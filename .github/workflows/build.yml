@@ -102,8 +102,12 @@ jobs:
         target_commitish: ${{ github.sha }}
         body: |
           - 这是最新构建的 MobileGL 共享库，将在下一次 Github Actions 运行时被替换
+          
+          - 一般用户请下载 `libMobileGL-release.so`
             
           - This is the newly built MobileGL shared library, which will be replaced during the next Github Actions run
+          
+          - General users should download `libMobileGL-release.so`
         files: |
           build/libMobileGL-release.so
           build/libMobileGL-debug.so
