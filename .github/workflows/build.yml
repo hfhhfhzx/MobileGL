@@ -19,6 +19,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         submodules: true
+        fetch-depth: 0
 
     - name: Configure ccache
       uses: actions/cache@v4
@@ -87,12 +88,8 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         LATEST_TAG=$(git tag --list latest)
-        if [[ -n "$LATEST_TAG" ]]; then
-          gh release delete "$LATEST_TAG" --yes || echo "No previous latest release found to delete."
-          git push origin --delete "$LATEST_TAG" || echo "No previous latest tag found to delete."
-        else
-          echo "No latest tag to delete."
-        fi
+        gh release delete "$LATEST_TAG" --yes || echo "No previous latest release found to delete."
+        git push origin --delete "$LATEST_TAG" || echo "No previous latest tag found to delete."
           
     - name: Create latest Release
       uses: softprops/action-gh-release@v2
