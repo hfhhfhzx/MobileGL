@@ -49,9 +49,9 @@ MobileGL重新使用了几个开源项目：
 
 ## 兼容性 & 目标
 
-* **短期目标：** `OpenGL 3.3 (Core Profile)`.
+* **短期目标：** `OpenGL 3.3 (核心配置)`.
 * **当前发展重点**
-  * `MG_State` and `MG_Impl` for `OpenGL 3.3 (Core Profile)`
+  * 针对`OpenGL 3.3 (核心配置)` 的 `MG_State` 和 `MG_Impl`
   * `Direct (Vulkan)` 后端
   * `Direct (OpenGL ES)` 后端
 
@@ -116,8 +116,8 @@ MobileGL重新使用了几个开源项目：
 
 ## 须知
 
-* MobileGL is **not** production-ready currently.
-* Some `OpenGL 3.3 (Core Profile)` features are still missing or under development.
+* MobileGL 目前**尚未**达到生产就绪状态
+* 部分 **OpenGL 3.3（核心配置）** 功能仍然缺失或正在开发中
 
 ## 许可证
 
