@@ -4,6 +4,7 @@ on:
   push:
     paths-ignore:
       - '**/*.md'
+      - 'docs/'
   workflow_dispatch:
 
 jobs:
@@ -67,22 +68,14 @@ jobs:
     - name: Strip Debug symbols
       run: |
         cd build
-        cp libMobileGL.so libMobileGL-debug.so
-        mv libMobileGL.so libMobileGL-release.so
-        $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip libMobileGL-release.so
+        $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip libMobileGL.so
 
-    - name: Upload MobileGL Release Shared Library
+    - name: Upload MobileGL Shared Library
       uses: actions/upload-artifact@v4
       with:
         name: MobileGL-release
-        path: build/libMobileGL-release.so
-        
-    - name: Upload MobileGL Debug Shared Library
-      uses: actions/upload-artifact@v4
-      with:
-        name: MobileGL-debug
-        path:  build/libMobileGL-debug.so
-        
+        path: build/libMobileGL.so
+
     - name: Delete old latest release and tag
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -99,12 +92,7 @@ jobs:
         target_commitish: ${{ github.sha }}
         body: |
           - 这是最新构建的 MobileGL 共享库，将在下一次 Github Actions 运行时被替换
-          
-          - 一般用户请下载 `libMobileGL-release.so`
-            
+
           - This is the newly built MobileGL shared library, which will be replaced during the next Github Actions run
-          
-          - General users should download `libMobileGL-release.so`
         files: |
-          build/libMobileGL-release.so
-          build/libMobileGL-debug.so
+          build/libMobileGL.so
