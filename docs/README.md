@@ -61,6 +61,8 @@ The upstream currently provides **no releases** and **no precompiled binaries**.
 
 This fork provides a Github Workflow to build binary files and release them to Github Artifact and Release.
 
+An FCL renderer plugin is also provided (albeit rudimentary), see [here](https://github.com/hfhhfhzx/MobileGL-Plugin)
+
 ## Build Instructions
 
 We(The upstream) currently provide **no releases** and **no precompiled binaries**.  

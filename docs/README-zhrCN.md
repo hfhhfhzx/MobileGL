@@ -61,6 +61,8 @@ MobileGL重新使用了几个开源项目：
 
 此分支提供一个 Github Workflow 来构建二进制文件，并发布到 Github Artifact 和 Release
 
+还提供了 FCL 渲染器插件(尽管很简陋)，见[这里](https://github.com/hfhhfhzx/MobileGL-Plugin)
+
 ## 构建说明
 
 我们（上游）目前不提供**任何版本**和**预编译的二进制文件**
