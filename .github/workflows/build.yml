@@ -2,9 +2,10 @@ name: Build MobileGL
 
 on:
   push:
+    branches: [ "*" ]
     paths-ignore:
       - '**/*.md'
-      - 'docs/'
+      - 'docs/*'
   workflow_dispatch:
 
 jobs:
