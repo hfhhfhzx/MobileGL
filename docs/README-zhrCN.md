@@ -116,6 +116,16 @@ MobileGL重新使用了几个开源项目：
 * `MG_Test` 和 `MG_Benchmark` 只能使用 Clang 构建，不能使用 GCC. 要强制使用 Clang，请在命令中添加 `-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`
 * 在 Android上， 测试和基准测试始终被禁用
 
+## 环境变量
+
+MobileGL 支持通过环境变量进行运行时的配置
+
+### 支持的 Key
+
+| 变量                | 介绍                                      | 允许的值                       | 默认        |
+|-------------------------|--------------------------------------------------|--------------------------------------|----------------|
+| `MOBILEGL_BACKEND_TYPE` | 启动时选择主动后端实现。	 | `DirectGLES`, `DirectVulkan`         | `DirectGLES`   |
+
 ## 须知
 
 * MobileGL 目前**尚未**达到生产就绪状态
