@@ -7,9 +7,16 @@ on:
       - '**/*.md'
       - 'docs/*'
   workflow_dispatch:
+    inputs:
+      Release:
+        type: boolean
+        description: "是否发布一个Release？Should a release be issued?"
+        required: true
+        default: false
 
 jobs:
   build:
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -78,6 +85,7 @@ jobs:
         path: build/libMobileGL.so
 
     - name: Delete old latest release and tag
+      if: ${{ github.event.inputs.Release == 'true' || !contains(github.event.head_commit.message, '[skip delete]') }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
@@ -86,6 +94,7 @@ jobs:
         git push origin --delete "$LATEST_TAG" || echo "No previous latest tag found to delete."
           
     - name: Create latest Release
+      if: ${{ github.event.inputs.Release == 'true' || !contains(github.event.head_commit.message, '[skip release]') }}
       uses: softprops/action-gh-release@v2
       with:
         name: "MobileGL Latest Shared Library File"
