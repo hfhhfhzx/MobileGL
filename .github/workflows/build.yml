@@ -95,13 +95,11 @@ jobs:
           
     - name: Create latest Release
       if: ${{ github.event.inputs.Release == 'true' || !contains(github.event.head_commit.message, '[skip release]') }}
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@v3
       with:
-        name: "MobileGL Latest Shared Library File"
+        name: "Nightly Build"
         tag_name: "latest"
         target_commitish: ${{ github.sha }}
         body: |
-          - 这是最新构建的 MobileGL 共享库，将在下一次 Github Actions 运行时被替换
-
-          - This is the newly built MobileGL shared library, which will be replaced during the next Github Actions run
+          # Nightly build
         files: build/libMobileGL.so
