@@ -14,11 +14,36 @@
 #include "MG_State/GLState/ProgramState/ProgramObject.h"
 #include "MG_State/GLState/ProgramState/ShaderObject.h"
 #include "MG_State/GLState/SamplerState/SamplerObject.h"
+#include "MG_State/GLState/TextureState/TextureObject.h"
 #include "MG_Impl/GLImpl/Framebuffer/GL_Framebuffer.h"
+#include "MG_Util/Converters/GLToMG/TextureEnumConverter.h"
 #include "MG_Util/Converters/MGToVk/RenderStateEnumConverter.h"
+#include "MG_Util/Converters/MGToVk/TextureEnumConverter.h"
+#include "MG_Util/Metrics/TextureMetrics.h"
 #include <vulkan/vulkan_core.h>
 
 namespace MobileGL::MG_Backend::DirectVulkan {
+    static VkPipelineColorBlendAttachmentState MakeColorBlendAttachmentState(
+        Bool blendEnable,
+        VkBlendFactor srcColorBlendFactor,
+        VkBlendFactor dstColorBlendFactor,
+        VkBlendOp colorBlendOp,
+        VkBlendFactor srcAlphaBlendFactor,
+        VkBlendFactor dstAlphaBlendFactor,
+        VkBlendOp alphaBlendOp,
+        VkColorComponentFlags colorWriteMask) {
+        VkPipelineColorBlendAttachmentState attachment{};
+        attachment.blendEnable = blendEnable ? VK_TRUE : VK_FALSE;
+        attachment.srcColorBlendFactor = srcColorBlendFactor;
+        attachment.dstColorBlendFactor = dstColorBlendFactor;
+        attachment.colorBlendOp = colorBlendOp;
+        attachment.srcAlphaBlendFactor = srcAlphaBlendFactor;
+        attachment.dstAlphaBlendFactor = dstAlphaBlendFactor;
+        attachment.alphaBlendOp = alphaBlendOp;
+        attachment.colorWriteMask = colorWriteMask;
+        return attachment;
+    }
+
     static Bool ShouldUseTransientVertexIndexBuffer(const MG_State::GLState::BufferObject& bufferObject) {
         switch (bufferObject.GetUsage()) {
         case BufferUsage::StreamDraw:
@@ -36,10 +61,427 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
     }
 
-    static Bool HasTransientVertexIndexBufferThisFrame(
-        const Vector<const MG_State::GLState::BufferObject*>& buffers,
-        const MG_State::GLState::BufferObject* buffer) {
-        return std::find(buffers.begin(), buffers.end(), buffer) != buffers.end();
+    static VkColorComponentFlags GetSupportedColorWriteMaskForComponentCount(SizeT componentCount) {
+        switch (componentCount) {
+        case 1:
+            return VK_COLOR_COMPONENT_R_BIT;
+        case 2:
+            return VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
+        case 3:
+            return VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+        case 4:
+            return VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                   VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        default:
+            MOBILEGL_ASSERT(false,
+                            "GetSupportedColorWriteMaskForComponentCount: unsupported componentCount=%zu",
+                            componentCount);
+            return 0;
+        }
+    }
+
+    enum class NumericDomain {
+        Unknown,
+        FloatLike,
+        Sint,
+        Uint,
+    };
+
+    static NumericDomain GetNumericDomainForShaderValueType(GLenum glType) {
+        switch (glType) {
+        case GL_FLOAT:
+        case GL_FLOAT_VEC2:
+        case GL_FLOAT_VEC3:
+        case GL_FLOAT_VEC4:
+            return NumericDomain::FloatLike;
+        case GL_INT:
+        case GL_INT_VEC2:
+        case GL_INT_VEC3:
+        case GL_INT_VEC4:
+            return NumericDomain::Sint;
+        case GL_UNSIGNED_INT:
+        case GL_UNSIGNED_INT_VEC2:
+        case GL_UNSIGNED_INT_VEC3:
+        case GL_UNSIGNED_INT_VEC4:
+            return NumericDomain::Uint;
+        default:
+            return NumericDomain::Unknown;
+        }
+    }
+
+    static SizeT GetComponentCountForShaderValueType(GLenum glType) {
+        switch (glType) {
+        case GL_FLOAT:
+        case GL_INT:
+        case GL_UNSIGNED_INT:
+            return 1;
+        case GL_FLOAT_VEC2:
+        case GL_INT_VEC2:
+        case GL_UNSIGNED_INT_VEC2:
+            return 2;
+        case GL_FLOAT_VEC3:
+        case GL_INT_VEC3:
+        case GL_UNSIGNED_INT_VEC3:
+            return 3;
+        case GL_FLOAT_VEC4:
+        case GL_INT_VEC4:
+        case GL_UNSIGNED_INT_VEC4:
+            return 4;
+        default:
+            return 0;
+        }
+    }
+
+    static NumericDomain GetNumericDomainForVertexFormat(VkFormat format) {
+        switch (format) {
+        case VK_FORMAT_R32_SFLOAT:
+        case VK_FORMAT_R32G32_SFLOAT:
+        case VK_FORMAT_R32G32B32_SFLOAT:
+        case VK_FORMAT_R32G32B32A32_SFLOAT:
+        case VK_FORMAT_R16_SNORM:
+        case VK_FORMAT_R16G16_SNORM:
+        case VK_FORMAT_R16G16B16_SNORM:
+        case VK_FORMAT_R16G16B16A16_SNORM:
+        case VK_FORMAT_R16_UNORM:
+        case VK_FORMAT_R16G16_UNORM:
+        case VK_FORMAT_R16G16B16_UNORM:
+        case VK_FORMAT_R16G16B16A16_UNORM:
+        case VK_FORMAT_R16_SSCALED:
+        case VK_FORMAT_R16G16_SSCALED:
+        case VK_FORMAT_R16G16B16_SSCALED:
+        case VK_FORMAT_R16G16B16A16_SSCALED:
+        case VK_FORMAT_R16_USCALED:
+        case VK_FORMAT_R16G16_USCALED:
+        case VK_FORMAT_R16G16B16_USCALED:
+        case VK_FORMAT_R16G16B16A16_USCALED:
+        case VK_FORMAT_R8_SNORM:
+        case VK_FORMAT_R8G8_SNORM:
+        case VK_FORMAT_R8G8B8_SNORM:
+        case VK_FORMAT_R8G8B8A8_SNORM:
+        case VK_FORMAT_R8_UNORM:
+        case VK_FORMAT_R8G8_UNORM:
+        case VK_FORMAT_R8G8B8_UNORM:
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8_SSCALED:
+        case VK_FORMAT_R8G8_SSCALED:
+        case VK_FORMAT_R8G8B8_SSCALED:
+        case VK_FORMAT_R8G8B8A8_SSCALED:
+        case VK_FORMAT_R8_USCALED:
+        case VK_FORMAT_R8G8_USCALED:
+        case VK_FORMAT_R8G8B8_USCALED:
+        case VK_FORMAT_R8G8B8A8_USCALED:
+            return NumericDomain::FloatLike;
+        case VK_FORMAT_R32_SINT:
+        case VK_FORMAT_R32G32_SINT:
+        case VK_FORMAT_R32G32B32_SINT:
+        case VK_FORMAT_R32G32B32A32_SINT:
+        case VK_FORMAT_R16_SINT:
+        case VK_FORMAT_R16G16_SINT:
+        case VK_FORMAT_R16G16B16_SINT:
+        case VK_FORMAT_R16G16B16A16_SINT:
+        case VK_FORMAT_R8_SINT:
+        case VK_FORMAT_R8G8_SINT:
+        case VK_FORMAT_R8G8B8_SINT:
+        case VK_FORMAT_R8G8B8A8_SINT:
+            return NumericDomain::Sint;
+        case VK_FORMAT_R32_UINT:
+        case VK_FORMAT_R32G32_UINT:
+        case VK_FORMAT_R32G32B32_UINT:
+        case VK_FORMAT_R32G32B32A32_UINT:
+        case VK_FORMAT_R16_UINT:
+        case VK_FORMAT_R16G16_UINT:
+        case VK_FORMAT_R16G16B16_UINT:
+        case VK_FORMAT_R16G16B16A16_UINT:
+        case VK_FORMAT_R8_UINT:
+        case VK_FORMAT_R8G8_UINT:
+        case VK_FORMAT_R8G8B8_UINT:
+        case VK_FORMAT_R8G8B8A8_UINT:
+            return NumericDomain::Uint;
+        default:
+            return NumericDomain::Unknown;
+        }
+    }
+
+    static Bool TryCoerceVertexFormatNumericDomain(VkFormat sourceFormat,
+                                                   NumericDomain targetDomain,
+                                                   VkFormat& outFormat) {
+        const NumericDomain sourceDomain = GetNumericDomainForVertexFormat(sourceFormat);
+        if (sourceDomain == targetDomain || targetDomain == NumericDomain::Unknown) {
+            outFormat = sourceFormat;
+            return true;
+        }
+        if (sourceDomain == NumericDomain::FloatLike) {
+            return false;
+        }
+
+        switch (sourceFormat) {
+        case VK_FORMAT_R32_SINT:
+            if (targetDomain == NumericDomain::Uint) {
+                outFormat = VK_FORMAT_R32_UINT;
+                return true;
+            }
+            return false;
+        case VK_FORMAT_R32G32_SINT:
+            if (targetDomain == NumericDomain::Uint) {
+                outFormat = VK_FORMAT_R32G32_UINT;
+                return true;
+            }
+            return false;
+        case VK_FORMAT_R32G32B32_SINT:
+            if (targetDomain == NumericDomain::Uint) {
+                outFormat = VK_FORMAT_R32G32B32_UINT;
+                return true;
+            }
+            return false;
+        case VK_FORMAT_R32G32B32A32_SINT:
+            if (targetDomain == NumericDomain::Uint) {
+                outFormat = VK_FORMAT_R32G32B32A32_UINT;
+                return true;
+            }
+            return false;
+        case VK_FORMAT_R32_UINT:
+            if (targetDomain == NumericDomain::Sint) {
+                outFormat = VK_FORMAT_R32_SINT;
+                return true;
+            }
+            return false;
+        case VK_FORMAT_R32G32_UINT:
+            if (targetDomain == NumericDomain::Sint) {
+                outFormat = VK_FORMAT_R32G32_SINT;
+                return true;
+            }
+            return false;
+        case VK_FORMAT_R32G32B32_UINT:
+            if (targetDomain == NumericDomain::Sint) {
+                outFormat = VK_FORMAT_R32G32B32_SINT;
+                return true;
+            }
+            return false;
+        case VK_FORMAT_R32G32B32A32_UINT:
+            if (targetDomain == NumericDomain::Sint) {
+                outFormat = VK_FORMAT_R32G32B32A32_SINT;
+                return true;
+            }
+            return false;
+        case VK_FORMAT_R16_SINT:
+            outFormat = targetDomain == NumericDomain::Uint ? VK_FORMAT_R16_UINT : VK_FORMAT_R16_SSCALED;
+            return true;
+        case VK_FORMAT_R16G16_SINT:
+            outFormat = targetDomain == NumericDomain::Uint ? VK_FORMAT_R16G16_UINT : VK_FORMAT_R16G16_SSCALED;
+            return true;
+        case VK_FORMAT_R16G16B16_SINT:
+            outFormat = targetDomain == NumericDomain::Uint ? VK_FORMAT_R16G16B16_UINT : VK_FORMAT_R16G16B16_SSCALED;
+            return true;
+        case VK_FORMAT_R16G16B16A16_SINT:
+            outFormat = targetDomain == NumericDomain::Uint ? VK_FORMAT_R16G16B16A16_UINT : VK_FORMAT_R16G16B16A16_SSCALED;
+            return true;
+        case VK_FORMAT_R16_UINT:
+            outFormat = targetDomain == NumericDomain::Sint ? VK_FORMAT_R16_SINT : VK_FORMAT_R16_USCALED;
+            return true;
+        case VK_FORMAT_R16G16_UINT:
+            outFormat = targetDomain == NumericDomain::Sint ? VK_FORMAT_R16G16_SINT : VK_FORMAT_R16G16_USCALED;
+            return true;
+        case VK_FORMAT_R16G16B16_UINT:
+            outFormat = targetDomain == NumericDomain::Sint ? VK_FORMAT_R16G16B16_SINT : VK_FORMAT_R16G16B16_USCALED;
+            return true;
+        case VK_FORMAT_R16G16B16A16_UINT:
+            outFormat = targetDomain == NumericDomain::Sint ? VK_FORMAT_R16G16B16A16_SINT : VK_FORMAT_R16G16B16A16_USCALED;
+            return true;
+        case VK_FORMAT_R8_SINT:
+            outFormat = targetDomain == NumericDomain::Uint ? VK_FORMAT_R8_UINT : VK_FORMAT_R8_SSCALED;
+            return true;
+        case VK_FORMAT_R8G8_SINT:
+            outFormat = targetDomain == NumericDomain::Uint ? VK_FORMAT_R8G8_UINT : VK_FORMAT_R8G8_SSCALED;
+            return true;
+        case VK_FORMAT_R8G8B8_SINT:
+            outFormat = targetDomain == NumericDomain::Uint ? VK_FORMAT_R8G8B8_UINT : VK_FORMAT_R8G8B8_SSCALED;
+            return true;
+        case VK_FORMAT_R8G8B8A8_SINT:
+            outFormat = targetDomain == NumericDomain::Uint ? VK_FORMAT_R8G8B8A8_UINT : VK_FORMAT_R8G8B8A8_SSCALED;
+            return true;
+        case VK_FORMAT_R8_UINT:
+            outFormat = targetDomain == NumericDomain::Sint ? VK_FORMAT_R8_SINT : VK_FORMAT_R8_USCALED;
+            return true;
+        case VK_FORMAT_R8G8_UINT:
+            outFormat = targetDomain == NumericDomain::Sint ? VK_FORMAT_R8G8_SINT : VK_FORMAT_R8G8_USCALED;
+            return true;
+        case VK_FORMAT_R8G8B8_UINT:
+            outFormat = targetDomain == NumericDomain::Sint ? VK_FORMAT_R8G8B8_SINT : VK_FORMAT_R8G8B8_USCALED;
+            return true;
+        case VK_FORMAT_R8G8B8A8_UINT:
+            outFormat = targetDomain == NumericDomain::Sint ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_USCALED;
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    static NumericDomain GetNumericDomainForTextureInternalFormat(TextureInternalFormat format) {
+        switch (format) {
+        case TextureInternalFormat::R8I:
+        case TextureInternalFormat::R16I:
+        case TextureInternalFormat::R32I:
+        case TextureInternalFormat::RG8I:
+        case TextureInternalFormat::RG16I:
+        case TextureInternalFormat::RG32I:
+        case TextureInternalFormat::RGB8I:
+        case TextureInternalFormat::RGB16I:
+        case TextureInternalFormat::RGB32I:
+        case TextureInternalFormat::RGBA8I:
+        case TextureInternalFormat::RGBA16I:
+        case TextureInternalFormat::RGBA32I:
+            return NumericDomain::Sint;
+        case TextureInternalFormat::R8UI:
+        case TextureInternalFormat::R16UI:
+        case TextureInternalFormat::R32UI:
+        case TextureInternalFormat::RG8UI:
+        case TextureInternalFormat::RG16UI:
+        case TextureInternalFormat::RG32UI:
+        case TextureInternalFormat::RGB8UI:
+        case TextureInternalFormat::RGB16UI:
+        case TextureInternalFormat::RGB32UI:
+        case TextureInternalFormat::RGBA8UI:
+        case TextureInternalFormat::RGBA16UI:
+        case TextureInternalFormat::RGBA32UI:
+        case TextureInternalFormat::RGB10A2UI:
+            return NumericDomain::Uint;
+        case TextureInternalFormat::DepthComponent:
+        case TextureInternalFormat::DepthComponent16:
+        case TextureInternalFormat::DepthComponent24:
+        case TextureInternalFormat::DepthComponent32:
+        case TextureInternalFormat::DepthComponent32F:
+        case TextureInternalFormat::Depth24Stencil8:
+        case TextureInternalFormat::Depth32FStencil8:
+        case TextureInternalFormat::DepthStencil:
+            return NumericDomain::Unknown;
+        default:
+            return NumericDomain::FloatLike;
+        }
+    }
+
+    static Uint32 BuildVertexInputAttributeMask(const Vector<VkVertexInputAttributeDescription>& attributes) {
+        Uint32 attributeMask = 0;
+        for (const auto& attribute : attributes) {
+            if (attribute.location < 32) {
+                attributeMask |= (1u << attribute.location);
+            }
+        }
+        return attributeMask;
+    }
+
+    static Bool TryGetCurrentVertexAttributeFormat(GLenum glType, VkFormat& outFormat) {
+        switch (glType) {
+        case GL_FLOAT:
+            outFormat = VK_FORMAT_R32_SFLOAT;
+            return true;
+        case GL_FLOAT_VEC2:
+            outFormat = VK_FORMAT_R32G32_SFLOAT;
+            return true;
+        case GL_FLOAT_VEC3:
+            outFormat = VK_FORMAT_R32G32B32_SFLOAT;
+            return true;
+        case GL_FLOAT_VEC4:
+            outFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
+            return true;
+        case GL_INT:
+            outFormat = VK_FORMAT_R32_SINT;
+            return true;
+        case GL_INT_VEC2:
+            outFormat = VK_FORMAT_R32G32_SINT;
+            return true;
+        case GL_INT_VEC3:
+            outFormat = VK_FORMAT_R32G32B32_SINT;
+            return true;
+        case GL_INT_VEC4:
+            outFormat = VK_FORMAT_R32G32B32A32_SINT;
+            return true;
+        case GL_UNSIGNED_INT:
+            outFormat = VK_FORMAT_R32_UINT;
+            return true;
+        case GL_UNSIGNED_INT_VEC2:
+            outFormat = VK_FORMAT_R32G32_UINT;
+            return true;
+        case GL_UNSIGNED_INT_VEC3:
+            outFormat = VK_FORMAT_R32G32B32_UINT;
+            return true;
+        case GL_UNSIGNED_INT_VEC4:
+            outFormat = VK_FORMAT_R32G32B32A32_UINT;
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    static Bool TryGetCurrentVertexAttributeUploadPayload(
+        const MG_State::GLState::CurrentVertexAttributeValue& currentValue,
+        GLenum glType,
+        VkFormat& outFormat,
+        const void*& outData,
+        VkDeviceSize& outSize) {
+        switch (glType) {
+        case GL_FLOAT:
+            outFormat = VK_FORMAT_R32_SFLOAT;
+            outData = currentValue.floatValue.data();
+            outSize = sizeof(Float);
+            return true;
+        case GL_FLOAT_VEC2:
+            outFormat = VK_FORMAT_R32G32_SFLOAT;
+            outData = currentValue.floatValue.data();
+            outSize = sizeof(Float) * 2;
+            return true;
+        case GL_FLOAT_VEC3:
+            outFormat = VK_FORMAT_R32G32B32_SFLOAT;
+            outData = currentValue.floatValue.data();
+            outSize = sizeof(Float) * 3;
+            return true;
+        case GL_FLOAT_VEC4:
+            outFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
+            outData = currentValue.floatValue.data();
+            outSize = sizeof(Float) * 4;
+            return true;
+        case GL_INT:
+            outFormat = VK_FORMAT_R32_SINT;
+            outData = currentValue.intValue.data();
+            outSize = sizeof(Int32);
+            return true;
+        case GL_INT_VEC2:
+            outFormat = VK_FORMAT_R32G32_SINT;
+            outData = currentValue.intValue.data();
+            outSize = sizeof(Int32) * 2;
+            return true;
+        case GL_INT_VEC3:
+            outFormat = VK_FORMAT_R32G32B32_SINT;
+            outData = currentValue.intValue.data();
+            outSize = sizeof(Int32) * 3;
+            return true;
+        case GL_INT_VEC4:
+            outFormat = VK_FORMAT_R32G32B32A32_SINT;
+            outData = currentValue.intValue.data();
+            outSize = sizeof(Int32) * 4;
+            return true;
+        case GL_UNSIGNED_INT:
+            outFormat = VK_FORMAT_R32_UINT;
+            outData = currentValue.uintValue.data();
+            outSize = sizeof(Uint32);
+            return true;
+        case GL_UNSIGNED_INT_VEC2:
+            outFormat = VK_FORMAT_R32G32_UINT;
+            outData = currentValue.uintValue.data();
+            outSize = sizeof(Uint32) * 2;
+            return true;
+        case GL_UNSIGNED_INT_VEC3:
+            outFormat = VK_FORMAT_R32G32B32_UINT;
+            outData = currentValue.uintValue.data();
+            outSize = sizeof(Uint32) * 3;
+            return true;
+        case GL_UNSIGNED_INT_VEC4:
+            outFormat = VK_FORMAT_R32G32B32A32_UINT;
+            outData = currentValue.uintValue.data();
+            outSize = sizeof(Uint32) * 4;
+            return true;
+        default:
+            return false;
+        }
     }
 
     static const char* VkImageLayoutToString(VkImageLayout layout) {
@@ -84,6 +526,14 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return false;
     }
 
+    static void RecordClearBufferError(const char* func, ErrorCode code, const char* message) {
+        MG_State::pGLContext->RecordError(code, MakeUnique<GenericErrorInfo>("DirectVulkan", func, message));
+    }
+
+    static void RecordTextureCopyError(const char* func, ErrorCode code, const char* message) {
+        MG_State::pGLContext->RecordError(code, MakeUnique<GenericErrorInfo>("DirectVulkan", func, message));
+    }
+
     static Bool IsValidSampledImageLayout(VkImageLayout layout) {
         switch (layout) {
             case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
@@ -98,13 +548,137 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     namespace {
-        static constexpr Uint32 kMaxProgramBindings = 16;
         static constexpr Uint32 kDescriptorSetsPerFrame = 64;
         static constexpr Uint kHiddenBlitProgramId = 0xFFFFFFF0u;
         static constexpr Uint kHiddenBlitVertexShaderId = 0xFFFFFFF1u;
         static constexpr Uint kHiddenBlitFragmentShaderId = 0xFFFFFFF2u;
         static constexpr Uint kHiddenBlitNearestSamplerId = 0xFFFFFFF3u;
         static constexpr Uint kHiddenBlitLinearSamplerId = 0xFFFFFFF4u;
+        static constexpr Uint kHiddenDepthMipmapProgramId = 0xFFFFFFF5u;
+        static constexpr Uint kHiddenDepthMipmapVertexShaderId = 0xFFFFFFF6u;
+        static constexpr Uint kHiddenDepthMipmapFragmentShaderId = 0xFFFFFFF7u;
+
+        static constexpr const char* kFullscreenTriangleVertexShaderSource = R"(#version 460 core
+uniform vec4 uSrcRect;
+uniform vec4 uDstRect;
+uniform int uSurfaceTransform;
+layout(location = 0) out vec2 vTexCoord;
+
+vec2 ApplySurfaceTransform(vec2 position, int transform) {
+    vec2 p = position;
+    p.y = -p.y;
+    if (transform == 1) {
+        p = vec2(-p.y, p.x);
+    } else if (transform == 2) {
+        p = -p;
+    } else if (transform == 3) {
+        p = vec2(p.y, -p.x);
+    }
+    return p;
+}
+
+void main() {
+    const vec2 uvTri[3] = vec2[](
+        vec2(0.0, 0.0),
+        vec2(2.0, 0.0),
+        vec2(0.0, 2.0)
+    );
+    vec2 uv = uvTri[gl_VertexID];
+    vec2 dst = uDstRect.xy + uv * uDstRect.zw;
+    vec2 clip = dst * 2.0 - 1.0;
+    clip = ApplySurfaceTransform(clip, uSurfaceTransform);
+    gl_Position = vec4(clip, 0.0, 1.0);
+    vTexCoord = uSrcRect.xy + uv * uSrcRect.zw;
+}
+)";
+
+        static constexpr const char* kBlitFragmentShaderSource = R"(#version 460 core
+layout(binding = 0) uniform sampler2D uSource;
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 outColor;
+
+void main() {
+    outColor = texture(uSource, vTexCoord);
+}
+)";
+
+        static constexpr const char* kDepthMipmapFragmentShaderSource = R"(#version 460 core
+layout(binding = 0) uniform sampler2D uSource;
+layout(location = 0) in vec2 vTexCoord;
+uniform ivec2 uSrcTexelSize;
+
+void main() {
+    ivec2 srcBase = ivec2(gl_FragCoord.xy) * 2;
+    ivec2 srcMax = max(uSrcTexelSize - ivec2(1), ivec2(0));
+    float depth0 = texelFetch(uSource, clamp(srcBase + ivec2(0, 0), ivec2(0), srcMax), 0).r;
+    float depth1 = texelFetch(uSource, clamp(srcBase + ivec2(1, 0), ivec2(0), srcMax), 0).r;
+    float depth2 = texelFetch(uSource, clamp(srcBase + ivec2(0, 1), ivec2(0), srcMax), 0).r;
+    float depth3 = texelFetch(uSource, clamp(srcBase + ivec2(1, 1), ivec2(0), srcMax), 0).r;
+    gl_FragDepth = 0.25 * (depth0 + depth1 + depth2 + depth3);
+}
+)";
+
+        static Uint32 ComputeFullMipLevelCount(const IntVec3& baseTexelSize) {
+            Int maxDimension = std::max<Int>(
+                baseTexelSize.x(),
+                std::max<Int>(baseTexelSize.y(), std::max<Int>(baseTexelSize.z(), 1)));
+            Uint32 mipLevelCount = 1;
+            while (maxDimension > 1) {
+                maxDimension = std::max<Int>(maxDimension / 2, 1);
+                ++mipLevelCount;
+            }
+            return mipLevelCount;
+        }
+
+        static IntVec3 ComputeMipTexelSize(const IntVec3& baseTexelSize, Uint32 relativeMipLevel) {
+            const Int width = std::max<Int>(baseTexelSize.x() >> static_cast<Int>(relativeMipLevel), 1);
+            const Int height = std::max<Int>(baseTexelSize.y() >> static_cast<Int>(relativeMipLevel), 1);
+            const Int depth = std::max<Int>(baseTexelSize.z() >> static_cast<Int>(relativeMipLevel), 1);
+            return {width, height, depth};
+        }
+
+        static Bool EnsureGenerateMipmapStorageAllocated(::MobileGL::MG_State::GLState::TextureObjectMipmap& texture,
+                                                         ::MobileGL::TextureUploadTarget uploadTarget,
+                                                         Uint32 baseMipLevel) {
+            const Uint32 existingMipLevelCount = static_cast<Uint32>(texture.GetMipmapLevelCount());
+            if (existingMipLevelCount <= baseMipLevel) {
+                return false;
+            }
+
+            const IntVec3 baseTexelSize = texture.GetMipmapTexelSize(uploadTarget, baseMipLevel);
+            const SizeT baseByteSize = texture.GetMipmapByteSize(uploadTarget, baseMipLevel);
+            if (baseTexelSize.x() <= 0 || baseTexelSize.y() <= 0 || baseTexelSize.z() <= 0 || baseByteSize == 0) {
+                return false;
+            }
+
+            const SizeT baseTexelCount = static_cast<SizeT>(baseTexelSize.x()) * static_cast<SizeT>(baseTexelSize.y()) *
+                                         static_cast<SizeT>(baseTexelSize.z());
+            if (baseTexelCount == 0 || (baseByteSize % baseTexelCount) != 0) {
+                return false;
+            }
+
+            const SizeT bytesPerTexel = baseByteSize / baseTexelCount;
+            const Uint32 requiredMipLevelCount = baseMipLevel + ComputeFullMipLevelCount(baseTexelSize);
+            if (existingMipLevelCount >= requiredMipLevelCount) {
+                return true;
+            }
+
+            for (Uint32 level = existingMipLevelCount; level < requiredMipLevelCount; ++level) {
+                const IntVec3 levelTexelSize = ComputeMipTexelSize(baseTexelSize, level - baseMipLevel);
+                const SizeT levelByteSize = bytesPerTexel * static_cast<SizeT>(levelTexelSize.x()) *
+                                            static_cast<SizeT>(levelTexelSize.y()) *
+                                            static_cast<SizeT>(levelTexelSize.z());
+                texture.AllocateStorage(uploadTarget, level, {levelTexelSize, levelByteSize});
+                texture.MarkStorageDirty(uploadTarget, level, false);
+            }
+            return true;
+        }
+
+        static VkImageLayout ResolveGenerateMipmapFinalLayout(VkImageAspectFlags aspectMask) {
+            return (aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0
+                ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
 
         enum class BlitSurfaceTransform : Uint32 {
             Identity = 0,
@@ -123,6 +697,26 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             const char* label = nullptr;
         };
 
+        static Uint32 ComputeMaxProgramBindings(const VkPhysicalDeviceProperties& properties) {
+            const auto& limits = properties.limits;
+            static constexpr Uint32 kMinProgramBindings = 16;
+            static constexpr Uint32 kMaxProgramBindingsCap = 256;
+            const Uint32 maxCombinedImageSamplers =
+                std::min(limits.maxPerStageDescriptorSamplers, limits.maxDescriptorSetSamplers);
+            const Uint32 maxSampledImages =
+                std::min(limits.maxPerStageDescriptorSampledImages, limits.maxDescriptorSetSampledImages);
+            const Uint32 maxDynamicUniformBuffers =
+                std::min(limits.maxPerStageDescriptorUniformBuffers, limits.maxDescriptorSetUniformBuffersDynamic);
+
+            Uint32 maxBindings = limits.maxPerStageResources;
+            maxBindings = std::min(maxBindings, maxCombinedImageSamplers);
+            maxBindings = std::min(maxBindings, maxSampledImages + maxDynamicUniformBuffers);
+
+            maxBindings = std::max(kMinProgramBindings, maxBindings);
+            maxBindings = std::min(kMaxProgramBindingsCap, maxBindings);
+            return maxBindings;
+        }
+
         static void GetImageTransitionSourceState(VkImageLayout oldLayout, VkPipelineStageFlags& outSrcStageMask,
                                                   VkAccessFlags& outSrcAccessMask) {
             switch (oldLayout) {
@@ -134,6 +728,18 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
                     outSrcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
                     outSrcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    break;
+                case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+                    outSrcStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+                    outSrcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                    break;
+                case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+                case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL:
+                case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL:
+                    outSrcStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+                    outSrcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
                     break;
                 case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
                     outSrcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -152,6 +758,77 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                     outSrcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
                     break;
             }
+        }
+
+        static void GetImageTransitionDestinationState(VkImageLayout newLayout, VkPipelineStageFlags& outDstStageMask,
+                                                       VkAccessFlags& outDstAccessMask) {
+            switch (newLayout) {
+                case VK_IMAGE_LAYOUT_UNDEFINED:
+                    outDstStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+                    outDstAccessMask = 0;
+                    break;
+                case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+                    outDstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                    outDstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    break;
+                case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+                    outDstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+                    outDstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                    break;
+                case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+                case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL:
+                case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL:
+                case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+                    outDstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+                    outDstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    break;
+                case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+                    outDstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                    outDstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    break;
+                case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+                    outDstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                    outDstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    break;
+                case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+                    outDstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+                    outDstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                    break;
+                default:
+                    outDstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                    outDstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                    break;
+            }
+        }
+
+        static VkImageAspectFlags GetSwapchainDepthStencilAspectMask(const SwapchainObject& swapchainObject) {
+            VkImageAspectFlags aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            switch (swapchainObject.GetDepthStencilFormat()) {
+                case VK_FORMAT_D24_UNORM_S8_UINT:
+                case VK_FORMAT_D32_SFLOAT_S8_UINT:
+                    aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+                    break;
+                default:
+                    break;
+            }
+            return aspectMask;
+        }
+
+        static FramebufferAttachmentType ResolveFramebufferCopyAttachmentType(
+            const MG_State::GLState::FramebufferObject& fbo, Bool isReadFramebuffer,
+            VkImageAspectFlags aspectMask) {
+            if ((aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
+                return isReadFramebuffer ? fbo.GetReadBuffer() : fbo.GetDrawBuffers()[0];
+            }
+            if ((aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) {
+                return FramebufferAttachmentType::Depth;
+            }
+            if ((aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) {
+                return FramebufferAttachmentType::Stencil;
+            }
+            return FramebufferAttachmentType::None;
         }
 
         static Bool ResolveColorBlitBinding(MG_State::GLState::FramebufferObject& fbo, Bool isReadFramebuffer,
@@ -218,6 +895,195 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             return true;
         }
 
+        static Bool ResolveFramebufferBlitBinding(MG_State::GLState::FramebufferObject& fbo, Bool isReadFramebuffer,
+                                                  Uint32 swapchainImageIndex, SwapchainObject& swapchainObject,
+                                                  VkTextureManager& textureManager,
+                                                  VkImageAspectFlags requiredAspectMask,
+                                                  BlitImageBinding& outBinding) {
+            const Bool isDefaultFbo =
+                (&fbo == MG_Impl::GLImpl::FramebufferImpl::pDefaultFramebufferInfo->defaultFBO.get());
+            const auto attachmentType = ResolveFramebufferCopyAttachmentType(fbo, isReadFramebuffer, requiredAspectMask);
+            if (attachmentType == FramebufferAttachmentType::None) {
+                MGLOG_E("BlitFramebuffer skipped: unsupported aspect mask=0x%x",
+                        static_cast<Uint32>(requiredAspectMask));
+                return false;
+            }
+
+            outBinding.label = isReadFramebuffer ? "read" : "draw";
+            if (isDefaultFbo) {
+                const auto extent = swapchainObject.GetExtent();
+                outBinding.extent = {static_cast<Int>(extent.width), static_cast<Int>(extent.height)};
+                outBinding.mipLevel = 0;
+                outBinding.mipLevelCount = 1;
+                outBinding.trackedLayout = nullptr;
+                if ((requiredAspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
+                    outBinding.image = swapchainObject.GetImage(swapchainImageIndex);
+                    outBinding.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    return true;
+                }
+
+                const VkImageAspectFlags swapchainAspectMask = GetSwapchainDepthStencilAspectMask(swapchainObject);
+                if ((swapchainAspectMask & requiredAspectMask) != requiredAspectMask) {
+                    MGLOG_E("BlitFramebuffer skipped: swapchain depth image missing required aspect mask=0x%x",
+                            static_cast<Uint32>(requiredAspectMask));
+                    return false;
+                }
+
+                outBinding.image = swapchainObject.GetDepthStencilImage(swapchainImageIndex);
+                outBinding.aspectMask = requiredAspectMask;
+                return true;
+            }
+
+            const auto& attachment = fbo.GetAttachment(attachmentType);
+            if (!attachment.IsComplete()) {
+                MGLOG_E("BlitFramebuffer skipped: %s framebuffer attachment is incomplete", outBinding.label);
+                return false;
+            }
+            if (attachment.IsRenderbuffer()) {
+                MGLOG_E("BlitFramebuffer skipped: renderbuffer attachments are not supported yet");
+                return false;
+            }
+            if (!attachment.IsTexture()) {
+                MGLOG_E("BlitFramebuffer skipped: unsupported framebuffer attachment type");
+                return false;
+            }
+
+            auto* texture = attachment.GetTexture().get();
+            MOBILEGL_ASSERT(texture != nullptr, "ResolveFramebufferBlitBinding: texture attachment is null");
+            auto* resource = textureManager.SyncTextureAndGetDescriptor(*texture);
+            if (resource == nullptr) {
+                MGLOG_E("BlitFramebuffer skipped: failed to sync %s framebuffer textureId=%d",
+                        outBinding.label, texture->GetExternalIndex());
+                return false;
+            }
+            if ((resource->aspect & requiredAspectMask) != requiredAspectMask) {
+                MGLOG_E("BlitFramebuffer skipped: %s framebuffer attachment textureId=%d is missing aspect mask=0x%x",
+                        outBinding.label, texture->GetExternalIndex(), static_cast<Uint32>(requiredAspectMask));
+                return false;
+            }
+
+            outBinding.image = resource->image;
+            outBinding.trackedLayout = &resource->layout;
+            outBinding.aspectMask = requiredAspectMask;
+            const auto attachmentExtent = attachment.GetSize();
+            outBinding.extent = {attachmentExtent.x(), attachmentExtent.y()};
+            outBinding.mipLevel = static_cast<Uint32>(std::max(attachment.GetTextureLevel(), 0));
+            outBinding.mipLevelCount = resource->mipLevels;
+            return true;
+        }
+
+        static Bool ResolveTextureCopyDestinationBinding(MG_State::GLState::ITextureObject& texture, Uint32 mipLevel,
+                                                         VkTextureManager& textureManager, BlitImageBinding& outBinding) {
+            auto* resource = textureManager.SyncTextureAndGetDescriptor(texture);
+            if (resource == nullptr) {
+                MGLOG_E("CopyTexSubImage2D skipped: failed to sync destination textureId=%d",
+                        texture.GetExternalIndex());
+                return false;
+            }
+            const VkImageAspectFlags copyAspectMask =
+                resource->aspect & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+            if (copyAspectMask == 0) {
+                MGLOG_E("CopyTexSubImage2D skipped: destination textureId=%d uses unsupported aspect mask=0x%x",
+                        texture.GetExternalIndex());
+                return false;
+            }
+            if (mipLevel >= resource->mipLevels) {
+                MGLOG_E("CopyTexSubImage2D skipped: destination textureId=%d mip=%u out of range (mips=%u)",
+                        texture.GetExternalIndex(), mipLevel, resource->mipLevels);
+                return false;
+            }
+
+            outBinding.image = resource->image;
+            outBinding.trackedLayout = &resource->layout;
+            outBinding.aspectMask = copyAspectMask;
+            outBinding.extent = {
+                static_cast<Int>(std::max(1u, resource->extent.width >> mipLevel)),
+                static_cast<Int>(std::max(1u, resource->extent.height >> mipLevel))};
+            outBinding.mipLevel = mipLevel;
+            outBinding.mipLevelCount = 1;
+            outBinding.label = "destination texture";
+            return true;
+        }
+
+        static Bool ResolveTextureCopySourceBinding(MG_State::GLState::FramebufferObject& fbo, Uint32 swapchainImageIndex,
+                                                    SwapchainObject& swapchainObject,
+                                                    VkTextureManager& textureManager,
+                                                    VkImageAspectFlags requiredAspectMask,
+                                                    BlitImageBinding& outBinding) {
+            const Bool isDefaultFbo =
+                (&fbo == MG_Impl::GLImpl::FramebufferImpl::pDefaultFramebufferInfo->defaultFBO.get());
+            const auto attachmentType = ResolveFramebufferCopyAttachmentType(fbo, true, requiredAspectMask);
+            if (attachmentType == FramebufferAttachmentType::None) {
+                MGLOG_E("CopyTexSubImage2D skipped: unsupported source aspect mask=0x%x",
+                        static_cast<Uint32>(requiredAspectMask));
+                return false;
+            }
+
+            outBinding.label = "read";
+            if (isDefaultFbo) {
+                const auto extent = swapchainObject.GetExtent();
+                outBinding.extent = {static_cast<Int>(extent.width), static_cast<Int>(extent.height)};
+                outBinding.mipLevel = 0;
+                outBinding.mipLevelCount = 1;
+                outBinding.trackedLayout = nullptr;
+                if ((requiredAspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
+                    outBinding.image = swapchainObject.GetImage(swapchainImageIndex);
+                    outBinding.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    return true;
+                }
+
+                const VkImageAspectFlags swapchainAspectMask = GetSwapchainDepthStencilAspectMask(swapchainObject);
+                if ((swapchainAspectMask & requiredAspectMask) != requiredAspectMask) {
+                    MGLOG_E("CopyTexSubImage2D skipped: swapchain depth image missing required aspect mask=0x%x",
+                            static_cast<Uint32>(requiredAspectMask));
+                    return false;
+                }
+
+                outBinding.image = swapchainObject.GetDepthStencilImage(swapchainImageIndex);
+                outBinding.aspectMask = requiredAspectMask;
+                return true;
+            }
+
+            const auto& attachment = fbo.GetAttachment(attachmentType);
+            if (!attachment.IsComplete()) {
+                MGLOG_E("CopyTexSubImage2D skipped: read framebuffer attachment %d is incomplete",
+                        static_cast<Int>(attachmentType));
+                return false;
+            }
+            if (attachment.IsRenderbuffer()) {
+                MGLOG_E("CopyTexSubImage2D skipped: renderbuffer read attachments are not supported yet");
+                return false;
+            }
+            if (!attachment.IsTexture()) {
+                MGLOG_E("CopyTexSubImage2D skipped: unsupported read framebuffer attachment type");
+                return false;
+            }
+
+            auto* texture = attachment.GetTexture().get();
+            MOBILEGL_ASSERT(texture != nullptr, "ResolveTextureCopySourceBinding: source texture attachment is null");
+            auto* resource = textureManager.SyncTextureAndGetDescriptor(*texture);
+            if (resource == nullptr) {
+                MGLOG_E("CopyTexSubImage2D skipped: failed to sync read framebuffer textureId=%d",
+                        texture->GetExternalIndex());
+                return false;
+            }
+            if ((resource->aspect & requiredAspectMask) != requiredAspectMask) {
+                MGLOG_E("CopyTexSubImage2D skipped: read framebuffer textureId=%d aspect mask=0x%x does not satisfy requested mask=0x%x",
+                        texture->GetExternalIndex(), static_cast<Uint32>(resource->aspect),
+                        static_cast<Uint32>(requiredAspectMask));
+                return false;
+            }
+
+            outBinding.image = resource->image;
+            outBinding.trackedLayout = &resource->layout;
+            outBinding.aspectMask = requiredAspectMask;
+            const auto attachmentExtent = attachment.GetSize();
+            outBinding.extent = {attachmentExtent.x(), attachmentExtent.y()};
+            outBinding.mipLevel = static_cast<Uint32>(std::max(attachment.GetTextureLevel(), 0));
+            outBinding.mipLevelCount = 1;
+            return true;
+        }
+
         static BlitSurfaceTransform ToBlitSurfaceTransform(VkSurfaceTransformFlagBitsKHR preTransform) {
             switch (preTransform) {
                 case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:
@@ -228,6 +1094,33 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                     return BlitSurfaceTransform::Rotate270;
                 default:
                     return BlitSurfaceTransform::Identity;
+            }
+        }
+
+        static Bool RequiresShaderBlitToDefaultFramebuffer(VkSurfaceTransformFlagBitsKHR preTransform) {
+            switch (preTransform) {
+                case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:
+                case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        static void ApplyNativeBlitDefaultFramebufferTransform(VkSurfaceTransformFlagBitsKHR preTransform,
+                                                               const BlitImageBinding& dstBinding,
+                                                               VkImageBlit& blitRegion) {
+            switch (preTransform) {
+                case VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR:
+                    blitRegion.dstOffsets[0].y = dstBinding.extent.y() - blitRegion.dstOffsets[0].y;
+                    blitRegion.dstOffsets[1].y = dstBinding.extent.y() - blitRegion.dstOffsets[1].y;
+                    break;
+                case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR:
+                    blitRegion.dstOffsets[0].x = dstBinding.extent.x() - blitRegion.dstOffsets[0].x;
+                    blitRegion.dstOffsets[1].x = dstBinding.extent.x() - blitRegion.dstOffsets[1].x;
+                    break;
+                default:
+                    break;
             }
         }
     } // namespace
@@ -312,6 +1205,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         VK_VERIFY(m_frameContext.Initialize(m_device, m_commandPool, m_config.MaxFramesInFlight),
                   "CreateFrameContexts");
         MGLOG_I("CreateFrameContexts completed");
+        m_deferredDepthMipmapCleanup.assign(m_frameContext.GetFrameCount(), {});
         auto succeeded = false;
         succeeded = m_bufferManager.Initialize({
             .allocator = m_allocator,
@@ -325,7 +1219,8 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         m_textureManager = MakeUnique<VkTextureManager>();
         MOBILEGL_ASSERT(m_textureManager != nullptr, "VkTextureManager creation failed.");
         succeeded = m_textureManager->Initialize(
-            {m_device, m_physicalDevice.handle, m_allocator, m_commandPool, m_graphicsQueue});
+            {m_device, m_physicalDevice.handle, m_allocator, m_commandPool, m_graphicsQueue,
+             m_frameContext.GetFrameCount()});
         MOBILEGL_ASSERT(succeeded, "VkTextureManager initialization failed.");
         m_clearManager = MakeUnique<VkClearManager>();
         MOBILEGL_ASSERT(m_clearManager != nullptr, "VkClearManager creation failed.");
@@ -337,11 +1232,14 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         succeeded = m_renderPassManager->Initialize();
         MOBILEGL_ASSERT(succeeded, "VkRenderPassManager initialization failed.");
 
+        const Uint32 maxProgramBindings = ComputeMaxProgramBindings(m_physicalDevice.properties);
+        MGLOG_I("DirectVulkan: using %u program descriptor bindings", maxProgramBindings);
+
         RecreateSwapchain();
 
         m_pipelineFactory = MakeUnique<PipelineFactory>(m_device, m_config);
         MOBILEGL_ASSERT(m_pipelineFactory != nullptr, "PipelineFactory creation failed.");
-        m_programFactory = MakeUnique<ProgramFactory>(m_device, m_config, kMaxProgramBindings);
+        m_programFactory = MakeUnique<ProgramFactory>(m_device, m_config, maxProgramBindings);
         MOBILEGL_ASSERT(m_programFactory != nullptr, "ProgramFactory creation failed.");
 
         m_samplerManager = MakeUnique<VkSamplerManager>();
@@ -350,13 +1248,15 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         MOBILEGL_ASSERT(succeeded, "VkSamplerManager initialization failed.");
         succeeded = InitializeBlitResources();
         MOBILEGL_ASSERT(succeeded, "Blit pipeline resource initialization failed.");
+        succeeded = InitializeDepthMipmapResources();
+        MOBILEGL_ASSERT(succeeded, "Depth mipmap pipeline resource initialization failed.");
 
         m_uniformManager = MakeUnique<UniformManager>();
         MOBILEGL_ASSERT(m_uniformManager != nullptr, "UniformDescriptorBinder creation failed.");
         succeeded = m_uniformManager->Initialize(
             m_device, &m_bufferManager, m_programFactory.get(),
             m_physicalDevice.properties.limits.minUniformBufferOffsetAlignment, m_config.MaxFramesInFlight,
-            kMaxProgramBindings, kDescriptorSetsPerFrame, m_textureManager.get(), m_samplerManager.get());
+            maxProgramBindings, kDescriptorSetsPerFrame, m_textureManager.get(), m_samplerManager.get());
         MOBILEGL_ASSERT(succeeded, "UniformDescriptorBinder initialization failed.");
         m_vertexInputStateFactory = MakeUnique<VertexInputStateFactory>(m_config);
         MOBILEGL_ASSERT(m_vertexInputStateFactory != nullptr, "VertexInputStateFactory creation failed.");
@@ -364,8 +1264,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         // Prime the first frame so Render() always targets an acquired swapchain image.
         VK_VERIFY(m_frameContext.WaitAndAcquireNextImage(m_device, m_swapchainObject.GetHandle(), m_imageIndexAcquired),
                   "Initialize, WaitAndAcquireNextImage");
+        m_textureManager->BeginFrame(m_frameContext.GetCurrentFrameIndex());
         m_bufferManager.BeginFrame(m_frameContext.GetCurrentFrameIndex());
-        m_transientVertexIndexBuffersThisFrame.clear();
+        m_transientVertexIndexBufferSlicesThisFrame.clear();
 
         MGLOG_D("VulkanRenderer initialized");
     }
@@ -373,8 +1274,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     void VulkanRenderer::Shutdown() {
         VK_VERIFY(vkDeviceWaitIdle(m_device));
 
+        DestroyDeferredDepthMipmapCleanup();
+
         m_pipelineFactory.reset();
         ShutdownBlitResources();
+        ShutdownDepthMipmapResources();
         if (m_samplerManager) {
             m_samplerManager->Shutdown();
             m_samplerManager.reset();
@@ -385,7 +1289,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
         m_vertexInputStateFactory.reset();
         m_bufferManager.Shutdown();
-        m_transientVertexIndexBuffersThisFrame.clear();
+        m_transientVertexIndexBufferSlicesThisFrame.clear();
 
         m_frameContext.Destroy(m_device, m_commandPool);
 
@@ -434,8 +1338,14 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     Bool VulkanRenderer::UploadAndBindVertexBuffers(
         VkCommandBuffer commandBuffer, const MG_State::GLState::VertexArrayObject& vao) {
         auto& vertexInputState = m_vertexInputStateFactory->GetOrCreateVertexInputState(vao);
+        const auto& program = *MG_State::pGLContext->GetCurrentProgram();
+        const auto transformFlags = GetShaderTransformFlags(m_swapchainObject.GetPreTransform());
+        const auto& programObj = m_programFactory->GetOrCreateProgram(program, transformFlags);
+        const Uint32 activeAttribMask = programObj.activeVertexInputLocationMask;
+        const Uint32 vertexInputAttribMask = BuildVertexInputAttributeMask(vertexInputState.attributes);
+        const Uint32 missingAttribMask = activeAttribMask & ~vertexInputAttribMask;
 
-        const auto bindingCount = vertexInputState.bindings.size();
+        const auto bindingCount = vertexInputState.bindings.size() + static_cast<SizeT>(std::popcount(missingAttribMask));
 
         Vector<VkBuffer> vkBuffers(bindingCount, VK_NULL_HANDLE);
         Vector<VkDeviceSize> vkOffsets(bindingCount, 0);
@@ -456,6 +1366,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         };
 
         for (SizeT binding = 0; binding < bindingCount; ++binding) {
+            if (binding >= vertexInputState.bindings.size()) {
+                break;
+            }
             const SizeT bufferKey = vertexInputState.bindingBufferKeys[binding];
             const MG_State::GLState::BufferObject* sourceBuffer = findBufferByKey(bufferKey);
             MOBILEGL_ASSERT(sourceBuffer != nullptr, "UploadAndBindVertexStreams failed to resolve source buffer");
@@ -463,21 +1376,26 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             MOBILEGL_ASSERT(sourceBufferShared != nullptr,
                             "UploadAndBindVertexStreams failed to resolve shared source buffer");
             BufferSlice slice{};
-            const Bool transientThisFrame =
-                HasTransientVertexIndexBufferThisFrame(m_transientVertexIndexBuffersThisFrame, sourceBufferShared.get());
             const Bool isDirty = (sourceBufferShared->GetChangeBits() & BufferChangeBits::DirtyBit);
-            if (ShouldUseTransientVertexIndexBuffer(*sourceBufferShared) || transientThisFrame || isDirty) {
+            const Uint64 changeSerial = sourceBufferShared->GetChangeSerial();
+            const SizeT sourceSize = sourceBufferShared->GetSize();
+            auto cachedTransient = m_transientVertexIndexBufferSlicesThisFrame.find(sourceBufferShared.get());
+            if (cachedTransient != m_transientVertexIndexBufferSlicesThisFrame.end() && !isDirty &&
+                cachedTransient->second.changeSerial == changeSerial && cachedTransient->second.size == sourceSize) {
+                slice = cachedTransient->second.slice;
+            } else if (ShouldUseTransientVertexIndexBuffer(*sourceBufferShared) || isDirty) {
                 const auto sourceData = sourceBufferShared->GetDataReadOnly();
-                const SizeT sourceSize = sourceBufferShared->GetSize();
                 if (!m_bufferManager.UploadTransient(BufferKind::Vertex, m_frameContext.GetCurrentFrameIndex(),
                                                      sourceData->data(), static_cast<VkDeviceSize>(sourceSize), 16,
                                                      slice)) {
                     MOBILEGL_ASSERT(false, "UploadAndBindVertexStreams skipped: failed to upload transient binding %zu", binding);
                     return false;
                 }
-                if (!transientThisFrame) {
-                    m_transientVertexIndexBuffersThisFrame.push_back(sourceBufferShared.get());
-                }
+                m_transientVertexIndexBufferSlicesThisFrame[sourceBufferShared.get()] = {
+                    .slice = slice,
+                    .changeSerial = changeSerial,
+                    .size = sourceSize,
+                };
                 m_bufferManager.DowngradeResidentBufferToTransient(sourceBufferShared);
                 sourceBufferShared->ClearDirty();
             } else {
@@ -488,6 +1406,37 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             }
             vkBuffers[binding] = slice.buffer;
             vkOffsets[binding] = slice.offset;
+        }
+
+        SizeT syntheticBinding = vertexInputState.bindings.size();
+        for (Uint32 location = 0; location < 32; ++location) {
+            if ((missingAttribMask & (1u << location)) == 0) {
+                continue;
+            }
+
+            const auto glType = programObj.vertexInputTypes[location];
+            const auto& currentValue = MG_State::pGLContext->GetCurrentVertexAttribute(location);
+            VkFormat format = VK_FORMAT_UNDEFINED;
+            const void* sourceData = nullptr;
+            VkDeviceSize sourceSize = 0;
+            const Bool supported = TryGetCurrentVertexAttributeUploadPayload(currentValue, glType, format,
+                                                                            sourceData, sourceSize);
+            MOBILEGL_ASSERT(supported,
+                            "DirectVulkan does not support current generic vertex attribute type yet: program=%u location=%u type=0x%x",
+                            program.GetExternalIndex(), location, glType);
+
+            BufferSlice slice{};
+            if (!m_bufferManager.UploadTransient(BufferKind::Vertex, m_frameContext.GetCurrentFrameIndex(),
+                                                 sourceData, sourceSize, 16, slice)) {
+                MOBILEGL_ASSERT(false,
+                                "UploadAndBindVertexStreams skipped: failed to upload current attribute binding for location %u",
+                                location);
+                return false;
+            }
+
+            vkBuffers[syntheticBinding] = slice.buffer;
+            vkOffsets[syntheticBinding] = slice.offset;
+            ++syntheticBinding;
         }
 
         vkCmdBindVertexBuffers(commandBuffer, 0, static_cast<Uint32>(bindingCount), vkBuffers.data(), vkOffsets.data());
@@ -525,24 +1474,40 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         BufferSlice slice{};
         auto indexBufferShared = MG_State::pGLContext->GetBufferObject(indexBuffer->GetExternalIndex());
         MOBILEGL_ASSERT(indexBufferShared != nullptr, "UploadAndBindIndexBuffer failed to resolve shared EBO");
-        const Bool transientThisFrame =
-            HasTransientVertexIndexBufferThisFrame(m_transientVertexIndexBuffersThisFrame, indexBufferShared.get());
         const Bool isDirty = (indexBufferShared->GetChangeBits() & BufferChangeBits::DirtyBit);
-        if (ShouldUseTransientVertexIndexBuffer(*indexBufferShared) || transientThisFrame || isDirty) {
+        const Uint64 changeSerial = indexBufferShared->GetChangeSerial();
+        const SizeT indexBufferSize = indexBufferShared->GetSize();
+        auto cachedTransient = m_transientVertexIndexBufferSlicesThisFrame.find(indexBufferShared.get());
+        if (cachedTransient != m_transientVertexIndexBufferSlicesThisFrame.end() && !isDirty &&
+            cachedTransient->second.changeSerial == changeSerial && cachedTransient->second.size == indexBufferSize) {
+            slice = cachedTransient->second.slice;
+            vkCmdBindIndexBuffer(frame.commandBuffer,
+                                 slice.buffer,
+                                 slice.offset + static_cast<VkDeviceSize>(pIndexBufferView->indexByteOffset),
+                                 vkIndexType);
+            return true;
+        }
+        if (ShouldUseTransientVertexIndexBuffer(*indexBufferShared) || isDirty) {
             const auto indexData = indexBufferShared->GetDataReadOnly();
             MOBILEGL_ASSERT(indexData != nullptr && !indexData->empty(), "DrawElements requires non-empty EBO data");
             if (!m_bufferManager.UploadTransient(BufferKind::Index, m_frameContext.GetCurrentFrameIndex(),
-                                                 indexData->data() + pIndexBufferView->indexByteOffset,
-                                                 static_cast<VkDeviceSize>(indexDataSizeBytes), indexSize, slice)) {
+                                                 indexData->data(),
+                                                 static_cast<VkDeviceSize>(indexBufferSize), indexSize,
+                                                 slice)) {
                 MOBILEGL_ASSERT(false, "DrawElements skipped: failed to prepare transient index buffer");
                 return false;
             }
-            if (!transientThisFrame) {
-                m_transientVertexIndexBuffersThisFrame.push_back(indexBufferShared.get());
-            }
+            m_transientVertexIndexBufferSlicesThisFrame[indexBufferShared.get()] = {
+                .slice = slice,
+                .changeSerial = changeSerial,
+                .size = indexBufferSize,
+            };
             m_bufferManager.DowngradeResidentBufferToTransient(indexBufferShared);
             indexBufferShared->ClearDirty();
-            vkCmdBindIndexBuffer(frame.commandBuffer, slice.buffer, slice.offset, vkIndexType);
+            vkCmdBindIndexBuffer(frame.commandBuffer,
+                                 slice.buffer,
+                                 slice.offset + static_cast<VkDeviceSize>(pIndexBufferView->indexByteOffset),
+                                 vkIndexType);
             return true;
         }
         if (!m_bufferManager.SyncResidentBuffer(BufferKind::Index, indexBufferShared, slice)) {
@@ -557,52 +1522,8 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     Bool VulkanRenderer::InitializeBlitResources() {
         ShutdownBlitResources();
 
-        static constexpr const char* kVertexShaderSource = R"(#version 460 core
-uniform vec4 uSrcRect;
-uniform vec4 uDstRect;
-uniform int uSurfaceTransform;
-
-layout(location = 0) out vec2 vTexCoord;
-
-vec2 ApplySurfaceTransform(vec2 position, int transform) {
-    vec2 p = position;
-    p.y = -p.y;
-    if (transform == 1) {
-        p = vec2(-p.y, p.x);
-    } else if (transform == 2) {
-        p = -p;
-    } else if (transform == 3) {
-        p = vec2(p.y, -p.x);
-    }
-    return p;
-}
-
-void main() {
-    const vec2 uvTri[3] = vec2[](
-        vec2(0.0, 0.0),
-        vec2(2.0, 0.0),
-        vec2(0.0, 2.0)
-    );
-    vec2 uv = uvTri[gl_VertexID];
-    vec2 dst = uDstRect.xy + uv * uDstRect.zw;
-    vec2 clip = dst * 2.0 - 1.0;
-    clip = ApplySurfaceTransform(clip, uSurfaceTransform);
-    gl_Position = vec4(clip, 0.0, 1.0);
-    vTexCoord = uSrcRect.xy + uv * uSrcRect.zw;
-}
-)";
-        static constexpr const char* kFragmentShaderSource = R"(#version 460 core
-layout(binding = 0) uniform sampler2D uSource;
-layout(location = 0) in vec2 vTexCoord;
-layout(location = 0) out vec4 outColor;
-
-void main() {
-    outColor = texture(uSource, vTexCoord);
-}
-)";
-
         auto vertexShader = MakeShared<MG_State::GLState::ShaderObject>(ShaderStage::Vertex, kHiddenBlitVertexShaderId);
-        vertexShader->SetShaderSource(kVertexShaderSource);
+        vertexShader->SetShaderSource(kFullscreenTriangleVertexShaderSource);
         vertexShader->Compile();
         if (!vertexShader->GetCompileStatus()) {
             MGLOG_E("InitializeBlitResources failed: vertex shader compile error: %s", vertexShader->GetInfoLog().c_str());
@@ -610,7 +1531,7 @@ void main() {
         }
 
         auto fragmentShader = MakeShared<MG_State::GLState::ShaderObject>(ShaderStage::Fragment, kHiddenBlitFragmentShaderId);
-        fragmentShader->SetShaderSource(kFragmentShaderSource);
+        fragmentShader->SetShaderSource(kBlitFragmentShaderSource);
         fragmentShader->Compile();
         if (!fragmentShader->GetCompileStatus()) {
             MGLOG_E("InitializeBlitResources failed: fragment shader compile error: %s", fragmentShader->GetInfoLog().c_str());
@@ -635,6 +1556,23 @@ void main() {
                         "InitializeBlitResources: missing uSurfaceTransform");
         MOBILEGL_ASSERT(m_blitResources.program->GetUBOSize() > 0,
                         "InitializeBlitResources: blit program global UBO is empty");
+        MOBILEGL_ASSERT(m_programFactory != nullptr, "InitializeBlitResources: program factory is null");
+
+        ProgramFactory::CompileOptionFlags blitTransformFlags = 0;
+        const auto& blitProgramObj = m_programFactory->GetOrCreateProgram(*m_blitResources.program, blitTransformFlags);
+        Bool foundBlitSamplerBinding = false;
+        for (Uint32 binding = 0; binding < blitProgramObj.samplerNameByBinding.size(); ++binding) {
+            if (blitProgramObj.bindingKinds[binding] != ProgramFactory::DescriptorBindingKind::CombinedImageSampler) {
+                continue;
+            }
+            if (blitProgramObj.samplerNameByBinding[binding] == "uSource") {
+                m_blitResources.samplerBinding = binding;
+                foundBlitSamplerBinding = true;
+                break;
+            }
+        }
+        MOBILEGL_ASSERT(foundBlitSamplerBinding,
+                        "InitializeBlitResources: failed to resolve reflected binding for uSource");
 
         auto createSampler = [](Uint externalIndex, SamplerFilterMode filter) {
             auto sampler = MakeShared<MG_State::GLState::SamplerObject>(externalIndex);
@@ -650,12 +1588,128 @@ void main() {
 
         m_blitResources.nearestSampler = createSampler(kHiddenBlitNearestSamplerId, SamplerFilterMode::Nearest);
         m_blitResources.linearSampler = createSampler(kHiddenBlitLinearSamplerId, SamplerFilterMode::Linear);
-        m_blitResources.samplerBinding = 0;
         return true;
     }
 
     void VulkanRenderer::ShutdownBlitResources() {
         m_blitResources = {};
+    }
+
+    Bool VulkanRenderer::InitializeDepthMipmapResources() {
+        ShutdownDepthMipmapResources();
+
+        auto vertexShader = MakeShared<MG_State::GLState::ShaderObject>(ShaderStage::Vertex,
+                                                                         kHiddenDepthMipmapVertexShaderId);
+        vertexShader->SetShaderSource(kFullscreenTriangleVertexShaderSource);
+        vertexShader->Compile();
+        if (!vertexShader->GetCompileStatus()) {
+            MGLOG_E("InitializeDepthMipmapResources failed: vertex shader compile error: %s",
+                    vertexShader->GetInfoLog().c_str());
+            return false;
+        }
+
+        auto fragmentShader = MakeShared<MG_State::GLState::ShaderObject>(ShaderStage::Fragment,
+                                                                           kHiddenDepthMipmapFragmentShaderId);
+        fragmentShader->SetShaderSource(kDepthMipmapFragmentShaderSource);
+        fragmentShader->Compile();
+        if (!fragmentShader->GetCompileStatus()) {
+            MGLOG_E("InitializeDepthMipmapResources failed: fragment shader compile error: %s",
+                    fragmentShader->GetInfoLog().c_str());
+            return false;
+        }
+
+        m_depthMipmapResources.program = MakeShared<MG_State::GLState::ProgramObject>(kHiddenDepthMipmapProgramId);
+        m_depthMipmapResources.program->AttachShader(vertexShader);
+        m_depthMipmapResources.program->AttachShader(fragmentShader);
+        m_depthMipmapResources.program->Link(false);
+        if (!m_depthMipmapResources.program->GetLinkStatus()) {
+            MGLOG_E("InitializeDepthMipmapResources failed: program link error: %s",
+                    m_depthMipmapResources.program->GetInfoLog().c_str());
+            return false;
+        }
+
+        m_depthMipmapResources.srcRectLocation = m_depthMipmapResources.program->GetUniformLocation("uSrcRect");
+        m_depthMipmapResources.dstRectLocation = m_depthMipmapResources.program->GetUniformLocation("uDstRect");
+        m_depthMipmapResources.surfaceTransformLocation =
+            m_depthMipmapResources.program->GetUniformLocation("uSurfaceTransform");
+        m_depthMipmapResources.srcTexelSizeLocation =
+            m_depthMipmapResources.program->GetUniformLocation("uSrcTexelSize");
+        MOBILEGL_ASSERT(m_depthMipmapResources.srcRectLocation >= 0,
+                        "InitializeDepthMipmapResources: missing uSrcRect");
+        MOBILEGL_ASSERT(m_depthMipmapResources.dstRectLocation >= 0,
+                        "InitializeDepthMipmapResources: missing uDstRect");
+        MOBILEGL_ASSERT(m_depthMipmapResources.surfaceTransformLocation >= 0,
+                        "InitializeDepthMipmapResources: missing uSurfaceTransform");
+        MOBILEGL_ASSERT(m_depthMipmapResources.srcTexelSizeLocation >= 0,
+                        "InitializeDepthMipmapResources: missing uSrcTexelSize");
+        MOBILEGL_ASSERT(m_depthMipmapResources.program->GetUBOSize() > 0,
+                        "InitializeDepthMipmapResources: depth mipmap program global UBO is empty");
+        MOBILEGL_ASSERT(m_programFactory != nullptr, "InitializeDepthMipmapResources: program factory is null");
+
+        ProgramFactory::CompileOptionFlags depthMipmapTransformFlags = 0;
+        const auto& depthMipmapProgramObj =
+            m_programFactory->GetOrCreateProgram(*m_depthMipmapResources.program, depthMipmapTransformFlags);
+        Bool foundDepthMipmapSamplerBinding = false;
+        for (Uint32 binding = 0; binding < depthMipmapProgramObj.samplerNameByBinding.size(); ++binding) {
+            if (depthMipmapProgramObj.bindingKinds[binding] != ProgramFactory::DescriptorBindingKind::CombinedImageSampler) {
+                continue;
+            }
+            if (depthMipmapProgramObj.samplerNameByBinding[binding] == "uSource") {
+                m_depthMipmapResources.samplerBinding = binding;
+                foundDepthMipmapSamplerBinding = true;
+                break;
+            }
+        }
+        MOBILEGL_ASSERT(foundDepthMipmapSamplerBinding,
+                        "InitializeDepthMipmapResources: failed to resolve reflected binding for uSource");
+        return true;
+    }
+
+    void VulkanRenderer::ShutdownDepthMipmapResources() {
+        m_depthMipmapResources = {};
+    }
+
+    void VulkanRenderer::CollectDeferredDepthMipmapCleanup(Uint32 frameIndex) {
+        MOBILEGL_ASSERT(frameIndex < m_deferredDepthMipmapCleanup.size(),
+                        "CollectDeferredDepthMipmapCleanup: frame index %u out of range (size=%zu)",
+                        frameIndex, m_deferredDepthMipmapCleanup.size());
+        if (m_device == VK_NULL_HANDLE) {
+            return;
+        }
+
+        auto& cleanup = m_deferredDepthMipmapCleanup[frameIndex];
+        for (auto framebuffer : cleanup.framebuffers) {
+            if (framebuffer != VK_NULL_HANDLE) {
+                vkDestroyFramebuffer(m_device, framebuffer, nullptr);
+            }
+        }
+        for (auto pipeline : cleanup.pipelines) {
+            if (pipeline != VK_NULL_HANDLE) {
+                vkDestroyPipeline(m_device, pipeline, nullptr);
+            }
+        }
+        for (auto renderPass : cleanup.renderPasses) {
+            if (renderPass != VK_NULL_HANDLE) {
+                vkDestroyRenderPass(m_device, renderPass, nullptr);
+            }
+        }
+        for (auto imageView : cleanup.imageViews) {
+            if (imageView != VK_NULL_HANDLE) {
+                vkDestroyImageView(m_device, imageView, nullptr);
+            }
+        }
+
+        cleanup.framebuffers.clear();
+        cleanup.pipelines.clear();
+        cleanup.renderPasses.clear();
+        cleanup.imageViews.clear();
+    }
+
+    void VulkanRenderer::DestroyDeferredDepthMipmapCleanup() {
+        for (Uint32 frameIndex = 0; frameIndex < m_deferredDepthMipmapCleanup.size(); ++frameIndex) {
+            CollectDeferredDepthMipmapCleanup(frameIndex);
+        }
+        m_deferredDepthMipmapCleanup.clear();
     }
 
     VkPipeline VulkanRenderer::GetOrCreateBlitPipeline(const RenderPassEntry& renderPassEntry) {
@@ -673,6 +1727,7 @@ void main() {
             .vertexInputHash = 0,
             .pipelineLayout = programObj.pipelineLayout,
             .renderPass = renderPassEntry.renderPass,
+            .colorAttachmentCount = renderPassEntry.colorAttachmentCount,
             .subpass = 0,
             .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
             .cullMode = VK_CULL_MODE_NONE,
@@ -680,48 +1735,462 @@ void main() {
             .depthTestEnable = false,
             .depthWriteEnable = false,
             .depthCompareOp = VK_COMPARE_OP_ALWAYS,
-            .blendEnable = false,
-            .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
-            .dstColorBlendFactor = VK_BLEND_FACTOR_ZERO,
-            .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
-            .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
-            .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
             .stages = &programObj.stages,
             .vertexInputState = &kEmptyVertexInputState
         };
+        static constexpr VkColorComponentFlags kColorWriteMask =
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        MOBILEGL_ASSERT(payload.colorAttachmentCount <= PipelineFactory::PipelineCreatePayload::kMaxColorAttachments,
+                        "GetOrCreateBlitPipeline: colorAttachmentCount=%u exceeds payload capacity",
+                        payload.colorAttachmentCount);
+        for (Uint32 i = 0; i < payload.colorAttachmentCount; ++i) {
+            payload.colorBlendAttachments[i] = MakeColorBlendAttachmentState(
+                false,
+                VK_BLEND_FACTOR_ONE,
+                VK_BLEND_FACTOR_ZERO,
+                VK_BLEND_OP_ADD,
+                VK_BLEND_FACTOR_ONE,
+                VK_BLEND_FACTOR_ZERO,
+                VK_BLEND_OP_ADD,
+                kColorWriteMask);
+        }
         return m_pipelineFactory->GetOrCreatePipeline(payload);
+    }
+
+    Bool VulkanRenderer::GenerateDepthMipmapWithShader(FrameContext::FrameData& frame,
+                                                       MG_State::GLState::ITextureObject& texture,
+                                                       VkTextureManager::TextureResource& resource,
+                                                       Uint32 baseMipLevel,
+                                                       Uint32 generateMipLevelCount,
+                                                       const IntVec3& storageBaseTexelSize,
+                                                       VkImageLayout originalLayout,
+                                                       VkImageLayout finalLayout) {
+        MOBILEGL_ASSERT(m_depthMipmapResources.program != nullptr,
+                        "GenerateDepthMipmapWithShader: depth mipmap program is null");
+        MOBILEGL_ASSERT(m_blitResources.nearestSampler != nullptr,
+                        "GenerateDepthMipmapWithShader: helper sampler is null");
+        MOBILEGL_ASSERT(m_programFactory != nullptr, "GenerateDepthMipmapWithShader: program factory is null");
+        MOBILEGL_ASSERT(m_uniformManager != nullptr, "GenerateDepthMipmapWithShader: uniform manager is null");
+        MOBILEGL_ASSERT(texture.GetTarget() == TextureTarget::Texture2D,
+                        "GenerateDepthMipmapWithShader only supports GL_TEXTURE_2D depth textures");
+        MOBILEGL_ASSERT((resource.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0,
+                        "GenerateDepthMipmapWithShader requires a depth aspect");
+        MOBILEGL_ASSERT(resource.depth == 1 && resource.arrayLayers == 1,
+                        "GenerateDepthMipmapWithShader only supports single-layer depth textures");
+        MOBILEGL_ASSERT(m_frameContext.GetCurrentFrameIndex() < m_deferredDepthMipmapCleanup.size(),
+                "GenerateDepthMipmapWithShader: frame index %u out of range (cleanup slots=%zu)",
+                m_frameContext.GetCurrentFrameIndex(), m_deferredDepthMipmapCleanup.size());
+        auto& deferredCleanup = m_deferredDepthMipmapCleanup[m_frameContext.GetCurrentFrameIndex()];
+
+        static const VkPipelineVertexInputStateCreateInfo kEmptyVertexInputState {
+            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
+        };
+
+        ProgramFactory::CompileOptionFlags depthMipmapTransformFlags = 0;
+        const auto& programObj = m_programFactory->GetOrCreateProgram(*m_depthMipmapResources.program,
+                                                                      depthMipmapTransformFlags);
+
+        VkAttachmentDescription depthAttachment{};
+        depthAttachment.format = resource.format;
+        depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+        VkAttachmentReference depthAttachmentRef{};
+        depthAttachmentRef.attachment = 0;
+        depthAttachmentRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+        VkSubpassDescription subpassDesc{};
+        subpassDesc.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpassDesc.pDepthStencilAttachment = &depthAttachmentRef;
+
+        VkRenderPassCreateInfo renderPassCreateInfo{};
+        renderPassCreateInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        renderPassCreateInfo.attachmentCount = 1;
+        renderPassCreateInfo.pAttachments = &depthAttachment;
+        renderPassCreateInfo.subpassCount = 1;
+        renderPassCreateInfo.pSubpasses = &subpassDesc;
+
+        VkRenderPass renderPass = VK_NULL_HANDLE;
+        VK_VERIFY(vkCreateRenderPass(m_device, &renderPassCreateInfo, nullptr, &renderPass),
+                  "GenerateDepthMipmapWithShader: vkCreateRenderPass");
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkPipelineViewportStateCreateInfo viewportState{};
+        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.viewportCount = 1;
+        viewportState.scissorCount = 1;
+
+        VkPipelineRasterizationStateCreateInfo rasterizationState{};
+        rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizationState.cullMode = VK_CULL_MODE_NONE;
+        rasterizationState.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        rasterizationState.lineWidth = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo multisampleState{};
+        multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo depthStencilState{};
+        depthStencilState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencilState.depthTestEnable = VK_TRUE;
+        depthStencilState.depthWriteEnable = VK_TRUE;
+        depthStencilState.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+        depthStencilState.minDepthBounds = 0.0f;
+        depthStencilState.maxDepthBounds = 1.0f;
+
+        VkPipelineColorBlendStateCreateInfo colorBlendState{};
+        colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+
+        const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamicState{};
+        dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamicState.dynamicStateCount = static_cast<Uint32>(std::size(dynamicStates));
+        dynamicState.pDynamicStates = dynamicStates;
+
+        VkGraphicsPipelineCreateInfo pipelineCreateInfo{};
+        pipelineCreateInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipelineCreateInfo.stageCount = static_cast<Uint32>(programObj.stages.size());
+        pipelineCreateInfo.pStages = programObj.stages.data();
+        pipelineCreateInfo.pVertexInputState = &kEmptyVertexInputState;
+        pipelineCreateInfo.pInputAssemblyState = &inputAssembly;
+        pipelineCreateInfo.pViewportState = &viewportState;
+        pipelineCreateInfo.pRasterizationState = &rasterizationState;
+        pipelineCreateInfo.pMultisampleState = &multisampleState;
+        pipelineCreateInfo.pDepthStencilState = &depthStencilState;
+        pipelineCreateInfo.pColorBlendState = &colorBlendState;
+        pipelineCreateInfo.pDynamicState = &dynamicState;
+        pipelineCreateInfo.layout = programObj.pipelineLayout;
+        pipelineCreateInfo.renderPass = renderPass;
+        pipelineCreateInfo.subpass = 0;
+
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VK_VERIFY(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &pipeline),
+                  "GenerateDepthMipmapWithShader: vkCreateGraphicsPipelines");
+        deferredCleanup.renderPasses.push_back(renderPass);
+        deferredCleanup.pipelines.push_back(pipeline);
+
+        auto createMipView = [&](Uint32 mipLevel, VkImageAspectFlags aspectMask) {
+            VkImageViewCreateInfo viewCreateInfo{};
+            viewCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            viewCreateInfo.image = resource.image;
+            viewCreateInfo.viewType = resource.viewType;
+            viewCreateInfo.format = resource.format;
+            viewCreateInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+            viewCreateInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+            viewCreateInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+            viewCreateInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+            viewCreateInfo.subresourceRange.aspectMask = aspectMask;
+            viewCreateInfo.subresourceRange.baseMipLevel = mipLevel;
+            viewCreateInfo.subresourceRange.levelCount = 1;
+            viewCreateInfo.subresourceRange.baseArrayLayer = 0;
+            viewCreateInfo.subresourceRange.layerCount = resource.arrayLayers;
+
+            VkImageView view = VK_NULL_HANDLE;
+            VK_VERIFY(vkCreateImageView(m_device, &viewCreateInfo, nullptr, &view),
+                      "GenerateDepthMipmapWithShader: vkCreateImageView");
+            return view;
+        };
+
+        VkPipelineStageFlags originalSrcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        VkAccessFlags originalSrcAccessMask = 0;
+        GetImageTransitionSourceState(originalLayout, originalSrcStageMask, originalSrcAccessMask);
+
+        VkPipelineStageFlags finalDstStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        VkAccessFlags finalDstAccessMask = 0;
+        GetImageTransitionDestinationState(finalLayout, finalDstStageMask, finalDstAccessMask);
+
+        VkPipelineStageFlags depthAttachmentStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        VkAccessFlags depthAttachmentAccessMask = 0;
+        GetImageTransitionDestinationState(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                           depthAttachmentStageMask, depthAttachmentAccessMask);
+
+        if (originalLayout != finalLayout) {
+            if (baseMipLevel > 0) {
+                VkImageLayout lowerMipLayout = originalLayout;
+                const Bool lowerReady = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, resource.image, lowerMipLayout, finalLayout,
+                    originalSrcStageMask, finalDstStageMask,
+                    originalSrcAccessMask, finalDstAccessMask,
+                    resource.aspect, 0, baseMipLevel);
+                MOBILEGL_ASSERT(lowerReady, "%s: failed to transition lower untouched mip levels", __func__);
+            }
+
+            if (generateMipLevelCount < resource.mipLevels) {
+                VkImageLayout upperMipLayout = originalLayout;
+                const Bool upperReady = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, resource.image, upperMipLayout, finalLayout,
+                    originalSrcStageMask, finalDstStageMask,
+                    originalSrcAccessMask, finalDstAccessMask,
+                    resource.aspect, generateMipLevelCount, resource.mipLevels - generateMipLevelCount);
+                MOBILEGL_ASSERT(upperReady, "%s: failed to transition upper untouched mip levels", __func__);
+            }
+
+            VkImageLayout srcMipLayout = originalLayout;
+            const Bool srcReady = VkTextureManager::TransitionImageLayout(
+                frame.commandBuffer, resource.image, srcMipLayout, finalLayout,
+                originalSrcStageMask, finalDstStageMask,
+                originalSrcAccessMask, finalDstAccessMask,
+                resource.aspect, baseMipLevel, 1);
+            MOBILEGL_ASSERT(srcReady, "%s: failed to transition base mip level to sampled layout", __func__);
+        }
+
+        resource.layout = finalLayout;
+
+        auto* depthProgramData = static_cast<Uint8*>(m_depthMipmapResources.program->MapUBO());
+        MOBILEGL_ASSERT(depthProgramData != nullptr, "GenerateDepthMipmapWithShader: depth mipmap UBO is null");
+        auto writeUniform = [&](Int location, const void* data, SizeT size) {
+            MOBILEGL_ASSERT(location >= 0, "GenerateDepthMipmapWithShader: invalid uniform location");
+            const Uint offset = m_depthMipmapResources.program->GetUniformOffset(static_cast<Uint>(location));
+            MOBILEGL_ASSERT(offset + size <= m_depthMipmapResources.program->GetUBOSize(),
+                            "GenerateDepthMipmapWithShader: uniform write out of bounds");
+            memcpy(depthProgramData + offset, data, size);
+        };
+
+        for (Uint32 level = baseMipLevel + 1; level < generateMipLevelCount; ++level) {
+            VkImageLayout dstMipLayout = originalLayout;
+            const Bool dstReady = VkTextureManager::TransitionImageLayout(
+                frame.commandBuffer, resource.image, dstMipLayout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                originalSrcStageMask, depthAttachmentStageMask,
+                originalSrcAccessMask, depthAttachmentAccessMask,
+                resource.aspect, level, 1);
+            MOBILEGL_ASSERT(dstReady, "%s: failed to transition mip level %u to depth attachment layout", __func__, level);
+
+            const IntVec3 srcTexelSize = ComputeMipTexelSize(storageBaseTexelSize, level - 1);
+            const IntVec3 dstTexelSize = ComputeMipTexelSize(storageBaseTexelSize, level);
+            const Int srcTexelSizeUniform[2] = {srcTexelSize.x(), srcTexelSize.y()};
+
+            const VkImageView sourceImageView = createMipView(level - 1, VK_IMAGE_ASPECT_DEPTH_BIT);
+            const VkImageView depthAttachmentView = createMipView(level, resource.aspect);
+            deferredCleanup.imageViews.push_back(sourceImageView);
+            deferredCleanup.imageViews.push_back(depthAttachmentView);
+
+            VkFramebufferCreateInfo framebufferCreateInfo{};
+            framebufferCreateInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebufferCreateInfo.renderPass = renderPass;
+            framebufferCreateInfo.attachmentCount = 1;
+            framebufferCreateInfo.pAttachments = &depthAttachmentView;
+            framebufferCreateInfo.width = static_cast<Uint32>(dstTexelSize.x());
+            framebufferCreateInfo.height = static_cast<Uint32>(dstTexelSize.y());
+            framebufferCreateInfo.layers = 1;
+
+            VkFramebuffer framebuffer = VK_NULL_HANDLE;
+            VK_VERIFY(vkCreateFramebuffer(m_device, &framebufferCreateInfo, nullptr, &framebuffer),
+                      "GenerateDepthMipmapWithShader: vkCreateFramebuffer");
+            deferredCleanup.framebuffers.push_back(framebuffer);
+
+            VkRenderPassBeginInfo renderPassBeginInfo{};
+            renderPassBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            renderPassBeginInfo.renderPass = renderPass;
+            renderPassBeginInfo.framebuffer = framebuffer;
+            renderPassBeginInfo.renderArea.offset = {0, 0};
+            renderPassBeginInfo.renderArea.extent = {
+                static_cast<Uint32>(dstTexelSize.x()), static_cast<Uint32>(dstTexelSize.y())
+            };
+
+            vkCmdBeginRenderPass(frame.commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+            VkViewport viewport{};
+            viewport.x = 0.0f;
+            viewport.y = 0.0f;
+            viewport.width = static_cast<float>(dstTexelSize.x());
+            viewport.height = static_cast<float>(dstTexelSize.y());
+            viewport.minDepth = 0.0f;
+            viewport.maxDepth = 1.0f;
+            vkCmdSetViewport(frame.commandBuffer, 0, 1, &viewport);
+
+            VkRect2D scissor{};
+            scissor.offset = {0, 0};
+            scissor.extent = {static_cast<Uint32>(dstTexelSize.x()), static_cast<Uint32>(dstTexelSize.y())};
+            vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
+
+            vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+            std::fill(depthProgramData,
+                      depthProgramData + m_depthMipmapResources.program->GetUBOSize(),
+                      Uint8{0});
+            BlitUniformData blitUniformData{};
+            writeUniform(m_depthMipmapResources.srcRectLocation,
+                         blitUniformData.srcRect,
+                         sizeof(blitUniformData.srcRect));
+            writeUniform(m_depthMipmapResources.dstRectLocation,
+                         blitUniformData.dstRect,
+                         sizeof(blitUniformData.dstRect));
+            writeUniform(m_depthMipmapResources.surfaceTransformLocation,
+                         &blitUniformData.surfaceTransform,
+                         sizeof(blitUniformData.surfaceTransform));
+            writeUniform(m_depthMipmapResources.srcTexelSizeLocation,
+                         srcTexelSizeUniform,
+                         sizeof(srcTexelSizeUniform));
+
+            const auto samplerBindingOverride = UniformManager::SamplerBindingOverride{
+                .binding = m_depthMipmapResources.samplerBinding,
+                .texture = &texture,
+                .sampler = m_blitResources.nearestSampler.get(),
+                .imageView = sourceImageView,
+            };
+            const Bool bound = m_uniformManager->BindProgramUniformBuffers(
+                frame.commandBuffer, *m_depthMipmapResources.program, programObj,
+                m_frameContext.GetCurrentFrameIndex(), &samplerBindingOverride);
+            MOBILEGL_ASSERT(bound, "GenerateDepthMipmapWithShader: BindProgramUniformBuffers failed");
+            vkCmdDraw(frame.commandBuffer, 3, 1, 0, 0);
+            vkCmdEndRenderPass(frame.commandBuffer);
+
+            VkImageLayout finishedMipLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            const Bool finishedReady = VkTextureManager::TransitionImageLayout(
+                frame.commandBuffer, resource.image, finishedMipLayout, finalLayout,
+                depthAttachmentStageMask, finalDstStageMask,
+                depthAttachmentAccessMask, finalDstAccessMask,
+                resource.aspect, level, 1);
+            MOBILEGL_ASSERT(finishedReady, "%s: failed to transition mip level %u to sampled layout", __func__, level);
+        }
+        return true;
     }
 
     VkPipeline VulkanRenderer::GetOrCreatePipeline(
             GLenum mode,
             const MG_State::GLState::ProgramObject& program,
+            const ProgramFactory::VkProgramObject& programObj,
+            ProgramFactory::CompileOptionFlags transformFlags,
             const MG_State::GLState::VertexArrayObject& vao,
             const RenderPassEntry& renderPassEntry) {
-        ProgramFactory::CompileOptionFlags transformFlags = GetShaderTransformFlags(m_swapchainObject.GetPreTransform());
         Bool invertClockwise = transformFlags & ProgramFactory::CompileOptionBit::PositionYFlip;
-        const auto& programObj = m_programFactory->GetOrCreateProgram(program, transformFlags);
         if (programObj.stages.empty()) {
             MGLOG_D("GetOrCreatePipeline skipped: program has no shader stages");
             return VK_NULL_HANDLE;
         }
 
+#if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG
+        const auto& limits = m_physicalDevice.properties.limits;
+        if (programObj.fragmentInputComponentCount != 0) {
+            MOBILEGL_ASSERT(
+                programObj.fragmentInputComponentCount <= limits.maxFragmentInputComponents,
+                "GetOrCreatePipeline: fragmentInputComponents=%u exceeds device limit=%u program=%u producerStage=%d",
+                programObj.fragmentInputComponentCount,
+                limits.maxFragmentInputComponents,
+                program.GetExternalIndex(),
+                static_cast<Int>(programObj.rasterizationProducerStage));
+        }
+        if (programObj.producerOutputComponentCount != 0) {
+            Uint32 producerOutputLimit = 0;
+            switch (programObj.rasterizationProducerStage) {
+            case ShaderStage::Vertex:
+                producerOutputLimit = limits.maxVertexOutputComponents;
+                break;
+            case ShaderStage::Geometry:
+                producerOutputLimit = limits.maxGeometryOutputComponents;
+                break;
+            case ShaderStage::TessEval:
+                producerOutputLimit = limits.maxTessellationEvaluationOutputComponents;
+                break;
+            default:
+                break;
+            }
+            if (producerOutputLimit != 0) {
+                MOBILEGL_ASSERT(
+                    programObj.producerOutputComponentCount <= producerOutputLimit,
+                    "GetOrCreatePipeline: producerOutputComponents=%u exceeds stage limit=%u program=%u producerStage=%d",
+                    programObj.producerOutputComponentCount,
+                    producerOutputLimit,
+                    program.GetExternalIndex(),
+                    static_cast<Int>(programObj.rasterizationProducerStage));
+            }
+        }
+#endif
+
         auto vertexInputHash = m_vertexInputStateFactory->ComputeHash(vao);
-        auto& vis = m_vertexInputStateFactory->GetOrCreateVertexInputState(vao);
+        auto& vis = m_vertexInputStateFactory->GetOrCreateVertexInputState(vao, vertexInputHash);
+        const Uint32 vertexInputAttribMask = BuildVertexInputAttributeMask(vis.attributes);
+        const Uint32 activeAttribMask = programObj.activeVertexInputLocationMask;
+        const Uint32 missingAttribMask = activeAttribMask & ~vertexInputAttribMask;
+        Vector<VkVertexInputAttributeDescription> patchedAttributes = vis.attributes;
+        Bool hasPatchedVertexAttributes = false;
+        for (auto& attribute : patchedAttributes) {
+            if (attribute.location >= 32 || (activeAttribMask & (1u << attribute.location)) == 0) {
+                continue;
+            }
+
+            const GLenum shaderInputType = programObj.vertexInputTypes[attribute.location];
+            const NumericDomain shaderInputDomain = GetNumericDomainForShaderValueType(shaderInputType);
+            const NumericDomain vertexInputDomain = GetNumericDomainForVertexFormat(attribute.format);
+            if (shaderInputDomain == NumericDomain::Unknown || vertexInputDomain == NumericDomain::Unknown ||
+                shaderInputDomain == vertexInputDomain) {
+                continue;
+            }
+
+            VkFormat patchedFormat = VK_FORMAT_UNDEFINED;
+            const Bool canPatch = TryCoerceVertexFormatNumericDomain(attribute.format, shaderInputDomain, patchedFormat);
+            MOBILEGL_ASSERT(
+                canPatch,
+                "GetOrCreatePipeline: vertex input location=%u format=%d mismatches shader input type=%u program=%u",
+                attribute.location,
+                static_cast<Int>(attribute.format),
+                static_cast<Uint32>(shaderInputType),
+                program.GetExternalIndex());
+
+            MGLOG_W("GetOrCreatePipeline: patching vertex input location=%u format=%d -> %d to match shader input type=%u for program=%u",
+                    attribute.location,
+                    static_cast<Int>(attribute.format),
+                    static_cast<Int>(patchedFormat),
+                    static_cast<Uint32>(shaderInputType),
+                    program.GetExternalIndex());
+            attribute.format = patchedFormat;
+            hasPatchedVertexAttributes = true;
+        }
+        VertexInputStateBuilder syntheticVertexInputBuilder;
+        const VkPipelineVertexInputStateCreateInfo* pipelineVertexInputState = &vis.state;
+        if (missingAttribMask != 0 || hasPatchedVertexAttributes) {
+            for (const auto& binding : vis.bindings) {
+                syntheticVertexInputBuilder.AddBinding(binding.binding, binding.stride, binding.inputRate);
+            }
+            for (const auto& attribute : patchedAttributes) {
+                syntheticVertexInputBuilder.AddAttribute(attribute.location, attribute.binding, attribute.format,
+                                                         attribute.offset);
+            }
+
+            Uint32 syntheticBinding = static_cast<Uint32>(vis.bindings.size());
+            for (Uint32 location = 0; location < 32; ++location) {
+                if ((missingAttribMask & (1u << location)) == 0) {
+                    continue;
+                }
+
+                VkFormat format = VK_FORMAT_UNDEFINED;
+                const Bool supported = TryGetCurrentVertexAttributeFormat(programObj.vertexInputTypes[location], format);
+                MOBILEGL_ASSERT(supported,
+                                "DirectVulkan does not support current generic vertex attribute type yet: program=%u location=%u type=0x%x activeAttribMask=0x%x vertexInputAttribMask=0x%x",
+                                program.GetExternalIndex(), location, programObj.vertexInputTypes[location],
+                                activeAttribMask, vertexInputAttribMask);
+
+                syntheticVertexInputBuilder.AddBinding(syntheticBinding, 0, VK_VERTEX_INPUT_RATE_VERTEX);
+                syntheticVertexInputBuilder.AddAttribute(location, syntheticBinding, format, 0);
+                ++syntheticBinding;
+            }
+            pipelineVertexInputState = &syntheticVertexInputBuilder.Build();
+        }
         auto cullFaceEnabled = MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::CullFace);
         auto depthTestEnabled = MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::DepthTest);
-        BlendFactor srcRGB = BlendFactor::One;
-        BlendFactor dstRGB = BlendFactor::Zero;
-        BlendFactor srcAlpha = BlendFactor::One;
-        BlendFactor dstAlpha = BlendFactor::Zero;
-        MG_State::pGLContext->GetBlendFunc(srcRGB, dstRGB, srcAlpha, dstAlpha);
         auto mask = MG_State::pGLContext->GetColorMask();
+        const auto colorWriteMask = static_cast<VkColorComponentFlags>(
+            (mask.r() ? VK_COLOR_COMPONENT_R_BIT : 0u) |
+            (mask.g() ? VK_COLOR_COMPONENT_G_BIT : 0u) |
+            (mask.b() ? VK_COLOR_COMPONENT_B_BIT : 0u) |
+            (mask.a() ? VK_COLOR_COMPONENT_A_BIT : 0u));
 
         PipelineFactory::PipelineCreatePayload payload {
             .programHash = programObj.hash,
             .vertexInputHash = vertexInputHash,
             .pipelineLayout = programObj.pipelineLayout,
             .renderPass = renderPassEntry.renderPass,
+            .colorAttachmentCount = renderPassEntry.colorAttachmentCount,
             .subpass = 0,
             .topology = MG_Util::ConvertPrimitiveModeToVkEnum(mode),
             .cullMode = cullFaceEnabled
@@ -731,19 +2200,181 @@ void main() {
             .depthTestEnable = depthTestEnabled,
             .depthWriteEnable = depthTestEnabled && MG_State::pGLContext->GetDepthMask(),
             .depthCompareOp = MG_Util::ConvertDepthTestFuncToVkEnum(MG_State::pGLContext->GetDepthFunc()),
-            .blendEnable = MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::Blend),
-            .srcColorBlendFactor = MG_Util::ConvertBlendFactorToVkEnum(srcRGB),
-            .dstColorBlendFactor = MG_Util::ConvertBlendFactorToVkEnum(dstRGB),
-            .srcAlphaBlendFactor = MG_Util::ConvertBlendFactorToVkEnum(srcAlpha),
-            .dstAlphaBlendFactor = MG_Util::ConvertBlendFactorToVkEnum(dstAlpha),
-            .colorWriteMask = (
-                (mask.r() ? VK_COLOR_COMPONENT_R_BIT : 0u) |
-                (mask.g() ? VK_COLOR_COMPONENT_G_BIT : 0u) |
-                (mask.b() ? VK_COLOR_COMPONENT_B_BIT : 0u) |
-                (mask.a() ? VK_COLOR_COMPONENT_A_BIT : 0u) ),
             .stages = &programObj.stages,
-            .vertexInputState = &vis.state
+            .vertexInputState = pipelineVertexInputState
         };
+        const Bool hasDepthStencilAttachment = renderPassEntry.hasDepthStencilAttachment;
+        if (!hasDepthStencilAttachment && (payload.depthTestEnable || payload.depthWriteEnable)) {
+            MGLOG_D("GetOrCreatePipeline: disabling depth test/write for program=%u because render pass has no depth attachment (attachmentCount=%u colorAttachmentCount=%u)",
+                    program.GetExternalIndex(),
+                    renderPassEntry.attachmentCount,
+                    renderPassEntry.colorAttachmentCount);
+            payload.depthTestEnable = false;
+            payload.depthWriteEnable = false;
+            payload.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+        }
+        const Uint32 fragmentOutputMask = programObj.activeFragmentOutputLocationMask;
+        MOBILEGL_ASSERT(
+            (fragmentOutputMask >> payload.colorAttachmentCount) == 0,
+            "GetOrCreatePipeline: fragmentOutputMask=0x%x exceeds colorAttachmentCount=%u for program=%u",
+            fragmentOutputMask,
+            payload.colorAttachmentCount,
+            program.GetExternalIndex());
+        MOBILEGL_ASSERT(payload.colorAttachmentCount <= PipelineFactory::PipelineCreatePayload::kMaxColorAttachments,
+                        "GetOrCreatePipeline: colorAttachmentCount=%u exceeds payload capacity",
+                        payload.colorAttachmentCount);
+        const auto& drawFboBinding =
+            MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
+        MOBILEGL_ASSERT(drawFboBinding != nullptr, "GetOrCreatePipeline: draw framebuffer is null");
+        const Bool isDefaultDrawFbo =
+            drawFboBinding.get() == MG_Impl::GLImpl::FramebufferImpl::pDefaultFramebufferInfo->defaultFBO.get();
+        const auto& drawBuffers = drawFboBinding->GetDrawBuffers();
+        auto resolveCompleteColorAttachmentTexture = [&](Uint32 drawBufferIndex) -> MG_State::GLState::ITextureObject* {
+            if (isDefaultDrawFbo || drawBufferIndex >= drawBuffers.size()) {
+                return nullptr;
+            }
+
+            const auto drawBuffer = drawBuffers[drawBufferIndex];
+            if (drawBuffer == FramebufferAttachmentType::None) {
+                return nullptr;
+            }
+
+            const auto& attachment = drawFboBinding->GetAttachment(drawBuffer);
+            if (!attachment.IsTexture() || !attachment.IsComplete()) {
+                return nullptr;
+            }
+
+            return attachment.GetTexture().get();
+        };
+        for (Uint32 i = 0; i < payload.colorAttachmentCount; ++i) {
+            BlendFactor srcRGB = BlendFactor::One;
+            BlendFactor dstRGB = BlendFactor::Zero;
+            BlendFactor srcAlpha = BlendFactor::One;
+            BlendFactor dstAlpha = BlendFactor::Zero;
+            BlendEquation colorEquation = BlendEquation::Add;
+            BlendEquation alphaEquation = BlendEquation::Add;
+            MG_State::pGLContext->GetBlendFuncIndexed(i, srcRGB, dstRGB, srcAlpha, dstAlpha);
+            MG_State::pGLContext->GetBlendEquationIndexed(i, colorEquation, alphaEquation);
+            const Bool blendEnabled = MG_State::pGLContext->IsCapabilityEnabledIndexed(CapabilityInput::Blend, i);
+            VkColorComponentFlags attachmentColorWriteMask = colorWriteMask;
+            Bool effectiveBlendEnabled = blendEnabled;
+            MG_State::GLState::ITextureObject* colorAttachmentTexture = nullptr;
+            if (!isDefaultDrawFbo && i < drawBuffers.size()) {
+                const auto drawBuffer = drawBuffers[i];
+                colorAttachmentTexture = resolveCompleteColorAttachmentTexture(i);
+                if (drawBuffer == FramebufferAttachmentType::None || colorAttachmentTexture == nullptr) {
+                    // GL ignores writes and per-target blend state for GL_NONE draw buffer slots.
+                    // Depth-only or otherwise unattached draw buffers should also discard color writes.
+                    attachmentColorWriteMask = 0;
+                    effectiveBlendEnabled = false;
+                }
+                if (colorAttachmentTexture != nullptr) {
+                    auto* texture = colorAttachmentTexture;
+#if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG
+                    const auto* textureResource = m_textureManager->SyncTextureAndGetDescriptor(*texture);
+                    MOBILEGL_ASSERT(textureResource != nullptr,
+                                    "GetOrCreatePipeline: failed to sync color attachment textureId=%d",
+                                    texture->GetExternalIndex());
+                    VkFormatProperties attachmentFormatProperties{};
+                    vkGetPhysicalDeviceFormatProperties(
+                        m_physicalDevice.handle,
+                        textureResource->format,
+                        &attachmentFormatProperties);
+                    MOBILEGL_ASSERT(
+                        (attachmentFormatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0,
+                        "GetOrCreatePipeline: color attachment %u format=%d textureId=%d lacks VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT (program=%u)",
+                        i,
+                        static_cast<Int>(textureResource->format),
+                        texture->GetExternalIndex(),
+                        program.GetExternalIndex());
+#endif
+                    const SizeT componentCount = MG_Util::GetBaseInternalFormatComponentCount(texture->GetFormat());
+#if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG
+                    const NumericDomain attachmentNumericDomain =
+                        GetNumericDomainForTextureInternalFormat(texture->GetFormat());
+                    for (Uint32 outputLocation = 0;
+                         outputLocation < ProgramFactory::VkProgramObject::kMaxVertexInputLocations;
+                         ++outputLocation) {
+                        if ((programObj.activeFragmentOutputLocationMask & (1u << outputLocation)) == 0 ||
+                            outputLocation != i) {
+                            continue;
+                        }
+
+                        const GLenum fragmentOutputType = programObj.fragmentOutputTypes[outputLocation];
+                        const NumericDomain fragmentOutputDomain =
+                            GetNumericDomainForShaderValueType(fragmentOutputType);
+                        // GL allows fragment outputs with more components than the bound color attachment;
+                        // excess components are discarded during conversion to the attachment format.
+                        MOBILEGL_ASSERT(
+                            attachmentNumericDomain == NumericDomain::Unknown ||
+                                fragmentOutputDomain == NumericDomain::Unknown ||
+                                attachmentNumericDomain == fragmentOutputDomain,
+                            "GetOrCreatePipeline: fragment output location=%d type=%u mismatches color attachment %u internalFormat=%d textureId=%d program=%u",
+                            static_cast<Int>(outputLocation),
+                            static_cast<Uint32>(fragmentOutputType),
+                            i,
+                            static_cast<Int>(texture->GetFormat()),
+                            texture->GetExternalIndex(),
+                            program.GetExternalIndex());
+                    }
+#endif
+                    const VkColorComponentFlags supportedColorWriteMask =
+                        GetSupportedColorWriteMaskForComponentCount(componentCount);
+                    if ((attachmentColorWriteMask & ~supportedColorWriteMask) != 0) {
+                        MGLOG_W(
+                            "GetOrCreatePipeline: clamping colorWriteMask=0x%x to 0x%x on color attachment %u (componentCount=%zu textureId=%d internalFormat=%d program=%u blendEnabled=%d)",
+                            static_cast<Uint32>(attachmentColorWriteMask),
+                            static_cast<Uint32>(attachmentColorWriteMask & supportedColorWriteMask),
+                            i,
+                            componentCount,
+                            texture->GetExternalIndex(),
+                            static_cast<Int>(texture->GetFormat()),
+                            program.GetExternalIndex(),
+                            effectiveBlendEnabled ? 1 : 0);
+                        attachmentColorWriteMask &= supportedColorWriteMask;
+                    }
+                }
+            }
+            if (effectiveBlendEnabled) {
+                MOBILEGL_ASSERT(i < drawBuffers.size(),
+                                "GetOrCreatePipeline: color attachment %u is out of draw buffer range %zu",
+                                i, drawBuffers.size());
+
+                VkFormat colorAttachmentFormat = VK_FORMAT_UNDEFINED;
+                Int textureExternalIndex = -1;
+                if (isDefaultDrawFbo) {
+                    colorAttachmentFormat = m_swapchainObject.GetSurfaceFormat().format;
+                } else {
+                    auto* texture = colorAttachmentTexture;
+                    MOBILEGL_ASSERT(texture != nullptr,
+                                    "GetOrCreatePipeline: blend is enabled on draw buffer %u but no complete texture attachment is bound",
+                                    i);
+                    textureExternalIndex = texture->GetExternalIndex();
+                    colorAttachmentFormat = MG_Util::ConvertTextureInternalFormatToVkEnum(texture->GetFormat());
+                }
+
+#if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG
+                VkFormatProperties formatProperties{};
+                vkGetPhysicalDeviceFormatProperties(m_physicalDevice.handle, colorAttachmentFormat, &formatProperties);
+                MOBILEGL_ASSERT(
+                    (formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0,
+                    "GetOrCreatePipeline: blend is enabled on color attachment %u for format=%d textureId=%d, but the format lacks VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT (program=%u)",
+                    i,
+                    static_cast<Int>(colorAttachmentFormat),
+                    textureExternalIndex,
+                    program.GetExternalIndex());
+#endif
+            }
+            payload.colorBlendAttachments[i] = MakeColorBlendAttachmentState(
+                effectiveBlendEnabled,
+                MG_Util::ConvertBlendFactorToVkEnum(srcRGB),
+                MG_Util::ConvertBlendFactorToVkEnum(dstRGB),
+                MG_Util::ConvertBlendEquationToVkEnum(colorEquation),
+                MG_Util::ConvertBlendFactorToVkEnum(srcAlpha),
+                MG_Util::ConvertBlendFactorToVkEnum(dstAlpha),
+                MG_Util::ConvertBlendEquationToVkEnum(alphaEquation),
+                attachmentColorWriteMask);
+        }
         return m_pipelineFactory->GetOrCreatePipeline(payload);
     }
 
@@ -838,26 +2469,42 @@ void main() {
                     static_cast<Int>(transitionedResource->layout));
         }
 
-        auto& renderPassEntry = m_renderPassManager->GetOrCreateRenderPass(*drawFbo, m_imageIndexAcquired);
-        auto pipeline = GetOrCreatePipeline(mode, program, vao, renderPassEntry);
+        auto* renderPassEntry = &m_renderPassManager->GetOrCreateRenderPass(*drawFbo, m_imageIndexAcquired);
+        if (activeRenderPass && !activeRenderPass->CompatibleWith(*renderPassEntry)) {
+            VkRenderPassManager::EndRenderPass(frame.commandBuffer);
+            activeRenderPass = nullptr;
+            renderPassEntry = &m_renderPassManager->GetOrCreateRenderPass(*drawFbo, m_imageIndexAcquired);
+        }
+        if (renderPassEntry->attachmentCount == 0 || renderPassEntry->extent.x() <= 0 || renderPassEntry->extent.y() <= 0) {
+            MGLOG_D("SetupDraw skipped: drawFbo=%u resolved to an empty render pass (attachmentCount=%u extent=%dx%d)",
+                    drawFbo->GetExternalIndex(),
+                    renderPassEntry->attachmentCount,
+                    renderPassEntry->extent.x(),
+                    renderPassEntry->extent.y());
+            return false;
+        }
+
+        auto pipeline = GetOrCreatePipeline(mode, program, programObj, transformFlags, vao, *renderPassEntry);
         activeRenderPass = VkRenderPassManager::GetActiveRenderPass();
 
         // Begin render pass, and handle clear
-        if (activeRenderPass && activeRenderPass->CompatibleWith(renderPassEntry)) {
-            ClearAttachmentsOnActiveRenderPass(frame.commandBuffer, renderPassEntry);
+        if (activeRenderPass && activeRenderPass->CompatibleWith(*renderPassEntry)) {
+            ClearAttachmentsOnActiveRenderPass(frame.commandBuffer, *renderPassEntry);
         } else {
             // No active render pass or active one not compatible.
             // Restart a new render pass
-            if (activeRenderPass)
-                VkRenderPassManager::EndRenderPass(frame.commandBuffer);
-            Bool ok = VkRenderPassManager::BeginRenderPass(frame.commandBuffer, renderPassEntry);
+            Bool ok = VkRenderPassManager::BeginRenderPass(frame.commandBuffer, *renderPassEntry);
             MOBILEGL_ASSERT(ok, "%s: BeginRenderPass failed", __func__);
         }
 
         vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-        m_uniformManager->BindProgramUniformBuffers(frame.commandBuffer, program, programObj,
-                                                                  m_frameContext.GetCurrentFrameIndex());
+        const Bool boundUniforms = m_uniformManager->BindProgramUniformBuffers(
+            frame.commandBuffer, program, programObj, m_frameContext.GetCurrentFrameIndex());
+        if (!boundUniforms) {
+            MGLOG_E("SetupDraw skipped: BindProgramUniformBuffers failed");
+            return false;
+        }
 
         auto vtxUploadOk = UploadAndBindVertexBuffers(frame.commandBuffer, vao);
         MOBILEGL_ASSERT(vtxUploadOk, "SetupDraw skipped: failed to upload vertex buffers");
@@ -870,8 +2517,8 @@ void main() {
         VkViewport viewport{};
         viewport.x = 0.0f;
         viewport.y = 0.0f;
-        viewport.width = static_cast<float>(renderPassEntry.extent.x());
-        viewport.height = static_cast<float>(renderPassEntry.extent.y());
+        viewport.width = static_cast<float>(renderPassEntry->extent.x());
+        viewport.height = static_cast<float>(renderPassEntry->extent.y());
         viewport.minDepth = 0.0f;
         viewport.maxDepth = 1.0f;
         vkCmdSetViewport(frame.commandBuffer, 0, 1, &viewport);
@@ -884,7 +2531,7 @@ void main() {
             scissor.extent = { (Uint)scissorBox[2], (Uint)scissorBox[3] };
         } else {
             scissor.offset = {0, 0};
-            scissor.extent = { (Uint)renderPassEntry.extent.x(), (Uint)renderPassEntry.extent.y() };
+            scissor.extent = { (Uint)renderPassEntry->extent.x(), (Uint)renderPassEntry->extent.y() };
         }
         vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
         return true;
@@ -901,6 +2548,135 @@ void main() {
             .stencil = MG_State::pGLContext->GetClearStencil()
         };
         m_clearManager->QueueClear(mask, payload, *fbo);
+    }
+
+    void VulkanRenderer::QueueClearBufferPayload(GLenum buffer, GLint drawbuffer,
+                                                 const ClearAttachmentPayload& clearPayload) {
+        m_clearManager->CollectGarbage();
+        auto* fbo = MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject().get();
+        MOBILEGL_ASSERT(fbo, "VulkanRenderer::QueueClearBufferPayload: draw framebuffer not found");
+
+        auto queueAttachmentClear = [&](FramebufferAttachmentType attachmentType) {
+            if (attachmentType == FramebufferAttachmentType::None) {
+                return;
+            }
+            const auto& attachment = fbo->GetAttachment(attachmentType);
+            if (!attachment.IsTexture() || attachment.IsRenderbuffer()) {
+                return;
+            }
+            auto texture = attachment.GetTexture();
+            if (!texture) {
+                return;
+            }
+            m_clearManager->QueueClear(clearPayload, texture);
+        };
+
+        switch (buffer) {
+            case GL_COLOR: {
+                if (drawbuffer < 0 ||
+                    drawbuffer >= static_cast<GLint>(MG_State::GLState::FramebufferObject::MAX_DRAW_BUFFERS)) {
+                    RecordClearBufferError(__func__, ErrorCode::InvalidValue, "color drawbuffer index is out of range");
+                    return;
+                }
+                queueAttachmentClear(fbo->GetDrawBuffers()[drawbuffer]);
+                return;
+            }
+            case GL_DEPTH:
+                if (drawbuffer != 0) {
+                    RecordClearBufferError(__func__, ErrorCode::InvalidValue, "depth clear requires drawbuffer 0");
+                    return;
+                }
+                queueAttachmentClear(FramebufferAttachmentType::Depth);
+                return;
+            case GL_STENCIL:
+                if (drawbuffer != 0) {
+                    RecordClearBufferError(__func__, ErrorCode::InvalidValue, "stencil clear requires drawbuffer 0");
+                    return;
+                }
+                queueAttachmentClear(FramebufferAttachmentType::Stencil);
+                return;
+            case GL_DEPTH_STENCIL:
+                if (drawbuffer != 0) {
+                    RecordClearBufferError(__func__, ErrorCode::InvalidValue, "depth/stencil clear requires drawbuffer 0");
+                    return;
+                }
+                queueAttachmentClear(FramebufferAttachmentType::Depth);
+                queueAttachmentClear(FramebufferAttachmentType::Stencil);
+                return;
+            default:
+                RecordClearBufferError(__func__, ErrorCode::InvalidEnum, "unsupported clear buffer target");
+                return;
+        }
+    }
+
+    void VulkanRenderer::ClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {
+        ClearAttachmentPayload payload{};
+        payload.mask = GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
+        payload.depth = depth;
+        payload.stencil = static_cast<Uint32>(stencil);
+        QueueClearBufferPayload(buffer, drawbuffer, payload);
+    }
+
+    void VulkanRenderer::ClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat* value) {
+        if (value == nullptr) {
+            return;
+        }
+        ClearAttachmentPayload payload{};
+        switch (buffer) {
+            case GL_COLOR:
+                payload.mask = GL_COLOR_BUFFER_BIT;
+                payload.color = FloatVec4(value[0], value[1], value[2], value[3]);
+                break;
+            case GL_DEPTH:
+                payload.mask = GL_DEPTH_BUFFER_BIT;
+                payload.depth = value[0];
+                break;
+            default:
+                break;
+        }
+        QueueClearBufferPayload(buffer, drawbuffer, payload);
+    }
+
+    void VulkanRenderer::ClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint* value) {
+        if (value == nullptr) {
+            return;
+        }
+        ClearAttachmentPayload payload{};
+        switch (buffer) {
+            case GL_COLOR:
+                payload.mask = GL_COLOR_BUFFER_BIT;
+                payload.color = FloatVec4(static_cast<Float>(value[0]), static_cast<Float>(value[1]),
+                                          static_cast<Float>(value[2]), static_cast<Float>(value[3]));
+                break;
+            case GL_STENCIL:
+                payload.mask = GL_STENCIL_BUFFER_BIT;
+                payload.stencil = value[0];
+                break;
+            default:
+                break;
+        }
+        QueueClearBufferPayload(buffer, drawbuffer, payload);
+    }
+
+    void VulkanRenderer::ClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint* value) {
+        if (value == nullptr) {
+            return;
+        }
+        ClearAttachmentPayload payload{};
+        switch (buffer) {
+            case GL_COLOR:
+                payload.mask = GL_COLOR_BUFFER_BIT;
+                payload.color = FloatVec4(static_cast<Float>(value[0]), static_cast<Float>(value[1]),
+                                          static_cast<Float>(value[2]), static_cast<Float>(value[3]));
+                break;
+            case GL_STENCIL:
+                payload.mask = GL_STENCIL_BUFFER_BIT;
+                payload.stencil = static_cast<Uint32>(std::max(value[0], 0));
+                break;
+            default:
+                break;
+        }
+        QueueClearBufferPayload(buffer, drawbuffer, payload);
     }
 
     Bool VulkanRenderer::MaterializePendingClearForTexture(VkCommandBuffer commandBuffer,
@@ -930,7 +2706,6 @@ void main() {
                         texture.GetExternalIndex());
 
         VkImageSubresourceRange subresourceRange{};
-        subresourceRange.aspectMask = resource->aspect;
         subresourceRange.baseMipLevel = 0;
         subresourceRange.levelCount = 1;
         subresourceRange.baseArrayLayer = 0;
@@ -938,6 +2713,7 @@ void main() {
 
         VkImageLayout sampledLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         if ((resource->aspect & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
+            subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             VkClearColorValue clearValue{};
             clearValue.float32[0] = clearPayload.color.x();
             clearValue.float32[1] = clearPayload.color.y();
@@ -946,6 +2722,19 @@ void main() {
             vkCmdClearColorImage(commandBuffer, resource->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                  &clearValue, 1, &subresourceRange);
         } else {
+            VkImageAspectFlags clearAspectMask = 0;
+            if ((resource->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 &&
+                (clearPayload.mask & GL_DEPTH_BUFFER_BIT) != 0) {
+                clearAspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            }
+            if ((resource->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0 &&
+                (clearPayload.mask & GL_STENCIL_BUFFER_BIT) != 0) {
+                clearAspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            }
+            MOBILEGL_ASSERT(clearAspectMask != 0,
+                            "MaterializePendingClearForTexture: textureId=%d has no matching depth/stencil clear mask",
+                            texture.GetExternalIndex());
+            subresourceRange.aspectMask = clearAspectMask;
             VkClearDepthStencilValue clearValue{};
             clearValue.depth = clearPayload.depth;
             clearValue.stencil = clearPayload.stencil;
@@ -1014,6 +2803,11 @@ void main() {
                     sourceTexture->GetExternalIndex());
             return false;
         }
+        const VkImageView sourceImageView =
+            m_textureManager->GetOrCreateSampledViewAtMipLevel(*sourceTexture, srcBinding.mipLevel);
+        MOBILEGL_ASSERT(sourceImageView != VK_NULL_HANDLE,
+                        "TryBlitToDefaultFramebufferWithShader: failed to create sampled view for textureId=%d mip=%u",
+                        sourceTexture->GetExternalIndex(), srcBinding.mipLevel);
 
         auto& renderPassEntry = m_renderPassManager->GetOrCreateRenderPass(drawFbo, m_imageIndexAcquired);
         const Bool ok = VkRenderPassManager::BeginRenderPass(frame.commandBuffer, renderPassEntry);
@@ -1085,6 +2879,7 @@ void main() {
             .texture = sourceTexture.get(),
             .sampler = (filter == GL_LINEAR ? m_blitResources.linearSampler.get()
                                             : m_blitResources.nearestSampler.get()),
+            .imageView = sourceImageView,
         };
         ProgramFactory::CompileOptionFlags blitTransformFlags = 0;
         const auto& blitProgramObj = m_programFactory->GetOrCreateProgram(*m_blitResources.program, blitTransformFlags);
@@ -1099,16 +2894,27 @@ void main() {
     void VulkanRenderer::BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
                                          GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
                                          GLbitfield mask, GLenum filter) {
-        if ((mask & ~GL_COLOR_BUFFER_BIT) != 0) {
-            MGLOG_E("BlitFramebuffer skipped: only GL_COLOR_BUFFER_BIT is supported right now (mask=0x%x)",
-                    static_cast<Uint32>(mask));
+        static constexpr GLbitfield kSupportedBlitMask = GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT;
+        if ((mask & ~kSupportedBlitMask) != 0) {
+            MGLOG_E("BlitFramebuffer skipped: unsupported mask bits=0x%x", static_cast<Uint32>(mask));
             return;
         }
-        if ((mask & GL_COLOR_BUFFER_BIT) == 0) {
+        const Bool isColorBlit = (mask & GL_COLOR_BUFFER_BIT) != 0;
+        const Bool isDepthBlit = (mask & GL_DEPTH_BUFFER_BIT) != 0;
+        if (!isColorBlit && !isDepthBlit) {
+            return;
+        }
+        if (isColorBlit && isDepthBlit) {
+            MGLOG_E("BlitFramebuffer skipped: combined color+depth blits are not supported yet (mask=0x%x)",
+                    static_cast<Uint32>(mask));
             return;
         }
         if (filter != GL_NEAREST && filter != GL_LINEAR) {
             MGLOG_E("BlitFramebuffer skipped: unsupported filter=0x%x", static_cast<Uint32>(filter));
+            return;
+        }
+        if (isDepthBlit && filter != GL_NEAREST) {
+            MGLOG_E("BlitFramebuffer skipped: depth blits currently require GL_NEAREST");
             return;
         }
 
@@ -1132,13 +2938,168 @@ void main() {
             (readFbo == MG_Impl::GLImpl::FramebufferImpl::pDefaultFramebufferInfo->defaultFBO);
         const Bool drawIsDefaultFbo =
             (drawFbo == MG_Impl::GLImpl::FramebufferImpl::pDefaultFramebufferInfo->defaultFBO);
-        if (drawIsDefaultFbo && m_swapchainObject.GetPreTransform() != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
+        if (isColorBlit && drawIsDefaultFbo &&
+            RequiresShaderBlitToDefaultFramebuffer(m_swapchainObject.GetPreTransform())) {
             if (TryBlitToDefaultFramebufferWithShader(frame, *readFbo, *drawFbo,
                                                       srcX0, srcY0, srcX1, srcY1,
                                                       dstX0, dstY0, dstX1, dstY1, filter)) {
                 return;
             }
             MGLOG_E("BlitFramebuffer skipped: rotated blit to default framebuffer requires a texture-backed source framebuffer");
+            return;
+        }
+
+        if (isDepthBlit) {
+            BlitImageBinding srcBinding{};
+            BlitImageBinding dstBinding{};
+            if (!ResolveFramebufferBlitBinding(*readFbo, true, m_imageIndexAcquired, m_swapchainObject,
+                                               *m_textureManager, VK_IMAGE_ASPECT_DEPTH_BIT, srcBinding) ||
+                !ResolveFramebufferBlitBinding(*drawFbo, false, m_imageIndexAcquired, m_swapchainObject,
+                                               *m_textureManager, VK_IMAGE_ASPECT_DEPTH_BIT, dstBinding)) {
+                return;
+            }
+
+            if (srcX1 < srcX0 || srcY1 < srcY0 || dstX1 < dstX0 || dstY1 < dstY0) {
+                MGLOG_E("BlitFramebuffer skipped: depth blits with flipped rectangles are not supported yet");
+                return;
+            }
+
+            const Int srcWidth = srcX1 - srcX0;
+            const Int srcHeight = srcY1 - srcY0;
+            const Int dstWidth = dstX1 - dstX0;
+            const Int dstHeight = dstY1 - dstY0;
+            if (srcWidth <= 0 || srcHeight <= 0 || srcWidth != dstWidth || srcHeight != dstHeight) {
+                MGLOG_E("BlitFramebuffer skipped: depth blits currently require matching source and destination extents");
+                return;
+            }
+
+            if (!readIsDefaultFbo) {
+                const auto sourceAttachmentType = ResolveFramebufferCopyAttachmentType(*readFbo, true, srcBinding.aspectMask);
+                const auto& sourceAttachment = readFbo->GetAttachment(sourceAttachmentType);
+                auto sourceTexture = sourceAttachment.GetTexture();
+                MOBILEGL_ASSERT(sourceTexture != nullptr, "BlitFramebuffer: depth source texture attachment is null");
+                const Bool clearReady = MaterializePendingClearForTexture(frame.commandBuffer, *sourceTexture);
+                MOBILEGL_ASSERT(clearReady,
+                                "BlitFramebuffer: failed to materialize pending clear for depth source textureId=%d",
+                                sourceTexture->GetExternalIndex());
+            }
+
+            const VkImageLayout srcOriginalLayout = readIsDefaultFbo
+                ? m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired)
+                : *srcBinding.trackedLayout;
+            if (srcOriginalLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+                MGLOG_E("BlitFramebuffer skipped: depth source image layout is undefined");
+                return;
+            }
+
+            const VkImageLayout dstOriginalLayout = drawIsDefaultFbo
+                ? m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired)
+                : *dstBinding.trackedLayout;
+            const VkImageLayout dstRestoreLayout = dstOriginalLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                : dstOriginalLayout;
+
+            VkPipelineStageFlags srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            VkAccessFlags srcAccessMask = 0;
+            GetImageTransitionSourceState(srcOriginalLayout, srcStageMask, srcAccessMask);
+            if (readIsDefaultFbo) {
+                VkImageLayout srcTrackedLayout = srcOriginalLayout;
+                Bool ok = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, srcBinding.image, srcTrackedLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    srcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    srcAccessMask, VK_ACCESS_TRANSFER_READ_BIT, srcBinding.aspectMask,
+                    srcBinding.mipLevel, srcBinding.mipLevelCount);
+                MOBILEGL_ASSERT(ok, "%s: failed to transition swapchain depth source image", __func__);
+                m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired, srcTrackedLayout);
+            } else {
+                Bool ok = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, srcBinding.image, *srcBinding.trackedLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    srcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    srcAccessMask, VK_ACCESS_TRANSFER_READ_BIT, srcBinding.aspectMask,
+                    srcBinding.mipLevel, srcBinding.mipLevelCount);
+                MOBILEGL_ASSERT(ok, "%s: failed to transition depth source image", __func__);
+            }
+
+            VkPipelineStageFlags dstStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            VkAccessFlags dstAccessMask = 0;
+            GetImageTransitionSourceState(dstOriginalLayout, dstStageMask, dstAccessMask);
+            if (drawIsDefaultFbo) {
+                VkImageLayout dstTrackedLayout = dstOriginalLayout;
+                Bool ok = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, dstBinding.image, dstTrackedLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    dstStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    dstAccessMask, VK_ACCESS_TRANSFER_WRITE_BIT, dstBinding.aspectMask,
+                    dstBinding.mipLevel, dstBinding.mipLevelCount);
+                MOBILEGL_ASSERT(ok, "%s: failed to transition swapchain depth destination image", __func__);
+                m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired, dstTrackedLayout);
+            } else {
+                Bool ok = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, dstBinding.image, *dstBinding.trackedLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    dstStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    dstAccessMask, VK_ACCESS_TRANSFER_WRITE_BIT, dstBinding.aspectMask,
+                    dstBinding.mipLevel, dstBinding.mipLevelCount);
+                MOBILEGL_ASSERT(ok, "%s: failed to transition depth destination image", __func__);
+            }
+
+            VkImageCopy copyRegion{};
+            copyRegion.srcSubresource.aspectMask = srcBinding.aspectMask;
+            copyRegion.srcSubresource.mipLevel = srcBinding.mipLevel;
+            copyRegion.srcSubresource.baseArrayLayer = 0;
+            copyRegion.srcSubresource.layerCount = 1;
+            copyRegion.srcOffset = {srcX0, srcY0, 0};
+            copyRegion.dstSubresource.aspectMask = dstBinding.aspectMask;
+            copyRegion.dstSubresource.mipLevel = dstBinding.mipLevel;
+            copyRegion.dstSubresource.baseArrayLayer = 0;
+            copyRegion.dstSubresource.layerCount = 1;
+            copyRegion.dstOffset = {dstX0, dstY0, 0};
+            copyRegion.extent = {static_cast<Uint32>(srcWidth), static_cast<Uint32>(srcHeight), 1};
+
+            vkCmdCopyImage(frame.commandBuffer,
+                           srcBinding.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           dstBinding.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &copyRegion);
+
+            VkPipelineStageFlags srcRestoreStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            VkAccessFlags srcRestoreAccessMask = 0;
+            GetImageTransitionDestinationState(srcOriginalLayout, srcRestoreStageMask, srcRestoreAccessMask);
+            if (readIsDefaultFbo) {
+                VkImageLayout srcTrackedLayout = m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired);
+                Bool ok = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, srcBinding.image, srcTrackedLayout, srcOriginalLayout,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, srcRestoreStageMask,
+                    VK_ACCESS_TRANSFER_READ_BIT, srcRestoreAccessMask, srcBinding.aspectMask,
+                    srcBinding.mipLevel, srcBinding.mipLevelCount);
+                MOBILEGL_ASSERT(ok, "%s: failed to restore swapchain depth source image layout", __func__);
+                m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired, srcTrackedLayout);
+            } else {
+                Bool ok = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, srcBinding.image, *srcBinding.trackedLayout, srcOriginalLayout,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, srcRestoreStageMask,
+                    VK_ACCESS_TRANSFER_READ_BIT, srcRestoreAccessMask, srcBinding.aspectMask,
+                    srcBinding.mipLevel, srcBinding.mipLevelCount);
+                MOBILEGL_ASSERT(ok, "%s: failed to restore depth source image layout", __func__);
+            }
+
+            VkPipelineStageFlags dstRestoreStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            VkAccessFlags dstRestoreAccessMask = 0;
+            GetImageTransitionDestinationState(dstRestoreLayout, dstRestoreStageMask, dstRestoreAccessMask);
+            if (drawIsDefaultFbo) {
+                VkImageLayout dstTrackedLayout = m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired);
+                Bool ok = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, dstBinding.image, dstTrackedLayout, dstRestoreLayout,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, dstRestoreStageMask,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, dstRestoreAccessMask, dstBinding.aspectMask,
+                    dstBinding.mipLevel, dstBinding.mipLevelCount);
+                MOBILEGL_ASSERT(ok, "%s: failed to restore swapchain depth destination image layout", __func__);
+                m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired, dstTrackedLayout);
+            } else {
+                Bool ok = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, dstBinding.image, *dstBinding.trackedLayout, dstRestoreLayout,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, dstRestoreStageMask,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, dstRestoreAccessMask, dstBinding.aspectMask,
+                    dstBinding.mipLevel, dstBinding.mipLevelCount);
+                MOBILEGL_ASSERT(ok, "%s: failed to restore depth destination image layout", __func__);
+            }
             return;
         }
 
@@ -1184,7 +3145,7 @@ void main() {
                 srcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 srcAccessMask, VK_ACCESS_TRANSFER_READ_BIT, srcBinding.aspectMask);
             MOBILEGL_ASSERT(ok, "%s: failed to transition swapchain source image", __func__);
-            m_swapchainObject.SetImageLayout(m_imageIndexAcquired, srcLayout);
+            m_swapchainObject.SetImageLayout(m_imageIndexAcquired, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         } else {
             Bool ok = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, srcBinding.image, *srcBinding.trackedLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -1202,7 +3163,7 @@ void main() {
                 dstStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 dstAccessMask, VK_ACCESS_TRANSFER_WRITE_BIT, dstBinding.aspectMask);
             MOBILEGL_ASSERT(ok, "%s: failed to transition swapchain destination image", __func__);
-            m_swapchainObject.SetImageLayout(m_imageIndexAcquired, dstLayout);
+            m_swapchainObject.SetImageLayout(m_imageIndexAcquired, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         } else {
             Bool ok = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, dstBinding.image, *dstBinding.trackedLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1224,6 +3185,9 @@ void main() {
         blitRegion.dstSubresource.layerCount = 1;
         blitRegion.dstOffsets[0] = {dstX0, dstY0, 0};
         blitRegion.dstOffsets[1] = {dstX1, dstY1, 1};
+        if (drawIsDefaultFbo) {
+            ApplyNativeBlitDefaultFramebufferTransform(m_swapchainObject.GetPreTransform(), dstBinding, blitRegion);
+        }
 
         vkCmdBlitImage(frame.commandBuffer,
                        srcBinding.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -1231,10 +3195,383 @@ void main() {
                        1, &blitRegion, filter == GL_LINEAR ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
 
+    void VulkanRenderer::CopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
+                                           GLint x, GLint y, GLsizei width, GLsizei height) {
+        if (width <= 0 || height <= 0) {
+            return;
+        }
+
+        const auto textureTarget = MG_Util::ConvertGLEnumToTextureTarget(target);
+        if (textureTarget != TextureTarget::Texture2D) {
+            RecordTextureCopyError(__func__, ErrorCode::InvalidOperation,
+                                   "CopyTexSubImage2D currently only supports GL_TEXTURE_2D destinations.");
+            return;
+        }
+        if (level < 0) {
+            RecordTextureCopyError(__func__, ErrorCode::InvalidValue,
+                                   "CopyTexSubImage2D level must be non-negative.");
+            return;
+        }
+
+        auto& textureUnit = MG_State::pGLContext->GetTextureUnitObject(MG_State::pGLContext->GetActiveTextureUnit());
+        auto destinationTexture = textureUnit.GetBindingSlot(textureTarget).GetBoundObject();
+        if (destinationTexture == nullptr) {
+            RecordTextureCopyError(__func__, ErrorCode::InvalidOperation,
+                                   "CopyTexSubImage2D requires a bound destination texture.");
+            return;
+        }
+
+        auto readFbo = MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Read).GetBoundObject();
+        if (readFbo == nullptr) {
+            RecordTextureCopyError(__func__, ErrorCode::InvalidOperation,
+                                   "CopyTexSubImage2D requires a framebuffer bound to GL_READ_FRAMEBUFFER.");
+            return;
+        }
+
+        auto& frame = m_frameContext.GetCurrent();
+        if (!frame.isCommandRecording) {
+            m_frameContext.BeginCommandRecording();
+            m_uniformManager->BeginFrame(m_frameContext.GetCurrentFrameIndex());
+        }
+
+        if (VkRenderPassManager::GetActiveRenderPass() != nullptr) {
+            VkRenderPassManager::EndRenderPass(frame.commandBuffer);
+        }
+
+        const Bool readIsDefaultFbo =
+            (readFbo == MG_Impl::GLImpl::FramebufferImpl::pDefaultFramebufferInfo->defaultFBO);
+
+        BlitImageBinding dstBinding{};
+        if (!ResolveTextureCopyDestinationBinding(*destinationTexture, static_cast<Uint32>(level), *m_textureManager,
+                                                  dstBinding)) {
+            RecordTextureCopyError(__func__, ErrorCode::InvalidOperation,
+                                   "CopyTexSubImage2D failed to resolve the destination texture.");
+            return;
+        }
+
+        BlitImageBinding srcBinding{};
+        if (!ResolveTextureCopySourceBinding(*readFbo, m_imageIndexAcquired, m_swapchainObject, *m_textureManager,
+                                             dstBinding.aspectMask, srcBinding)) {
+            RecordTextureCopyError(__func__, ErrorCode::InvalidOperation,
+                                   "CopyTexSubImage2D requires a complete read attachment compatible with the destination texture.");
+            return;
+        }
+
+        if (!readIsDefaultFbo) {
+            const auto sourceAttachmentType = ResolveFramebufferCopyAttachmentType(*readFbo, true, srcBinding.aspectMask);
+            const auto& sourceAttachment = readFbo->GetAttachment(sourceAttachmentType);
+            auto sourceTexture = sourceAttachment.GetTexture();
+            MOBILEGL_ASSERT(sourceTexture != nullptr, "CopyTexSubImage2D: source texture attachment is null");
+            const Bool clearReady = MaterializePendingClearForTexture(frame.commandBuffer, *sourceTexture);
+            MOBILEGL_ASSERT(clearReady,
+                            "CopyTexSubImage2D: failed to materialize pending clear for source textureId=%d",
+                            sourceTexture->GetExternalIndex());
+        }
+
+        const Bool srcUsesSwapchainDepth = readIsDefaultFbo && (srcBinding.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) == 0;
+        const VkImageLayout srcOriginalLayout = readIsDefaultFbo
+            ? (srcUsesSwapchainDepth
+                ? m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired)
+                : m_swapchainObject.GetImageLayout(m_imageIndexAcquired))
+            : *srcBinding.trackedLayout;
+        if (srcOriginalLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+            RecordTextureCopyError(__func__, ErrorCode::InvalidOperation,
+                                   "CopyTexSubImage2D source image has undefined layout.");
+            return;
+        }
+
+        const VkImageLayout dstOriginalLayout = *dstBinding.trackedLayout;
+        const VkImageLayout dstRestoreLayout = dstOriginalLayout == VK_IMAGE_LAYOUT_UNDEFINED
+            ? ((dstBinding.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0
+                ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            : dstOriginalLayout;
+
+        VkPipelineStageFlags srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        VkAccessFlags srcAccessMask = 0;
+        GetImageTransitionSourceState(srcOriginalLayout, srcStageMask, srcAccessMask);
+        if (readIsDefaultFbo) {
+            VkImageLayout srcTrackedLayout = srcOriginalLayout;
+            Bool ok = VkTextureManager::TransitionImageLayout(
+                frame.commandBuffer, srcBinding.image, srcTrackedLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                srcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                srcAccessMask, VK_ACCESS_TRANSFER_READ_BIT, srcBinding.aspectMask,
+                srcBinding.mipLevel, srcBinding.mipLevelCount);
+            MOBILEGL_ASSERT(ok, "%s: failed to transition swapchain source image", __func__);
+            if (srcUsesSwapchainDepth) {
+                m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired, srcTrackedLayout);
+            } else {
+                m_swapchainObject.SetImageLayout(m_imageIndexAcquired, srcTrackedLayout);
+            }
+        } else {
+            Bool ok = VkTextureManager::TransitionImageLayout(
+                frame.commandBuffer, srcBinding.image, *srcBinding.trackedLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                srcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                srcAccessMask, VK_ACCESS_TRANSFER_READ_BIT, srcBinding.aspectMask,
+                srcBinding.mipLevel, srcBinding.mipLevelCount);
+            MOBILEGL_ASSERT(ok, "%s: failed to transition source image", __func__);
+        }
+
+        VkPipelineStageFlags dstStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        VkAccessFlags dstAccessMask = 0;
+        GetImageTransitionSourceState(dstOriginalLayout, dstStageMask, dstAccessMask);
+        Bool dstReady = VkTextureManager::TransitionImageLayout(
+            frame.commandBuffer, dstBinding.image, *dstBinding.trackedLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            dstStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            dstAccessMask, VK_ACCESS_TRANSFER_WRITE_BIT, dstBinding.aspectMask,
+            dstBinding.mipLevel, dstBinding.mipLevelCount);
+        MOBILEGL_ASSERT(dstReady, "%s: failed to transition destination image", __func__);
+
+        VkImageCopy copyRegion{};
+        copyRegion.srcSubresource.aspectMask = srcBinding.aspectMask;
+        copyRegion.srcSubresource.mipLevel = srcBinding.mipLevel;
+        copyRegion.srcSubresource.baseArrayLayer = 0;
+        copyRegion.srcSubresource.layerCount = 1;
+        copyRegion.srcOffset = {x, y, 0};
+        copyRegion.dstSubresource.aspectMask = dstBinding.aspectMask;
+        copyRegion.dstSubresource.mipLevel = dstBinding.mipLevel;
+        copyRegion.dstSubresource.baseArrayLayer = 0;
+        copyRegion.dstSubresource.layerCount = 1;
+        copyRegion.dstOffset = {xoffset, yoffset, 0};
+        copyRegion.extent = {static_cast<Uint32>(width), static_cast<Uint32>(height), 1};
+        vkCmdCopyImage(frame.commandBuffer,
+                       srcBinding.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       dstBinding.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &copyRegion);
+
+        VkPipelineStageFlags srcRestoreStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        VkAccessFlags srcRestoreAccessMask = 0;
+        GetImageTransitionDestinationState(srcOriginalLayout, srcRestoreStageMask, srcRestoreAccessMask);
+        if (readIsDefaultFbo) {
+            VkImageLayout srcTrackedLayout = srcUsesSwapchainDepth
+                ? m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired)
+                : m_swapchainObject.GetImageLayout(m_imageIndexAcquired);
+            Bool ok = VkTextureManager::TransitionImageLayout(
+                frame.commandBuffer, srcBinding.image, srcTrackedLayout, srcOriginalLayout,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, srcRestoreStageMask,
+                VK_ACCESS_TRANSFER_READ_BIT, srcRestoreAccessMask, srcBinding.aspectMask,
+                srcBinding.mipLevel, srcBinding.mipLevelCount);
+            MOBILEGL_ASSERT(ok, "%s: failed to restore swapchain source image layout", __func__);
+            if (srcUsesSwapchainDepth) {
+                m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired, srcTrackedLayout);
+            } else {
+                m_swapchainObject.SetImageLayout(m_imageIndexAcquired, srcTrackedLayout);
+            }
+        } else {
+            Bool ok = VkTextureManager::TransitionImageLayout(
+                frame.commandBuffer, srcBinding.image, *srcBinding.trackedLayout, srcOriginalLayout,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, srcRestoreStageMask,
+                VK_ACCESS_TRANSFER_READ_BIT, srcRestoreAccessMask, srcBinding.aspectMask,
+                srcBinding.mipLevel, srcBinding.mipLevelCount);
+            MOBILEGL_ASSERT(ok, "%s: failed to restore source image layout", __func__);
+        }
+
+        VkPipelineStageFlags dstRestoreStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        VkAccessFlags dstRestoreAccessMask = 0;
+        GetImageTransitionDestinationState(dstRestoreLayout, dstRestoreStageMask, dstRestoreAccessMask);
+        Bool dstRestored = VkTextureManager::TransitionImageLayout(
+            frame.commandBuffer, dstBinding.image, *dstBinding.trackedLayout, dstRestoreLayout,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, dstRestoreStageMask,
+            VK_ACCESS_TRANSFER_WRITE_BIT, dstRestoreAccessMask, dstBinding.aspectMask,
+            dstBinding.mipLevel, dstBinding.mipLevelCount);
+        MOBILEGL_ASSERT(dstRestored, "%s: failed to restore destination image layout", __func__);
+    }
+
+    void VulkanRenderer::GenerateMipmap(GLenum target) {
+        const auto textureTarget = MG_Util::ConvertGLEnumToTextureTarget(target);
+        const auto uploadTarget = MG_Util::ConvertGLEnumToTextureUploadTarget(target);
+        MOBILEGL_ASSERT(textureTarget == TextureTarget::Texture2D || textureTarget == TextureTarget::Texture3D,
+                        "GenerateMipmap currently only supports GL_TEXTURE_2D and GL_TEXTURE_3D.");
+
+        auto& textureUnit = MG_State::pGLContext->GetTextureUnitObject(MG_State::pGLContext->GetActiveTextureUnit());
+        auto texture = textureUnit.GetBindingSlot(textureTarget).GetBoundObject();
+        MOBILEGL_ASSERT(texture != nullptr, "GenerateMipmap requires a bound texture.");
+        MOBILEGL_ASSERT(texture->IsComplete(), "GenerateMipmap requires a complete texture.");
+
+        auto* mipmapTexture = dynamic_cast<MG_State::GLState::TextureObjectMipmap*>(texture.get());
+        MOBILEGL_ASSERT(mipmapTexture != nullptr, "GenerateMipmap requires a mipmapped texture object.");
+
+        const Uint32 currentMipLevelCount = static_cast<Uint32>(mipmapTexture->GetMipmapLevelCount());
+        MOBILEGL_ASSERT(currentMipLevelCount > 0, "GenerateMipmap requires level 0 storage.");
+
+        const Uint32 baseMipLevel = std::min(static_cast<Uint32>(texture->GetLevelRange().x()), currentMipLevelCount - 1);
+
+        auto& frame = m_frameContext.GetCurrent();
+        if (!frame.isCommandRecording) {
+            m_frameContext.BeginCommandRecording();
+            m_uniformManager->BeginFrame(m_frameContext.GetCurrentFrameIndex());
+        }
+
+        if (VkRenderPassManager::GetActiveRenderPass() != nullptr) {
+            VkRenderPassManager::EndRenderPass(frame.commandBuffer);
+        }
+
+        const Bool clearReady = MaterializePendingClearForTexture(frame.commandBuffer, *texture);
+        MOBILEGL_ASSERT(clearReady,
+                        "GenerateMipmap: failed to materialize pending clear for textureId=%d",
+                        texture->GetExternalIndex());
+
+        auto* resource = m_textureManager->SyncTextureAndGetDescriptor(*texture);
+        MOBILEGL_ASSERT(resource != nullptr && resource->image != VK_NULL_HANDLE,
+                        "GenerateMipmap failed to sync the backend texture.");
+
+        VkFormatProperties formatProperties{};
+        vkGetPhysicalDeviceFormatProperties(m_physicalDevice.handle, resource->format, &formatProperties);
+        const VkFormatFeatureFlags optimalTilingFeatures = formatProperties.optimalTilingFeatures;
+        const Bool isDepthOrStencilTexture =
+            (resource->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+        if (!isDepthOrStencilTexture &&
+            ((optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) == 0 ||
+             (optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) == 0)) {
+            MGLOG_W("GenerateMipmap skipped for textureId=%d because Vulkan format %d does not support blit-based mip generation",
+                texture->GetExternalIndex(), static_cast<Int>(resource->format));
+            return;
+        }
+
+        MOBILEGL_ASSERT(EnsureGenerateMipmapStorageAllocated(*mipmapTexture, uploadTarget, baseMipLevel),
+                "GenerateMipmap could not allocate a full mip chain for this texture.");
+
+        resource = m_textureManager->SyncTextureAndGetDescriptor(*texture);
+        MOBILEGL_ASSERT(resource != nullptr && resource->image != VK_NULL_HANDLE,
+                "GenerateMipmap failed to resync the backend texture after allocating mip storage.");
+        MOBILEGL_ASSERT(resource->layout != VK_IMAGE_LAYOUT_UNDEFINED,
+                "GenerateMipmap requires initialized base-level image data.");
+
+        const IntVec3 storageBaseTexelSize = {
+            static_cast<Int>(resource->extent.width),
+            static_cast<Int>(resource->extent.height),
+            static_cast<Int>(resource->depth),
+        };
+        const IntVec3 baseTexelSize = ComputeMipTexelSize(storageBaseTexelSize, baseMipLevel);
+        const Uint32 requiredMipLevelCount = baseMipLevel + ComputeFullMipLevelCount(baseTexelSize);
+        const Uint32 generateMipLevelCount = std::min(requiredMipLevelCount, resource->mipLevels);
+        if (generateMipLevelCount <= baseMipLevel + 1) {
+            resource->layout = ResolveGenerateMipmapFinalLayout(resource->aspect);
+            return;
+        }
+
+        const VkImageLayout originalLayout = resource->layout;
+        const VkImageLayout finalLayout = ResolveGenerateMipmapFinalLayout(resource->aspect);
+        if (isDepthOrStencilTexture) {
+            const Bool depthReady = GenerateDepthMipmapWithShader(frame, *texture, *resource,
+                                                                  baseMipLevel, generateMipLevelCount,
+                                                                  storageBaseTexelSize, originalLayout, finalLayout);
+            MOBILEGL_ASSERT(depthReady,
+                            "GenerateMipmap: depth/stencil fallback failed for textureId=%d target=%d internalFormat=%d vkFormat=%d",
+                            texture->GetExternalIndex(), static_cast<Int>(texture->GetTarget()),
+                            static_cast<Int>(texture->GetFormat()), static_cast<Int>(resource->format));
+            return;
+        }
+
+        const VkFilter blitFilter = (optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0
+            ? VK_FILTER_LINEAR
+            : VK_FILTER_NEAREST;
+
+        VkPipelineStageFlags originalSrcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        VkAccessFlags originalSrcAccessMask = 0;
+        GetImageTransitionSourceState(originalLayout, originalSrcStageMask, originalSrcAccessMask);
+
+        VkPipelineStageFlags finalDstStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        VkAccessFlags finalDstAccessMask = 0;
+        GetImageTransitionDestinationState(finalLayout, finalDstStageMask, finalDstAccessMask);
+
+        if (originalLayout != finalLayout) {
+            if (baseMipLevel > 0) {
+                VkImageLayout lowerMipLayout = originalLayout;
+                const Bool lowerReady = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, resource->image, lowerMipLayout, finalLayout,
+                    originalSrcStageMask, finalDstStageMask,
+                    originalSrcAccessMask, finalDstAccessMask,
+                    resource->aspect, 0, baseMipLevel);
+                MOBILEGL_ASSERT(lowerReady, "%s: failed to transition lower untouched mip levels", __func__);
+            }
+
+            if (generateMipLevelCount < resource->mipLevels) {
+                VkImageLayout upperMipLayout = originalLayout;
+                const Bool upperReady = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, resource->image, upperMipLayout, finalLayout,
+                    originalSrcStageMask, finalDstStageMask,
+                    originalSrcAccessMask, finalDstAccessMask,
+                    resource->aspect, generateMipLevelCount, resource->mipLevels - generateMipLevelCount);
+                MOBILEGL_ASSERT(upperReady, "%s: failed to transition upper untouched mip levels", __func__);
+            }
+        }
+
+        VkImageLayout srcMipLayout = originalLayout;
+        Bool srcReady = VkTextureManager::TransitionImageLayout(
+            frame.commandBuffer, resource->image, srcMipLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            originalSrcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            originalSrcAccessMask, VK_ACCESS_TRANSFER_READ_BIT,
+            resource->aspect, baseMipLevel, 1);
+        MOBILEGL_ASSERT(srcReady, "%s: failed to transition base mip level to transfer source", __func__);
+
+        for (Uint32 level = baseMipLevel + 1; level < generateMipLevelCount; ++level) {
+            VkImageLayout dstMipLayout = originalLayout;
+            Bool dstReady = VkTextureManager::TransitionImageLayout(
+                frame.commandBuffer, resource->image, dstMipLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                originalSrcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                originalSrcAccessMask, VK_ACCESS_TRANSFER_WRITE_BIT,
+                resource->aspect, level, 1);
+            MOBILEGL_ASSERT(dstReady, "%s: failed to transition mip level %u to transfer destination", __func__, level);
+
+            const IntVec3 srcTexelSize = ComputeMipTexelSize(storageBaseTexelSize, level - 1);
+            const IntVec3 dstTexelSize = ComputeMipTexelSize(storageBaseTexelSize, level);
+
+            VkImageBlit blitRegion{};
+            blitRegion.srcSubresource.aspectMask = resource->aspect;
+            blitRegion.srcSubresource.mipLevel = level - 1;
+            blitRegion.srcSubresource.baseArrayLayer = 0;
+            blitRegion.srcSubresource.layerCount = 1;
+            blitRegion.srcOffsets[0] = {0, 0, 0};
+            blitRegion.srcOffsets[1] = {srcTexelSize.x(), srcTexelSize.y(), srcTexelSize.z()};
+            blitRegion.dstSubresource.aspectMask = resource->aspect;
+            blitRegion.dstSubresource.mipLevel = level;
+            blitRegion.dstSubresource.baseArrayLayer = 0;
+            blitRegion.dstSubresource.layerCount = 1;
+            blitRegion.dstOffsets[0] = {0, 0, 0};
+            blitRegion.dstOffsets[1] = {dstTexelSize.x(), dstTexelSize.y(), dstTexelSize.z()};
+
+            vkCmdBlitImage(frame.commandBuffer,
+                           resource->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           resource->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &blitRegion, blitFilter);
+
+            VkImageLayout finishedSrcLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            Bool srcRestored = VkTextureManager::TransitionImageLayout(
+                frame.commandBuffer, resource->image, finishedSrcLayout, finalLayout,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, finalDstStageMask,
+                VK_ACCESS_TRANSFER_READ_BIT, finalDstAccessMask,
+                resource->aspect, level - 1, 1);
+            MOBILEGL_ASSERT(srcRestored, "%s: failed to transition mip level %u to final layout", __func__, level - 1);
+
+            if (level + 1 < generateMipLevelCount) {
+                VkImageLayout nextSrcLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                Bool nextSrcReady = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, resource->image, nextSrcLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    resource->aspect, level, 1);
+                MOBILEGL_ASSERT(nextSrcReady, "%s: failed to prepare mip level %u as next transfer source", __func__, level);
+            } else {
+                VkImageLayout lastMipLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                Bool lastMipReady = VkTextureManager::TransitionImageLayout(
+                    frame.commandBuffer, resource->image, lastMipLayout, finalLayout,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, finalDstStageMask,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, finalDstAccessMask,
+                    resource->aspect, level, 1);
+                MOBILEGL_ASSERT(lastMipReady, "%s: failed to transition last mip level to final layout", __func__);
+            }
+        }
+
+        resource->layout = finalLayout;
+    }
+
     void VulkanRenderer::DrawArrays(const DrawCmd& payload) {
         auto& frame = m_frameContext.GetCurrent();
 
-        SetupDraw(frame, payload.mode, 0);
+        if (!SetupDraw(frame, payload.mode, 0)) {
+            return;
+        }
 
         MOBILEGL_ASSERT(frame.isCommandRecording, "%s: frame recording was not started", __func__);
 
@@ -1250,8 +3587,10 @@ void main() {
     void VulkanRenderer::DrawElements(const DrawIndexedCmd& payload) {
         auto& frame = m_frameContext.GetCurrent();
 
-        SetupDraw(frame, payload.mode, DrawSetupAspect::IndexBuffer,
-                       &payload.indexBufferView);
+        if (!SetupDraw(frame, payload.mode, DrawSetupAspect::IndexBuffer,
+                       &payload.indexBufferView)) {
+            return;
+        }
 
         MOBILEGL_ASSERT(frame.isCommandRecording, "%s: frame recording was not started", __func__);
 
@@ -1268,8 +3607,10 @@ void main() {
     void VulkanRenderer::MultiDrawElements(const MultiDrawIndexedCmd& payload) {
         auto& frame = m_frameContext.GetCurrent();
 
-        SetupDraw(frame, payload.mode, DrawSetupAspect::IndexBuffer,
-                  &payload.indexBufferView);
+        if (!SetupDraw(frame, payload.mode, DrawSetupAspect::IndexBuffer,
+                  &payload.indexBufferView)) {
+            return;
+        }
 
         MOBILEGL_ASSERT(frame.isCommandRecording, "%s: frame recording was not started", __func__);
 
@@ -1330,8 +3671,10 @@ void main() {
             result = VK_SUCCESS;
         }
         VK_VERIFY(result, "Present, vkAcquireNextImageKHR");
+        CollectDeferredDepthMipmapCleanup(m_frameContext.GetCurrentFrameIndex());
+        m_textureManager->BeginFrame(m_frameContext.GetCurrentFrameIndex());
         m_bufferManager.BeginFrame(m_frameContext.GetCurrentFrameIndex());
-        m_transientVertexIndexBuffersThisFrame.clear();
+        m_transientVertexIndexBufferSlicesThisFrame.clear();
     }
 
     void VulkanRenderer::CreateInstance() {
@@ -1603,8 +3946,14 @@ void main() {
             presentQueueCreateInfo.pQueuePriorities = &queuePriority;
         }
 
+        VkPhysicalDeviceFeatures supportedDeviceFeatures{};
+        vkGetPhysicalDeviceFeatures(m_physicalDevice.handle, &supportedDeviceFeatures);
+
         VkPhysicalDeviceFeatures deviceFeatures{};
-        // TODO: query and make use of device features
+        deviceFeatures.geometryShader = supportedDeviceFeatures.geometryShader;
+        deviceFeatures.independentBlend = supportedDeviceFeatures.independentBlend;
+        deviceFeatures.shaderClipDistance = supportedDeviceFeatures.shaderClipDistance;
+        deviceFeatures.shaderCullDistance = supportedDeviceFeatures.shaderCullDistance;
 
         VkDeviceCreateInfo deviceCreateInfo{};
         deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -1669,6 +4018,16 @@ void main() {
 
         deviceCreateInfo.enabledExtensionCount = static_cast<Uint32>(enabledDeviceExtensions.size());
         deviceCreateInfo.ppEnabledExtensionNames = enabledDeviceExtensions.data();
+        MGLOG_I("Device feature support: geometryShader=%s independentBlend=%s shaderClipDistance=%s shaderCullDistance=%s",
+            supportedDeviceFeatures.geometryShader ? "true" : "false",
+            supportedDeviceFeatures.independentBlend ? "true" : "false",
+            supportedDeviceFeatures.shaderClipDistance ? "true" : "false",
+            supportedDeviceFeatures.shaderCullDistance ? "true" : "false");
+        MGLOG_I("Device feature enabled: geometryShader=%s independentBlend=%s shaderClipDistance=%s shaderCullDistance=%s",
+            deviceFeatures.geometryShader ? "true" : "false",
+            deviceFeatures.independentBlend ? "true" : "false",
+            deviceFeatures.shaderClipDistance ? "true" : "false",
+            deviceFeatures.shaderCullDistance ? "true" : "false");
         VK_VERIFY(vkCreateDevice(m_physicalDevice.handle, &deviceCreateInfo, nullptr, &m_device), "vkCreateDevice");
 
         s_vkCmdDrawIndexedIndirectCount = reinterpret_cast<PFNDrawIndexedIndirectCountFunc>(
@@ -1891,6 +4250,9 @@ void main() {
 
         vkDeviceWaitIdle(m_device);
 
+        DestroyDeferredDepthMipmapCleanup();
+        m_deferredDepthMipmapCleanup.assign(m_frameContext.GetFrameCount(), {});
+
         ShutdownSwapchain();
 
         CreateSwapchain();
@@ -1910,8 +4272,11 @@ void main() {
         const Bool okArena = m_bufferManager.RecreateTransientArenas(m_frameContext.GetFrameCount());
         MOBILEGL_ASSERT(okArena, "RecreateSwapchain: buffer manager transient arena initialization failed");
         if (m_frameContext.GetFrameCount() > 0) {
+            if (m_textureManager) {
+                m_textureManager->BeginFrame(m_frameContext.GetCurrentFrameIndex());
+            }
             m_bufferManager.BeginFrame(m_frameContext.GetCurrentFrameIndex());
-            m_transientVertexIndexBuffersThisFrame.clear();
+            m_transientVertexIndexBufferSlicesThisFrame.clear();
         }
     }
 
@@ -1948,8 +4313,7 @@ void main() {
 
             VkClearAttachment clearAttachment{};
             clearAttachment.clearValue.depthStencil = {1.0f, 0};
-            if (clearPayload.attachmentType >= FramebufferAttachmentType::Color0 &&
-                clearPayload.attachmentType <= FramebufferAttachmentType::Color31) {
+            if ((clearPayload.mask & GL_COLOR_BUFFER_BIT) != 0) {
                 clearAttachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                 clearAttachment.colorAttachment = pending.attachmentIndex;
                 clearAttachment.clearValue.color = {
@@ -1958,14 +4322,18 @@ void main() {
                         clearPayload.color.z(),
                         clearPayload.color.w()
                 };
-            } else if (clearPayload.attachmentType == FramebufferAttachmentType::Depth) {
-                clearAttachment.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-                clearAttachment.clearValue.depthStencil.depth = clearPayload.depth;
-            } else if (clearPayload.attachmentType == FramebufferAttachmentType::Stencil) {
-                clearAttachment.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
-                clearAttachment.clearValue.depthStencil.stencil = clearPayload.stencil;
             } else {
-                continue;
+                if ((clearPayload.mask & GL_DEPTH_BUFFER_BIT) != 0) {
+                    clearAttachment.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+                    clearAttachment.clearValue.depthStencil.depth = clearPayload.depth;
+                }
+                if ((clearPayload.mask & GL_STENCIL_BUFFER_BIT) != 0) {
+                    clearAttachment.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+                    clearAttachment.clearValue.depthStencil.stencil = clearPayload.stencil;
+                }
+                if (clearAttachment.aspectMask == 0) {
+                    continue;
+                }
             }
 
             vkCmdClearAttachments(commandBuffer, 1, &clearAttachment, 1, &clearRect);

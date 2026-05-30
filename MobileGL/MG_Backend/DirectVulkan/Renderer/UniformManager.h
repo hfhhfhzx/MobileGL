@@ -28,6 +28,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             Uint32 binding = 0;
             MG_State::GLState::ITextureObject* texture = nullptr;
             const MG_State::GLState::SamplerObject* sampler = nullptr;
+            VkImageView imageView = VK_NULL_HANDLE;
         };
 
         Bool Initialize(VkDevice device, VkBufferManager* bufferManager,
@@ -54,27 +55,42 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             Uint32 allocatedSets = 0;
         };
 
+        struct DescriptorSetCacheEntry {
+            Vector<VkDescriptorSet> sets;
+            Uint32 cursor = 0;
+        };
+
         struct FrameResources {
             Vector<DescriptorPoolBucket> descriptorPools;
+            UnorderedMap<VkDescriptorSetLayout, DescriptorSetCacheEntry> descriptorSetCacheByLayout;
+            Vector<VkBufferView> texelBufferViews;
             Uint32 activeDescriptorPoolIndex = 0;
             Uint32 allocatedSetsThisFrame = 0;
             Uint32 peakAllocatedSetsThisFrame = 0;
         };
 
-        Bool ResolveSamplerTexture(const MG_State::GLState::ProgramObject& program,
+        static Bool ResolveSamplerTexture(const MG_State::GLState::ProgramObject& program,
                                    const ProgramFactory::VkProgramObject& programObj, Uint32 binding,
-                                   SharedPtr<MG_State::GLState::ITextureObject>& outTexture) const;
+                                   SharedPtr<MG_State::GLState::ITextureObject>& outTexture);
+        SharedPtr<MG_State::GLState::ITextureObject> GetFallbackTexture(TextureTarget target) const;
         Bool ResolveSamplerDescriptor(VkCommandBuffer commandBuffer, const MG_State::GLState::ProgramObject& program,
                                       const ProgramFactory::VkProgramObject& programObj, Uint32 binding,
                                       VkDescriptorImageInfo& outImageInfo) const;
         Bool ResolveSamplerDescriptorOverride(const SamplerBindingOverride& samplerBindingOverride,
                                               VkDescriptorImageInfo& outImageInfo) const;
-        Bool GatherBindingPayloads(const MG_State::GLState::ProgramObject& program, Vector<const void*>& outData,
-                                   Vector<VkDeviceSize>& outSizes) const;
+        Bool ResolveTexelBufferDescriptor(const MG_State::GLState::ProgramObject& program,
+                                          const ProgramFactory::VkProgramObject& programObj, Uint32 binding,
+                                          Uint32 frameIndex, VkBufferView& outBufferView);
+        Bool ResolveUniformBufferPayload(const MG_State::GLState::ProgramObject& program,
+                                         const ProgramFactory::VkProgramObject& programObj, Uint32 binding,
+                                         const void*& outData, VkDeviceSize& outSize) const;
         Bool CreateDescriptorPool(Uint32 maxSets, VkDescriptorPool& outPool) const;
         Bool GrowFrameDescriptorPool(FrameResources& frame, Uint32 frameIndex);
         VkResult AllocateDescriptorSetsFromActivePool(
             Uint32 frameIndex, const ProgramFactory::VkProgramObject& programObj, VkDescriptorSet& outDescriptorSet);
+        VkResult AcquireDescriptorSet(Uint32 frameIndex,
+                                      const ProgramFactory::VkProgramObject& programObj,
+                                      VkDescriptorSet& outDescriptorSet);
 
         VkDevice m_device = VK_NULL_HANDLE;
         VkBufferManager* m_bufferManager = nullptr;
@@ -88,6 +104,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         Uint32 m_peakDescriptorSetsObserved = 0;
         VkTextureManager* m_textureManager = nullptr;
         VkSamplerManager* m_samplerManager = nullptr;
+        mutable SharedPtr<MG_State::GLState::ITextureObject> m_fallbackTexture2D;
     };
 } // namespace MobileGL::MG_Backend::DirectVulkan
 

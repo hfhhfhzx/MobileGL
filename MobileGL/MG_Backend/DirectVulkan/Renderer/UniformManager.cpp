@@ -10,10 +10,18 @@
 
 #include "MG_State/GLState/Core.h"
 #include "MG_State/GLState/ProgramState/ProgramObject.h"
+#include "MG_State/GLState/TextureState/TextureObject2D.h"
+#include "MG_State/GLState/TextureState/TextureObjectBuffer.h"
 #include "MG_Util/Converters/MGToStr/FramebufferEnumConverter.h"
+#include "MG_Util/Converters/MGToVk/TextureEnumConverter.h"
+#include "MG_Util/Metrics/TextureMetrics.h"
 #include <limits>
 
 namespace MobileGL::MG_Backend::DirectVulkan {
+    namespace {
+        constexpr Uint kFallbackTexture2DExternalIndex = 0xFFFFFF00u;
+    }
+
     static Bool FindFramebufferAttachmentForTexture(const MG_State::GLState::FramebufferObject& framebuffer,
                                                     const MG_State::GLState::ITextureObject& texture,
                                                     FramebufferAttachmentType& outAttachment, Int& outLevel) {
@@ -51,6 +59,18 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         default:
             return false;
         }
+    }
+
+    static Int ResolveSamplerUnitIndex(const MG_State::GLState::ProgramObject& program, Int location, Uint32 binding) {
+        MOBILEGL_ASSERT(location >= -1, "ResolveSamplerUnitIndex: invalid sampler location for binding %u", binding);
+        if (location < 0) {
+            return 0;
+        }
+        const Int uniformUnit = program.GetUniformSamplerOrImageUnitIndex(static_cast<Uint>(location));
+        MOBILEGL_ASSERT(uniformUnit >= -1,
+                        "ResolveSamplerUnitIndex: invalid texture unit for binding %u location %d (unit=%d)", binding,
+                        location, uniformUnit);
+        return uniformUnit >= 0 ? uniformUnit : 0;
     }
 
     Bool UniformManager::Initialize(VkDevice device, VkBufferManager* bufferManager,
@@ -109,6 +129,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     void UniformManager::Shutdown() {
         for (auto& frame : m_frames) {
             if (m_device != VK_NULL_HANDLE) {
+                for (auto& view : frame.texelBufferViews) {
+                    if (view != VK_NULL_HANDLE) {
+                        vkDestroyBufferView(m_device, view, nullptr);
+                    }
+                }
+                frame.texelBufferViews.clear();
+                frame.descriptorSetCacheByLayout.clear();
                 for (auto& bucket : frame.descriptorPools) {
                     if (bucket.handle != VK_NULL_HANDLE) {
                         vkDestroyDescriptorPool(m_device, bucket.handle, nullptr);
@@ -133,11 +160,18 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         m_peakDescriptorSetsObserved = 0;
         m_textureManager = nullptr;
         m_samplerManager = nullptr;
+        m_fallbackTexture2D.reset();
     }
 
     void UniformManager::BeginFrame(Uint32 frameIndex) {
         MOBILEGL_ASSERT(frameIndex < m_frames.size(), "UniformDescriptorBinder::BeginFrame invalid frame index");
         auto& frame = m_frames[frameIndex];
+        for (auto& view : frame.texelBufferViews) {
+            if (view != VK_NULL_HANDLE) {
+                vkDestroyBufferView(m_device, view, nullptr);
+            }
+        }
+        frame.texelBufferViews.clear();
         if (frame.peakAllocatedSetsThisFrame > m_peakDescriptorSetsObserved) {
             m_peakDescriptorSetsObserved = frame.peakAllocatedSetsThisFrame;
             MGLOG_D(
@@ -147,13 +181,8 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         frame.activeDescriptorPoolIndex = 0;
         frame.allocatedSetsThisFrame = 0;
         frame.peakAllocatedSetsThisFrame = 0;
-        for (auto& bucket : frame.descriptorPools) {
-            bucket.allocatedSets = 0;
-            if (bucket.handle == VK_NULL_HANDLE) {
-                continue;
-            }
-            VK_VERIFY(vkResetDescriptorPool(m_device, bucket.handle, 0),
-                      "UniformDescriptorBinder::BeginFrame, vkResetDescriptorPool");
+        for (auto& cacheEntryPair : frame.descriptorSetCacheByLayout) {
+            cacheEntryPair.second.cursor = 0;
         }
     }
 
@@ -164,26 +193,47 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         (void)commandBuffer;
         MOBILEGL_ASSERT(m_textureManager != nullptr, "ResolveSamplerDescriptor: texture manager is null");
         MOBILEGL_ASSERT(m_samplerManager != nullptr, "ResolveSamplerDescriptor: sampler manager is null");
+        MOBILEGL_ASSERT(binding < programObj.samplerNameByBinding.size(),
+                        "ResolveSamplerDescriptor: sampler binding %u name lookup out of range", binding);
         SharedPtr<MG_State::GLState::ITextureObject> texture;
-        if (!ResolveSamplerTexture(program, programObj, binding, texture)) {
+        const Bool resolvedTexture = ResolveSamplerTexture(program, programObj, binding, texture);
+        if (!resolvedTexture) {
+            MGLOG_E("ResolveSamplerDescriptor: failed to resolve sampler texture for binding %u ('%s')", binding,
+                programObj.samplerNameByBinding[binding].c_str());
             return false;
         }
 
         const Int location = programObj.samplerUniformLocationByBinding[binding];
-        const Int unit = program.GetUniformSamplerOrImageUnitIndex(static_cast<Uint>(location));
+        const Int unit = ResolveSamplerUnitIndex(program, location, binding);
         auto& textureUnit = MG_State::pGLContext->GetTextureUnitObject(unit);
         const auto samplerOverride = textureUnit.GetSamplerObject();
-        if (!texture) {
-            return false;
+        const auto preferredTarget = programObj.samplerTextureTargetByBinding[binding];
+        if (texture == nullptr) {
+            texture = GetFallbackTexture(preferredTarget);
+            MOBILEGL_ASSERT(texture != nullptr,
+                            "ResolveSamplerDescriptor: no fallback texture available for binding=%u location=%d unit=%d target=%d",
+                            binding, location, unit, static_cast<Int>(preferredTarget));
+            MGLOG_W(
+                "ResolveSamplerDescriptor: using fallback texture for unbound sampler binding=%u ('%s') location=%d unit=%d target=%d",
+                binding, programObj.samplerNameByBinding[binding].c_str(), location, unit,
+                static_cast<Int>(preferredTarget));
         }
 
         const MG_State::GLState::SamplerObject* samplerToUse =
             samplerOverride ? samplerOverride.get() : texture->GetSamplerObject().get();
-        if (!samplerToUse) {
+        if (samplerToUse == nullptr) {
+            MGLOG_E(
+                "ResolveSamplerDescriptor: sampler binding %u ('%s') has no sampler object (textureId=%d location=%d unit=%d)",
+                binding, programObj.samplerNameByBinding[binding].c_str(), texture->GetExternalIndex(), location,
+                unit);
             return false;
         }
         VkTextureManager::TextureResource* resource = m_textureManager->SyncTextureAndGetDescriptor(*texture);
         if (resource == nullptr) {
+            MGLOG_E(
+                "ResolveSamplerDescriptor: sampler binding %u ('%s') failed to create/sync texture resource (textureId=%d target=%d location=%d unit=%d)",
+                binding, programObj.samplerNameByBinding[binding].c_str(), texture->GetExternalIndex(),
+                static_cast<Int>(texture->GetTarget()), location, unit);
             return false;
         }
         if (!IsValidSampledImageLayout(resource->layout)) {
@@ -207,7 +257,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             return false;
         }
         outImageInfo = {
-            .sampler = m_samplerManager->GetOrCreateSampler(*samplerToUse),
+            .sampler = m_samplerManager->GetOrCreateSampler(*samplerToUse, *texture),
             .imageView = resource->fullView,
             .imageLayout = resource->layout,
         };
@@ -218,18 +268,28 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         const SamplerBindingOverride& samplerBindingOverride, VkDescriptorImageInfo& outImageInfo) const {
         MOBILEGL_ASSERT(m_textureManager != nullptr, "ResolveSamplerDescriptorOverride: texture manager is null");
         MOBILEGL_ASSERT(m_samplerManager != nullptr, "ResolveSamplerDescriptorOverride: sampler manager is null");
-        if (samplerBindingOverride.texture == nullptr || samplerBindingOverride.sampler == nullptr) {
-            return false;
-        }
+        MOBILEGL_ASSERT(samplerBindingOverride.texture != nullptr,
+                        "ResolveSamplerDescriptorOverride: override texture is null for binding %u",
+                        samplerBindingOverride.binding);
+        MOBILEGL_ASSERT(samplerBindingOverride.sampler != nullptr,
+                        "ResolveSamplerDescriptorOverride: override sampler is null for binding %u",
+                        samplerBindingOverride.binding);
 
         auto* resource = m_textureManager->SyncTextureAndGetDescriptor(*samplerBindingOverride.texture);
-        if (resource == nullptr || !IsValidSampledImageLayout(resource->layout)) {
-            return false;
-        }
+        MOBILEGL_ASSERT(resource != nullptr,
+                        "ResolveSamplerDescriptorOverride: failed to sync override texture resource for binding %u textureId=%d",
+                        samplerBindingOverride.binding, samplerBindingOverride.texture->GetExternalIndex());
+        MOBILEGL_ASSERT(IsValidSampledImageLayout(resource->layout),
+                        "ResolveSamplerDescriptorOverride: invalid layout %d for binding %u textureId=%d",
+                        static_cast<Int>(resource->layout), samplerBindingOverride.binding,
+                        samplerBindingOverride.texture->GetExternalIndex());
 
         outImageInfo = {
-            .sampler = m_samplerManager->GetOrCreateSampler(*samplerBindingOverride.sampler),
-            .imageView = resource->fullView,
+            .sampler = m_samplerManager->GetOrCreateSampler(*samplerBindingOverride.sampler,
+                                                            *samplerBindingOverride.texture),
+            .imageView = samplerBindingOverride.imageView != VK_NULL_HANDLE ?
+                samplerBindingOverride.imageView :
+                resource->fullView,
             .imageLayout = resource->layout,
         };
         return outImageInfo.sampler != VK_NULL_HANDLE;
@@ -237,26 +297,117 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
     Bool UniformManager::ResolveSamplerTexture(const MG_State::GLState::ProgramObject& program,
                                                          const ProgramFactory::VkProgramObject& programObj, Uint32 binding,
-                                                         SharedPtr<MG_State::GLState::ITextureObject>& outTexture) const {
+                                                         SharedPtr<MG_State::GLState::ITextureObject>& outTexture) {
         outTexture.reset();
-        if (!MG_State::pGLContext || binding >= programObj.samplerUniformLocationByBinding.size()) {
-            return false;
-        }
+        MOBILEGL_ASSERT(MG_State::pGLContext != nullptr, "ResolveSamplerTexture: GL context is null");
+        MOBILEGL_ASSERT(binding < programObj.samplerUniformLocationByBinding.size(),
+                        "ResolveSamplerTexture: sampler location binding %u out of range", binding);
+        MOBILEGL_ASSERT(binding < programObj.samplerTextureTargetByBinding.size(),
+                        "ResolveSamplerTexture: sampler target binding %u out of range", binding);
 
         const Int location = programObj.samplerUniformLocationByBinding[binding];
-        if (location < 0) {
-            return false;
-        }
-
-        const Int unit = program.GetUniformSamplerOrImageUnitIndex(static_cast<Uint>(location));
-        if (unit < 0) {
-            return false;
-        }
+        const Int unit = ResolveSamplerUnitIndex(program, location, binding);
 
         auto& textureUnit = MG_State::pGLContext->GetTextureUnitObject(unit);
         const TextureTarget preferredTarget = programObj.samplerTextureTargetByBinding[binding];
         outTexture = textureUnit.GetBindingSlot(preferredTarget).GetBoundObject();
-        return outTexture != nullptr;
+
+        return true;
+    }
+
+    Bool UniformManager::ResolveTexelBufferDescriptor(const MG_State::GLState::ProgramObject& program,
+                                                      const ProgramFactory::VkProgramObject& programObj,
+                                                      Uint32 binding, Uint32 frameIndex,
+                                                      VkBufferView& outBufferView) {
+        outBufferView = VK_NULL_HANDLE;
+        MOBILEGL_ASSERT(m_bufferManager != nullptr, "ResolveTexelBufferDescriptor: buffer manager is null");
+        MOBILEGL_ASSERT(frameIndex < m_frames.size(), "ResolveTexelBufferDescriptor: frame index out of range");
+
+        SharedPtr<MG_State::GLState::ITextureObject> texture;
+        if (!ResolveSamplerTexture(program, programObj, binding, texture) || texture == nullptr) {
+            MGLOG_E("ResolveTexelBufferDescriptor: texture buffer binding %u ('%s') is unbound", binding,
+                    programObj.samplerNameByBinding[binding].c_str());
+            return false;
+        }
+
+        if (texture->GetStorageType() != TextureStorageType::Buffer ||
+            texture->GetTarget() != TextureTarget::TextureBuffer) {
+            MGLOG_E(
+                "ResolveTexelBufferDescriptor: binding %u ('%s') expected texture buffer, got textureId=%u target=%d storage=%d",
+                binding, programObj.samplerNameByBinding[binding].c_str(), texture->GetExternalIndex(),
+                static_cast<Int>(texture->GetTarget()), static_cast<Int>(texture->GetStorageType()));
+            return false;
+        }
+
+        auto* textureBuffer = static_cast<MG_State::GLState::TextureObjectBuffer*>(texture.get());
+        const auto bufferObject = textureBuffer->GetBufferBindingSlot().GetBoundObject();
+        if (bufferObject == nullptr) {
+            MGLOG_E("ResolveTexelBufferDescriptor: texture buffer binding %u ('%s') has no GL buffer bound",
+                    binding, programObj.samplerNameByBinding[binding].c_str());
+            return false;
+        }
+
+        BufferSlice slice{};
+        if (!m_bufferManager->SyncResidentBuffer(BufferKind::TextureBuffer, bufferObject, slice) || !slice.IsValid()) {
+            MGLOG_E("ResolveTexelBufferDescriptor: failed to sync GL buffer %u for texture buffer %u",
+                    bufferObject->GetExternalIndex(), texture->GetExternalIndex());
+            return false;
+        }
+
+        const auto internalFormat = textureBuffer->GetFormat();
+        const VkFormat vkFormat = MG_Util::ConvertTextureInternalFormatToVkEnum(internalFormat);
+        if (vkFormat == VK_FORMAT_UNDEFINED) {
+            MGLOG_E("ResolveTexelBufferDescriptor: unsupported texture buffer internal format %d",
+                    static_cast<Int>(internalFormat));
+            return false;
+        }
+
+        const VkDeviceSize texelSize =
+            static_cast<VkDeviceSize>(MG_Util::GetSizedInternalFormatSizeInBytes(internalFormat));
+        VkDeviceSize viewRange = slice.size;
+        if (texelSize > 0) {
+            viewRange = (viewRange / texelSize) * texelSize;
+        }
+        if (viewRange == 0) {
+            MGLOG_E("ResolveTexelBufferDescriptor: texture buffer %u has empty view range", texture->GetExternalIndex());
+            return false;
+        }
+
+        VkBufferViewCreateInfo viewInfo{};
+        viewInfo.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
+        viewInfo.buffer = slice.buffer;
+        viewInfo.format = vkFormat;
+        viewInfo.offset = slice.offset;
+        viewInfo.range = viewRange;
+
+        VkBufferView bufferView = VK_NULL_HANDLE;
+        const VkResult result = vkCreateBufferView(m_device, &viewInfo, nullptr, &bufferView);
+        if (result != VK_SUCCESS || bufferView == VK_NULL_HANDLE) {
+            MGLOG_E("ResolveTexelBufferDescriptor: vkCreateBufferView failed result=%d format=%d range=%zu",
+                    result, static_cast<Int>(vkFormat), static_cast<SizeT>(viewRange));
+            return false;
+        }
+
+        m_frames[frameIndex].texelBufferViews.push_back(bufferView);
+        outBufferView = bufferView;
+        return true;
+    }
+
+    SharedPtr<MG_State::GLState::ITextureObject> UniformManager::GetFallbackTexture(TextureTarget target) const {
+        MOBILEGL_ASSERT(target == TextureTarget::Texture2D || target == TextureTarget::TextureRectangle,
+                        "UniformManager::GetFallbackTexture: unsupported fallback target=%d",
+                        static_cast<Int>(target));
+
+        if (m_fallbackTexture2D == nullptr) {
+            auto fallbackTexture = MakeShared<MG_State::GLState::TextureObject2D>(kFallbackTexture2DExternalIndex);
+            fallbackTexture->SetInternalFormat(TextureInternalFormat::RGBA8);
+            fallbackTexture->AllocateStorage(TextureUploadTarget::Texture2D, 0,
+                                             {.texelSize = {1, 1, 1}, .byteSize = 4});
+            fallbackTexture->MarkStorageDirty(TextureUploadTarget::Texture2D, 0, true);
+            m_fallbackTexture2D = fallbackTexture;
+        }
+
+        return m_fallbackTexture2D;
     }
 
     Bool UniformManager::CollectSampledTextures(const MG_State::GLState::ProgramObject& program,
@@ -284,62 +435,85 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return true;
     }
 
-    Bool UniformManager::GatherBindingPayloads(const MG_State::GLState::ProgramObject& program,
-                                                        Vector<const void*>& outData,
-                                                        Vector<VkDeviceSize>& outSizes) const {
-        outData.assign(m_maxBindings, nullptr);
-        outSizes.assign(m_maxBindings, 0);
+    Bool UniformManager::ResolveUniformBufferPayload(const MG_State::GLState::ProgramObject& program,
+                                                     const ProgramFactory::VkProgramObject& programObj, Uint32 binding,
+                                                     const void*& outData, VkDeviceSize& outSize) const {
+        outData = nullptr;
+        outSize = 0;
 
-        const Uint32 activeUniformBlockCount = static_cast<Uint32>(program.GetActiveUniformBlocksCount());
-        const Uint32 uniformBindingPointCount =
-            static_cast<Uint32>(MG_State::pGLContext->GetBufferBindingPointCount(BufferTarget::Uniform));
+        MOBILEGL_ASSERT(MG_State::pGLContext != nullptr, "ResolveUniformBufferPayload: GL context is null");
+        MOBILEGL_ASSERT(binding < programObj.bindingKinds.size(),
+                        "ResolveUniformBufferPayload: binding %u out of range", binding);
+        MOBILEGL_ASSERT(programObj.bindingKinds[binding] == ProgramFactory::DescriptorBindingKind::UniformBufferDynamic,
+                        "ResolveUniformBufferPayload: binding %u is not a uniform buffer descriptor", binding);
 
-        for (Uint32 blockIndex = 0; blockIndex < activeUniformBlockCount; ++blockIndex) {
-            const Uint32 binding = program.GetUniformBlockBinding(blockIndex);
-            if (binding >= m_maxBindings) {
-                continue;
-            }
-
-            VkDeviceSize blockSize = static_cast<VkDeviceSize>(program.GetUBOSizeAt(blockIndex));
-            if (blockSize == 0) {
-                continue;
-            }
-
-            if (binding >= uniformBindingPointCount) {
-                continue;
-            }
-            auto& bindingPoint = MG_State::pGLContext->GetBufferBindingPoint(BufferTarget::Uniform, binding);
-            const auto bufferObject = bindingPoint.GetBoundObject();
-            if (!bufferObject) {
-                continue;
-            }
-
-            const auto bufferData = bufferObject->GetDataReadOnly();
-            if (!bufferData || bufferData->empty()) {
-                continue;
-            }
-
-            const auto range = bindingPoint.GetRange();
-            const VkDeviceSize bufferSize = static_cast<VkDeviceSize>(bufferObject->GetSize());
-            VkDeviceSize rangeStart = static_cast<VkDeviceSize>(range.start);
-            VkDeviceSize rangeEnd = static_cast<VkDeviceSize>(range.end);
-
-            if (rangeStart >= bufferSize) {
-                continue;
-            }
-            if (rangeEnd <= rangeStart || rangeEnd > bufferSize) {
-                rangeEnd = bufferSize;
-            }
-
-            VkDeviceSize available = rangeEnd - rangeStart;
-            if (available == 0) {
-                continue;
-            }
-
-            outData[binding] = bufferData->data() + static_cast<SizeT>(rangeStart);
-            outSizes[binding] = std::min(blockSize, available);
+        if (programObj.globalUboBinding == static_cast<Int>(binding)) {
+            outData = program.GetUBOData();
+            outSize = static_cast<VkDeviceSize>(program.GetUBOSize());
+            MOBILEGL_ASSERT(outData != nullptr, "ResolveUniformBufferPayload: global UBO data is null");
+            MOBILEGL_ASSERT(outSize > 0, "ResolveUniformBufferPayload: global UBO size is zero");
+            return outData != nullptr && outSize > 0;
         }
 
+        MOBILEGL_ASSERT(binding < programObj.uniformBlockIndexByBinding.size(),
+                        "ResolveUniformBufferPayload: UBO mapping binding %u out of range", binding);
+        const Int blockIndex = programObj.uniformBlockIndexByBinding[binding];
+        MOBILEGL_ASSERT(blockIndex >= 0,
+                        "ResolveUniformBufferPayload: no uniform block mapped to descriptor binding %u", binding);
+
+        const Uint32 activeUniformBlockCount = static_cast<Uint32>(program.GetActiveUniformBlocksCount());
+        MOBILEGL_ASSERT(static_cast<Uint32>(blockIndex) < activeUniformBlockCount,
+                        "ResolveUniformBufferPayload: uniform block index %d out of range (count=%u)", blockIndex,
+                        activeUniformBlockCount);
+
+        const Uint32 frontendBinding = program.GetUniformBlockBinding(static_cast<Uint32>(blockIndex));
+        const Uint32 uniformBindingPointCount =
+            static_cast<Uint32>(MG_State::pGLContext->GetBufferBindingPointCount(BufferTarget::Uniform));
+        MOBILEGL_ASSERT(frontendBinding < uniformBindingPointCount,
+                        "ResolveUniformBufferPayload: frontend UBO binding %u out of range for block '%s'",
+                        frontendBinding, program.GetUniformBlockName(static_cast<Uint32>(blockIndex)).c_str());
+
+        auto& bindingPoint = MG_State::pGLContext->GetBufferBindingPoint(BufferTarget::Uniform, frontendBinding);
+        const auto bufferObject = bindingPoint.GetBoundObject();
+        MOBILEGL_ASSERT(bufferObject != nullptr,
+                        "ResolveUniformBufferPayload: no UBO bound at frontend binding %u for block '%s'",
+                        frontendBinding, program.GetUniformBlockName(static_cast<Uint32>(blockIndex)).c_str());
+
+        const auto bufferData = bufferObject->GetDataReadOnly();
+        MOBILEGL_ASSERT(bufferData != nullptr && !bufferData->empty(),
+                        "ResolveUniformBufferPayload: bound UBO data is empty for block '%s'",
+                        program.GetUniformBlockName(static_cast<Uint32>(blockIndex)).c_str());
+
+        const auto range = bindingPoint.GetRange();
+        const VkDeviceSize bufferSize = static_cast<VkDeviceSize>(bufferObject->GetSize());
+        const VkDeviceSize rangeStart = static_cast<VkDeviceSize>(range.start);
+        MOBILEGL_ASSERT(rangeStart < bufferSize,
+                        "ResolveUniformBufferPayload: UBO range start %zu exceeds buffer size %zu for block '%s'",
+                        static_cast<SizeT>(rangeStart), static_cast<SizeT>(bufferSize),
+                        program.GetUniformBlockName(static_cast<Uint32>(blockIndex)).c_str());
+
+        VkDeviceSize rangeEnd = static_cast<VkDeviceSize>(range.end);
+        if (rangeEnd > bufferSize) {
+            rangeEnd = bufferSize;
+        }
+        MOBILEGL_ASSERT(rangeEnd > rangeStart,
+                        "ResolveUniformBufferPayload: invalid UBO range [%zu, %zu) for block '%s'",
+                        static_cast<SizeT>(rangeStart), static_cast<SizeT>(rangeEnd),
+                        program.GetUniformBlockName(static_cast<Uint32>(blockIndex)).c_str());
+
+        const VkDeviceSize blockSize = static_cast<VkDeviceSize>(program.GetUBOSizeAt(static_cast<Uint32>(blockIndex)));
+        MOBILEGL_ASSERT(blockSize > 0,
+                        "ResolveUniformBufferPayload: reflected UBO size is zero for block '%s'",
+                        program.GetUniformBlockName(static_cast<Uint32>(blockIndex)).c_str());
+
+        const VkDeviceSize available = rangeEnd - rangeStart;
+        MOBILEGL_ASSERT(available >= blockSize,
+                        "ResolveUniformBufferPayload: bound range %zu is smaller than UBO size %zu for block '%s'",
+                        static_cast<SizeT>(available), static_cast<SizeT>(blockSize),
+                        program.GetUniformBlockName(static_cast<Uint32>(blockIndex)).c_str());
+
+        outData = bufferData->data() + static_cast<SizeT>(rangeStart);
+        outSize = blockSize;
         return true;
     }
 
@@ -356,11 +530,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
 
         const Uint32 descriptorCount = static_cast<Uint32>(descriptorCount64);
-        VkDescriptorPoolSize poolSizes[2]{};
+        VkDescriptorPoolSize poolSizes[3]{};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         poolSizes[0].descriptorCount = descriptorCount;
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         poolSizes[1].descriptorCount = descriptorCount;
+        poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        poolSizes[2].descriptorCount = descriptorCount;
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -404,7 +580,26 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
     VkResult UniformManager::AllocateDescriptorSetsFromActivePool(Uint32 frameIndex, const ProgramFactory::VkProgramObject& programObj, VkDescriptorSet& outDescriptorSet) {
         auto& frame = m_frames[frameIndex];
+        if (frame.activeDescriptorPoolIndex >= frame.descriptorPools.size()) {
+            frame.activeDescriptorPoolIndex = 0;
+        }
+        if (frame.descriptorPools[frame.activeDescriptorPoolIndex].allocatedSets >=
+            frame.descriptorPools[frame.activeDescriptorPoolIndex].maxSets) {
+            const auto availableBucket = std::find_if(
+                frame.descriptorPools.begin(), frame.descriptorPools.end(),
+                [](const DescriptorPoolBucket& candidate) { return candidate.allocatedSets < candidate.maxSets; });
+            if (availableBucket == frame.descriptorPools.end()) {
+                outDescriptorSet = VK_NULL_HANDLE;
+                return VK_ERROR_OUT_OF_POOL_MEMORY;
+            }
+            frame.activeDescriptorPoolIndex =
+                static_cast<Uint32>(std::distance(frame.descriptorPools.begin(), availableBucket));
+        }
         auto& bucket = frame.descriptorPools[frame.activeDescriptorPoolIndex];
+        if (bucket.allocatedSets >= bucket.maxSets) {
+            outDescriptorSet = VK_NULL_HANDLE;
+            return VK_ERROR_OUT_OF_POOL_MEMORY;
+        }
         VkDescriptorSetAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         allocInfo.descriptorSetCount = 1;
@@ -414,11 +609,40 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         VkResult result = vkAllocateDescriptorSets(m_device, &allocInfo, &outDescriptorSet);
         if (result == VK_SUCCESS) {
             ++bucket.allocatedSets;
-            ++frame.allocatedSetsThisFrame;
-            frame.peakAllocatedSetsThisFrame =
-                std::max(frame.peakAllocatedSetsThisFrame, frame.allocatedSetsThisFrame);
         }
         return result;
+    }
+
+    VkResult UniformManager::AcquireDescriptorSet(Uint32 frameIndex,
+                                                  const ProgramFactory::VkProgramObject& programObj,
+                                                  VkDescriptorSet& outDescriptorSet) {
+        auto& frame = m_frames[frameIndex];
+        auto& cache = frame.descriptorSetCacheByLayout[programObj.descriptorSetLayout];
+        if (cache.cursor < cache.sets.size()) {
+            outDescriptorSet = cache.sets[cache.cursor++];
+        } else {
+            VkResult allocResult = AllocateDescriptorSetsFromActivePool(frameIndex, programObj, outDescriptorSet);
+            if (allocResult == VK_ERROR_OUT_OF_POOL_MEMORY || allocResult == VK_ERROR_FRAGMENTED_POOL) {
+                if (!GrowFrameDescriptorPool(frame, frameIndex)) {
+                    MGLOG_E("UniformDescriptorBinder::AcquireDescriptorSet failed: descriptor pool growth failed");
+                    return allocResult;
+                }
+                allocResult = AllocateDescriptorSetsFromActivePool(frameIndex, programObj, outDescriptorSet);
+            }
+            if (allocResult != VK_SUCCESS || outDescriptorSet == VK_NULL_HANDLE) {
+                return allocResult;
+            }
+
+            cache.sets.push_back(outDescriptorSet);
+            ++cache.cursor;
+            MGLOG_D("UniformDescriptorBinder: cached descriptor set count for frame=%u grew to %zu", frameIndex,
+                    cache.sets.size());
+        }
+
+        ++frame.allocatedSetsThisFrame;
+        frame.peakAllocatedSetsThisFrame =
+            std::max(frame.peakAllocatedSetsThisFrame, frame.allocatedSetsThisFrame);
+        return VK_SUCCESS;
     }
 
     Bool UniformManager::BindProgramUniformBuffers(VkCommandBuffer commandBuffer,
@@ -436,24 +660,10 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
 
         VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
-        VkResult allocResult = AllocateDescriptorSetsFromActivePool(frameIndex, programObj, descriptorSet);
-        if (allocResult == VK_ERROR_OUT_OF_POOL_MEMORY || allocResult == VK_ERROR_FRAGMENTED_POOL) {
-            if (!GrowFrameDescriptorPool(frame, frameIndex)) {
-                MGLOG_E("UniformDescriptorBinder::BindProgramUniformBuffers failed: descriptor pool growth failed");
-                return false;
-            }
-            allocResult = AllocateDescriptorSetsFromActivePool(frameIndex, programObj, descriptorSet);
-        }
+        VkResult allocResult = AcquireDescriptorSet(frameIndex, programObj, descriptorSet);
         if (allocResult != VK_SUCCESS || descriptorSet == VK_NULL_HANDLE) {
-            MGLOG_E("UniformDescriptorBinder::BindProgramUniformBuffers failed: vkAllocateDescriptorSets returned %d",
+            MGLOG_E("UniformDescriptorBinder::BindProgramUniformBuffers failed: descriptor set acquire returned %d",
                     allocResult);
-            return false;
-        }
-
-        Vector<const void*> bindingData;
-        Vector<VkDeviceSize> bindingSizes;
-        if (!GatherBindingPayloads(program, bindingData, bindingSizes)) {
-            MGLOG_E("UniformDescriptorBinder::BindProgramUniformBuffers failed: cannot gather UBO payloads");
             return false;
         }
 
@@ -465,9 +675,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         writes.reserve(m_maxBindings);
         Vector<VkDescriptorBufferInfo> bufferInfos;
         Vector<VkDescriptorImageInfo> imageInfos;
+        Vector<VkBufferView> texelBufferViews;
         Vector<Uint32> dynamicOffsets;
         bufferInfos.reserve(m_maxBindings);
         imageInfos.reserve(m_maxBindings);
+        texelBufferViews.reserve(m_maxBindings);
         dynamicOffsets.reserve(programObj.dynamicBindings.size());
 
         const Uint32 bindingCount =
@@ -486,18 +698,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             write.descriptorCount = 1;
 
             if (kind == ProgramFactory::DescriptorBindingKind::UniformBufferDynamic) {
-                const void* payload = bindingData[binding];
-                VkDeviceSize payloadSize = bindingSizes[binding];
-                if (payload == nullptr || payloadSize == 0) {
-                    if (programObj.globalUboBinding == static_cast<Int>(binding)) {
-                        const void* globalUboData = program.GetUBOData();
-                        const VkDeviceSize globalUboSize = static_cast<VkDeviceSize>(program.GetUBOSize());
-                        if (globalUboData != nullptr && globalUboSize > 0) {
-                            payload = globalUboData;
-                            payloadSize = globalUboSize;
-                        }
-                    }
-                }
+                const void* payload = nullptr;
+                VkDeviceSize payloadSize = 0;
+                const Bool hasPayload = ResolveUniformBufferPayload(program, programObj, binding, payload, payloadSize);
+                MOBILEGL_ASSERT(hasPayload && payload != nullptr && payloadSize > 0,
+                                "UniformDescriptorBinder::BindProgramUniformBuffers failed: missing UBO payload on binding %u",
+                                binding);
 
                 BufferSlice slice{};
                 if (!m_bufferManager->UploadTransient(BufferKind::Uniform, frameIndex, payload, payloadSize,
@@ -517,6 +723,20 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 write.pBufferInfo = &bufferInfos.back();
                 writes.push_back(write);
                 dynamicOffsets.push_back(static_cast<Uint32>(slice.offset));
+            } else if (kind == ProgramFactory::DescriptorBindingKind::UniformTexelBuffer) {
+                VkBufferView bufferView = VK_NULL_HANDLE;
+                if (!ResolveTexelBufferDescriptor(program, programObj, binding, frameIndex, bufferView) ||
+                    bufferView == VK_NULL_HANDLE) {
+                    MGLOG_E(
+                        "UniformDescriptorBinder::BindProgramUniformBuffers failed: texture buffer binding %u has no valid descriptor",
+                        binding);
+                    return false;
+                }
+
+                texelBufferViews.push_back(bufferView);
+                write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+                write.pTexelBufferView = &texelBufferViews.back();
+                writes.push_back(write);
             } else {
                 VkDescriptorImageInfo imageInfo{};
                 Bool hasImage = false;
@@ -529,13 +749,15 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                     hasImage = ResolveSamplerDescriptor(commandBuffer, program, programObj, binding, imageInfo);
                 }
                 if (!hasImage) {
-                    MGLOG_E("UniformDescriptorBinder::BindProgramUniformBuffers failed: sampler binding %u has no valid texture descriptor",
-                            binding);
+                    MGLOG_E(
+                        "UniformDescriptorBinder::BindProgramUniformBuffers failed: sampler binding %u has no valid texture descriptor",
+                        binding);
                     return false;
                 }
                 if (imageInfo.sampler == VK_NULL_HANDLE || imageInfo.imageView == VK_NULL_HANDLE) {
-                    MGLOG_E("UniformDescriptorBinder::BindProgramUniformBuffers failed: sampler binding %u has null sampler or imageView",
-                            binding);
+                    MGLOG_E(
+                        "UniformDescriptorBinder::BindProgramUniformBuffers failed: sampler binding %u has null sampler or imageView",
+                        binding);
                     return false;
                 }
                 imageInfos.push_back(imageInfo);

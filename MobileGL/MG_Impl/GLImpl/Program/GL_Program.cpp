@@ -462,7 +462,8 @@ namespace MobileGL::MG_Impl::GLImpl {
          * A program object marked for deletion with glDeleteProgram but still in use as part of current
          * rendering state is still considered a program object and glIsProgram will return GL_TRUE.
          */
-        return CheckProgramNameValidity(program);
+        if (program == 0) return GL_FALSE;
+        return MG_State::pGLContext->ValidateProgramName(program) ? GL_TRUE : GL_FALSE;
     }
 
     GLboolean IsShader_State(GLuint shader) {
@@ -470,7 +471,8 @@ namespace MobileGL::MG_Impl::GLImpl {
          * A shader object marked for deletion with glDeleteShader but still attached to a program object is still
          * considered a shader object and glIsShader will return GL_TRUE.
          */
-        return CheckShaderNameValidity(shader);
+        if (shader == 0) return GL_FALSE;
+        return MG_State::pGLContext->ValidateShaderName(shader) ? GL_TRUE : GL_FALSE;
     }
 
     void LinkProgram_State(GLuint program) {
@@ -541,6 +543,9 @@ namespace MobileGL::MG_Impl::GLImpl {
         } else {
             auto* ttype = programObject.GetUniformTType(location);
             if (ttype->isTexture() || ttype->isImage()) {
+                MGLOG_D("%s: program = %d, opaque uniform location = %d, name = '%s', unit = %d", __func__,
+                        programObject.GetExternalIndex(), location, programObject.GetUniformName(location).c_str(),
+                        static_cast<Int>(*value));
                 programObject.SetUniformSamplerOrImageUnitIndex(location, *value);
             }
         }

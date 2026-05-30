@@ -34,7 +34,9 @@
 #define MOBILEGL_EGL_API MOBILEGL_API
 
 // ====================== MobileGL configurations ======================= //
+#ifndef MOBILEGL_LOG_ACTIVE_LEVEL
 #define MOBILEGL_LOG_ACTIVE_LEVEL MOBILEGL_LOG_LEVEL_DEBUG
+#endif
 
 #define MOBILEGL_LOG_ENABLE_CONSOLE 0
 #define MOBILEGL_LOG_ENABLE_FILE 1
@@ -63,11 +65,15 @@
 #endif
 
 // =============================== Utils ================================ //
-#define MOBILEGL_ASSERT(condition, ...)                                                                                \
-    do {                                                                                                               \
-        if (!(condition)) {                                                                                            \
-            MGLOG_F("Assertion failed" __VA_OPT__(": ") __VA_ARGS__);                                                  \
-            MGLOG_F("  at %s:%d (%s)", __FILE__, __LINE__, __func__);                                                  \
-            TRAP;                                                                                                      \
-        }                                                                                                              \
-    } while (0)
+#if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG
+    #define MOBILEGL_ASSERT(condition, ...)                                                                                \
+        do {                                                                                                               \
+            if (!(condition)) {                                                                                            \
+                MGLOG_F("Assertion failed" __VA_OPT__(": ") __VA_ARGS__);                                                  \
+                MGLOG_F("  at %s:%d (%s)", __FILE__, __LINE__, __func__);                                                  \
+                TRAP;                                                                                                      \
+            }                                                                                                              \
+        } while (0)
+#else
+    #define MOBILEGL_ASSERT(condition, ...)
+#endif
