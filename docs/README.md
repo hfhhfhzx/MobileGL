@@ -1,7 +1,7 @@
 <h1 align="center">MobileGL</h1>
 
 <p align="center">
-**English** | [简体中文](./README-zhrCN.md)
+<strong>English</strong> | <a href="README-zhrCN.md">简体中文</a>
 </p>
 
 <p align="center">
