@@ -1,6 +1,8 @@
-**English** | [简体中文](./README-zhrCN.md)
-
 <h1 align="center">MobileGL</h1>
+
+<p align="center">
+**English** | [简体中文](./README-zhrCN.md)
+</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Language-C%2B%2B-00599c?style=flat&logo=c%2B%2B" alt="C++">
