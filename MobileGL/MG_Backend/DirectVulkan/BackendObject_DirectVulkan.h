@@ -14,6 +14,7 @@
 namespace MobileGL::MG_Backend::DirectVulkan {
     class BackendObject_DirectVulkan : public BackendObject {
     public:
+        BackendObject_DirectVulkan();
         ~BackendObject_DirectVulkan() override;
 
         void Initialize() override;
@@ -21,20 +22,26 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         Bool InitCapabilities() override;
         Bool InitializeEGLDisplay(EGLDisplay dpy, EGLint* major, EGLint* minor) override;
         Bool CreateEGLWindowSurface(const WindowHandle& handle) override;
+        Bool CreateEGLPbufferSurface(EGLint width, EGLint height) override;
         Bool MakeEGLCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) override;
         Bool SwapEGLBuffers(EGLDisplay dpy, EGLSurface draw) override;
+        void ReleaseEGLResources() override;
 
         const RendererInfo& GetRendererInfo() const override;
         String GetBackendAPIVersionString() const override;
         const GlobalBackendFunctionsTable& GetBackendFunctions() const override;
         const DynamicBackendParameters& GetDynamicParameters() const override;
         BackendType GetBackendType() const override;
+        void ApplyVulkanCapabilitiesForTesting(const MG_External::VulkanCapabilities& capabilities);
 
     private:
+        Bool InitPbufferSurface(EGLint width, EGLint height) override;
+        void UpdateAdvertisedExtensions();
         void UpdateDynamicBackendParameters();
 
         Bool m_initialized = false;
         DynamicBackendParameters m_dynamicParameters;
         MG_External::VulkanCapabilities m_vulkanCaps;
+        RendererInfo m_rendererInfo;
     };
 } // namespace MobileGL::MG_Backend::DirectVulkan

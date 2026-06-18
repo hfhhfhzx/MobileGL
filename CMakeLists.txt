@@ -4,8 +4,10 @@ project("MobileGL")
 
 option(MOBILEGL_BUILD_TEST        "Build MobileGL tests"                             ON )
 option(MOBILEGL_BUILD_BENCHMARK   "Build MobileGL benchmarks"                        ON )
-option(MOBILEGL_FORCE_RELEASE_OPT "Enable Release optimization flags in Debug build" OFF)
+option(MOBILEGL_FORCE_RELEASE_OPT "Enable Release optimization flags in Debug build" ON )
 option(MOBILEGL_ENABLE_TRACY      "Enable tracy for profiling"                       OFF)
+option(MOBILEGL_BUILD_TRACE_REPLAY "Build Linux apitrace replay runner"              OFF)
+set(MOBILEGL_LOG_ACTIVE_LEVEL "MOBILEGL_LOG_LEVEL_INFO" CACHE STRING "MobileGL active log level macro")
 
 if (ANDROID)
     set(MOBILEGL_BUILD_TEST       OFF CACHE BOOL "Build MobileGL tests"      FORCE)
@@ -329,6 +331,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 target_compile_definitions(${CMAKE_PROJECT_NAME}
         PUBLIC
         ${MOBILEGL_COMPILE_DEF}
+        MOBILEGL_LOG_ACTIVE_LEVEL=${MOBILEGL_LOG_ACTIVE_LEVEL}
 )
 
 if(NOT ANDROID)
@@ -362,6 +365,7 @@ if(NOT ANDROID)
     target_compile_definitions(${CMAKE_PROJECT_NAME}_s
             PUBLIC
             ${MOBILEGL_COMPILE_DEF}
+            MOBILEGL_LOG_ACTIVE_LEVEL=${MOBILEGL_LOG_ACTIVE_LEVEL}
     )
 endif()
 
@@ -395,5 +399,10 @@ if (NOT ANDROID)
 
     if (MOBILEGL_BUILD_BENCHMARK)
         add_subdirectory(MobileGL/MG_Benchmark)
+    endif()
+
+    if (MOBILEGL_BUILD_TRACE_REPLAY)
+        enable_testing()
+        add_subdirectory(tools/trace_replay)
     endif()
 endif()

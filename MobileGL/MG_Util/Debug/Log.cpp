@@ -58,8 +58,14 @@ namespace MobileGL {
 
         void InitFile() {
 #if MOBILEGL_LOG_ENABLE_FILE
-            if (!s_logFile && MOBILEGL_LOG_FILE_PATH && *MOBILEGL_LOG_FILE_PATH) {
-                s_logFile = std::fopen(MOBILEGL_LOG_FILE_PATH, "w");
+            if (!s_logFile) {
+                const char* logPath = std::getenv("MOBILEGL_LOG_FILE_PATH");
+                if (!logPath || !*logPath) {
+                    logPath = MOBILEGL_LOG_FILE_PATH;
+                }
+                if (logPath && *logPath) {
+                    s_logFile = std::fopen(logPath, "w");
+                }
             }
 #endif
         }
@@ -89,11 +95,13 @@ namespace MobileGL {
             va_list args;
             va_start(args, fmt);
             int n = std::vsnprintf(buffer, sizeof(buffer), fmt, args);
+            const SizeT messageLength =
+                (n < 0) ? 0 : std::min(static_cast<SizeT>(n), sizeof(buffer) - static_cast<SizeT>(1));
             std::string out = header +
 #if MOBILEGL_LOG_ENABLE_STACKTRACE
                               padding +
 #endif
-                              std::string(buffer, n) + "\n";
+                              std::string(buffer, messageLength) + "\n";
 
 #if MOBILEGL_LOG_ENABLE_CONSOLE
             std::fwrite(out.c_str(), 1, out.size(), stdout);

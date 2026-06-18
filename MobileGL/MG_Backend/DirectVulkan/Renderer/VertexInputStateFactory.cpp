@@ -52,14 +52,14 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
 
         VertexInputStateBuilder builder;
-        UnorderedMap<SizeT, Uint32> bindingByBufferKey;
-        UnorderedMap<SizeT, Uint32> strideByBufferKey;
-        UnorderedMap<SizeT, VkVertexInputRate> inputRateByBufferKey;
         Vector<SizeT> bindingBufferKeys;
+        Vector<SizeT> bindingBaseOffsets;
+        Vector<Uint32> bindingAttributeLocations;
+        Vector<Bool> bindingUsesClientMemory;
 
         for (Uint32 location = 0; location < MG_State::GLState::VertexArrayObject::MAX_VERTEX_ATTRIBS; ++location) {
             const auto& attr = vao.GetAttribute(location);
-            if (!attr.Enabled || !attr.Buffer) {
+            if (!attr.Enabled) {
                 continue;
             }
 
@@ -84,29 +84,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 (attr.Divisor == 0) ? VK_VERTEX_INPUT_RATE_VERTEX : VK_VERTEX_INPUT_RATE_INSTANCE;
 
             const SizeT bufferKey = reinterpret_cast<SizeT>(attr.Buffer.get());
-            Uint32 binding = 0;
-            auto itBinding = bindingByBufferKey.find(bufferKey);
-            if (itBinding == bindingByBufferKey.end()) {
-                binding = static_cast<Uint32>(bindingByBufferKey.size());
-                bindingByBufferKey.emplace(bufferKey, binding);
-                strideByBufferKey.emplace(bufferKey, stride);
-                inputRateByBufferKey.emplace(bufferKey, inputRate);
-                bindingBufferKeys.push_back(bufferKey);
-                builder.AddBinding(binding, stride, inputRate);
-            } else {
-                binding = itBinding->second;
-                if (strideByBufferKey[bufferKey] != stride) {
-                    MGLOG_D("Skipping vertex attribute at location %u: stride mismatch (%u vs %u) on same buffer",
-                            location, stride, strideByBufferKey[bufferKey]);
-                    continue;
-                }
-                if (inputRateByBufferKey[bufferKey] != inputRate) {
-                    MGLOG_D("Skipping vertex attribute at location %u: input-rate mismatch on same buffer", location);
-                    continue;
-                }
-            }
-
-            builder.AddAttribute(location, binding, vkFormat, static_cast<Uint32>(attr.Offset));
+            const Uint32 binding = static_cast<Uint32>(bindingBufferKeys.size());
+            bindingBufferKeys.push_back(bufferKey);
+            bindingBaseOffsets.push_back(attr.Buffer ? attr.Offset : 0);
+            bindingAttributeLocations.push_back(location);
+            bindingUsesClientMemory.push_back(attr.Buffer == nullptr);
+            builder.AddBinding(binding, stride, inputRate);
+            builder.AddAttribute(location, binding, vkFormat, 0);
         }
 
         const auto& state = builder.Build();
@@ -116,6 +100,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         entry.bindings = builder.GetBindings();
         entry.attributes = builder.GetAttributes();
         entry.bindingBufferKeys = std::move(bindingBufferKeys);
+        entry.bindingBaseOffsets = std::move(bindingBaseOffsets);
+        entry.bindingAttributeLocations = std::move(bindingAttributeLocations);
+        entry.bindingUsesClientMemory = std::move(bindingUsesClientMemory);
         entry.state = state;
         entry.state.pVertexBindingDescriptions = entry.bindings.empty() ? nullptr : entry.bindings.data();
         entry.state.pVertexAttributeDescriptions = entry.attributes.empty() ? nullptr : entry.attributes.data();

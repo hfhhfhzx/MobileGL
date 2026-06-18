@@ -8,7 +8,9 @@
 
 #include "ShaderSourceProcessor.h"
 
+#include <algorithm>
 #include <cctype>
+#include <MG_Backend/BackendObjects.h>
 
 namespace {
     using MobileGL::SizeT;
@@ -29,8 +31,7 @@ namespace {
             while (functionPos != MobileGL::String::npos && functionPos < lineEnd) {
                 const bool hasLeftBoundary = functionPos == 0 || !IsIdentifierChar(source[functionPos - 1]);
                 const SizeT functionEnd = functionPos + functionName.size();
-                const bool hasRightBoundary =
-                    functionEnd >= source.size() || !IsIdentifierChar(source[functionEnd]);
+                const bool hasRightBoundary = functionEnd >= source.size() || !IsIdentifierChar(source[functionEnd]);
                 if (hasLeftBoundary && hasRightBoundary) {
                     SizeT probe = functionEnd;
                     while (probe < lineEnd && std::isspace(static_cast<unsigned char>(source[probe]))) {
@@ -89,6 +90,220 @@ namespace {
 
         RenameFunctionInvocations(source, fromName, to);
     }
+
+    void ReplaceIdentifier(MobileGL::String& source, const MobileGL::String& from, const MobileGL::String& to) {
+        SizeT pos = 0;
+        while ((pos = source.find(from, pos)) != MobileGL::String::npos) {
+            const bool hasLeftBoundary = pos == 0 || !IsIdentifierChar(source[pos - 1]);
+            const SizeT end = pos + from.size();
+            const bool hasRightBoundary = end >= source.size() || !IsIdentifierChar(source[end]);
+            if (hasLeftBoundary && hasRightBoundary) {
+                source.replace(pos, from.size(), to);
+                pos += to.size();
+            } else {
+                pos = end;
+            }
+        }
+    }
+
+    void RemoveDefineForIdentifier(MobileGL::String& source, const MobileGL::String& identifier) {
+        SizeT lineStart = 0;
+        while (lineStart < source.size()) {
+            SizeT lineEnd = source.find('\n', lineStart);
+            const bool hasLineBreak = lineEnd != MobileGL::String::npos;
+            if (!hasLineBreak) {
+                lineEnd = source.size();
+            }
+
+            SizeT probe = lineStart;
+            while (probe < lineEnd && std::isspace(static_cast<unsigned char>(source[probe]))) {
+                probe++;
+            }
+            if (probe < lineEnd && source[probe] == '#') {
+                probe++;
+                while (probe < lineEnd && std::isspace(static_cast<unsigned char>(source[probe]))) {
+                    probe++;
+                }
+
+                constexpr const char* defineToken = "define";
+                constexpr SizeT defineLen = 6;
+                const bool hasDefine = probe + defineLen <= lineEnd &&
+                                       source.compare(probe, defineLen, defineToken) == 0 &&
+                                       (probe + defineLen == lineEnd ||
+                                        !IsIdentifierChar(source[probe + defineLen]));
+                if (hasDefine) {
+                    probe += defineLen;
+                    while (probe < lineEnd && std::isspace(static_cast<unsigned char>(source[probe]))) {
+                        probe++;
+                    }
+
+                    const bool hasIdentifier = probe + identifier.size() <= lineEnd &&
+                                               source.compare(probe, identifier.size(), identifier) == 0 &&
+                                               (probe + identifier.size() == lineEnd ||
+                                                !IsIdentifierChar(source[probe + identifier.size()]));
+                    if (hasIdentifier) {
+                        source.erase(lineStart, lineEnd - lineStart + (hasLineBreak ? 1 : 0));
+                        continue;
+                    }
+                }
+            }
+
+            lineStart = lineEnd + (hasLineBreak ? 1 : 0);
+        }
+    }
+
+    SizeT FindAfterVersionDirective(const MobileGL::String& source) {
+        const SizeT versionPos = source.find("#version");
+        if (versionPos == MobileGL::String::npos) {
+            return 0;
+        }
+        const SizeT lineEnd = source.find('\n', versionPos);
+        return lineEnd == MobileGL::String::npos ? source.size() : lineEnd + 1;
+    }
+
+    bool IsExtensionAdvertised(MobileGL::GLExtension extension) {
+        const auto& activeBackendObject = MobileGL::MG_Backend::pActiveBackendObject;
+        if (!activeBackendObject) {
+            return true;
+        }
+
+        const auto& extensions = activeBackendObject->GetRendererInfo().RendererGLInfo.Extensions;
+        return std::find(extensions.begin(), extensions.end(), extension) != extensions.end();
+    }
+
+    MobileGL::String TrimDirectiveToken(const MobileGL::String& token) {
+        SizeT start = 0;
+        while (start < token.size() && std::isspace(static_cast<unsigned char>(token[start]))) {
+            start++;
+        }
+
+        SizeT end = token.size();
+        while (end > start && std::isspace(static_cast<unsigned char>(token[end - 1]))) {
+            end--;
+        }
+        return token.substr(start, end - start);
+    }
+
+    void FilterUnsupportedGpuShaderInt64(MobileGL::String& source) {
+        if (IsExtensionAdvertised(MobileGL::E_GL_ARB_gpu_shader_int64)) {
+            return;
+        }
+
+        SizeT lineStart = 0;
+        while (lineStart < source.size()) {
+            SizeT lineEnd = source.find('\n', lineStart);
+            const bool hasLineBreak = lineEnd != MobileGL::String::npos;
+            if (!hasLineBreak) {
+                lineEnd = source.size();
+            }
+
+            const MobileGL::String line = source.substr(lineStart, lineEnd - lineStart);
+            SizeT probe = 0;
+            while (probe < line.size() && std::isspace(static_cast<unsigned char>(line[probe]))) {
+                probe++;
+            }
+
+            if (probe < line.size() && line[probe] == '#') {
+                probe++;
+                while (probe < line.size() && std::isspace(static_cast<unsigned char>(line[probe]))) {
+                    probe++;
+                }
+
+                constexpr const char* extensionToken = "extension";
+                constexpr SizeT extensionLen = 9;
+                const bool hasExtensionDirective =
+                    probe + extensionLen <= line.size() &&
+                    line.compare(probe, extensionLen, extensionToken) == 0 &&
+                    (probe + extensionLen == line.size() || !IsIdentifierChar(line[probe + extensionLen]));
+                if (hasExtensionDirective) {
+                    probe += extensionLen;
+                    while (probe < line.size() && std::isspace(static_cast<unsigned char>(line[probe]))) {
+                        probe++;
+                    }
+
+                    constexpr const char* int64Extension = "GL_ARB_gpu_shader_int64";
+                    constexpr SizeT int64ExtensionLen = 23;
+                    const bool hasInt64Extension =
+                        probe + int64ExtensionLen <= line.size() &&
+                        line.compare(probe, int64ExtensionLen, int64Extension) == 0 &&
+                        (probe + int64ExtensionLen == line.size() ||
+                         !IsIdentifierChar(line[probe + int64ExtensionLen]));
+                    if (hasInt64Extension) {
+                        probe += int64ExtensionLen;
+                        while (probe < line.size() && std::isspace(static_cast<unsigned char>(line[probe]))) {
+                            probe++;
+                        }
+
+                        if (probe < line.size() && line[probe] == ':') {
+                            probe++;
+                            const MobileGL::String behavior = TrimDirectiveToken(line.substr(probe));
+                            const SizeT replaceLen = lineEnd - lineStart + (hasLineBreak ? 1 : 0);
+                            if (behavior == "require") {
+                                const MobileGL::String replacement =
+                                    "#error GL_ARB_gpu_shader_int64 is not advertised by MobileGL\n";
+                                source.replace(lineStart, replaceLen, replacement);
+                                lineStart += replacement.size();
+                            } else if (behavior == "enable" || behavior == "warn") {
+                                source.replace(lineStart, replaceLen, "\n");
+                                lineStart++;
+                            } else {
+                                lineStart = lineEnd + (hasLineBreak ? 1 : 0);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            lineStart = lineEnd + (hasLineBreak ? 1 : 0);
+        }
+
+        ReplaceIdentifier(source, "GL_ARB_gpu_shader_int64", "MG_DISABLED_GL_ARB_gpu_shader_int64");
+    }
+
+    void ModernizeLegacyGLSL(MobileGL::ShaderStage stage, MobileGL::String& source) {
+        RemoveDefineForIdentifier(source, "HIGHP_OR_DEFAULT");
+        RemoveDefineForIdentifier(source, "MEDIUMP_OR_DEFAULT");
+        RemoveDefineForIdentifier(source, "LOWP_OR_DEFAULT");
+        ReplaceIdentifier(source, "HIGHP_OR_DEFAULT", "");
+        ReplaceIdentifier(source, "MEDIUMP_OR_DEFAULT", "");
+        ReplaceIdentifier(source, "LOWP_OR_DEFAULT", "");
+        ReplaceIdentifier(source, "highp", "");
+        ReplaceIdentifier(source, "mediump", "");
+        ReplaceIdentifier(source, "lowp", "");
+
+        ReplaceIdentifier(source, "texture2D", "texture");
+        ReplaceIdentifier(source, "texture2DProj", "textureProj");
+        ReplaceIdentifier(source, "textureCube", "texture");
+        ReplaceIdentifier(source, "texture3D", "texture");
+
+        if (stage == MobileGL::ShaderStage::Vertex) {
+            ReplaceIdentifier(source, "attribute", "in");
+            ReplaceIdentifier(source, "varying", "out");
+            return;
+        }
+
+        if (stage == MobileGL::ShaderStage::Fragment) {
+            ReplaceIdentifier(source, "varying", "in");
+            const bool usesFragColor = source.find("gl_FragColor") != MobileGL::String::npos;
+            if (usesFragColor) {
+                ReplaceIdentifier(source, "gl_FragColor", "mg_FragColor");
+                source.insert(FindAfterVersionDirective(source), "out vec4 mg_FragColor;\n");
+            }
+        }
+    }
+
+    void InjectDepthRangeBuiltinShim(MobileGL::ShaderStage stage, MobileGL::String& source) {
+        if (stage != MobileGL::ShaderStage::Fragment) return;
+        if (source.find("gl_DepthRange") == MobileGL::String::npos) return;
+        if (source.find("mg_DepthRangeParameters") != MobileGL::String::npos) return;
+
+        constexpr const char* shim =
+            "struct mg_DepthRangeParameters { float near; float far; float diff; };\n"
+            "const mg_DepthRangeParameters mg_DepthRange = mg_DepthRangeParameters(0.0, 1.0, 1.0);\n"
+            "#define gl_DepthRange mg_DepthRange\n";
+        source.insert(FindAfterVersionDirective(source), shim);
+    }
 } // namespace
 
 namespace MobileGL {
@@ -99,6 +314,10 @@ namespace MobileGL {
                 size_t commentStartPos = source.find("/*");
                 while (commentStartPos != String::npos) {
                     size_t commentEndPos = source.find("*/", commentStartPos);
+                    if (commentEndPos == String::npos) {
+                        source.erase(commentStartPos);
+                        break;
+                    }
                     // + length of "*/"
                     source = source.replace(commentStartPos, commentEndPos - commentStartPos + 2, "");
                     commentStartPos = source.find("/*", commentStartPos);
@@ -145,7 +364,8 @@ namespace MobileGL {
                 } else {
                     profile = ShaderProfile::Core;
                     source.insert(0, "#version 460 core\n");
-                    return;
+                    versionPos = 0;
+                    lineEnd = source.find('\n', versionPos);
                 }
 
                 SizeT firstLineEnd = lineEnd;
@@ -164,11 +384,17 @@ namespace MobileGL {
                     }
                 }
 
+                FilterUnsupportedGpuShaderInt64(source);
+
                 // Some shader packs define helpers with built-in GLSL names such as round(), tanh(), or fma().
                 // These may pass OpenGL-style validation but fail when recompiled for Vulkan/SPIR-V generation.
                 RenameBuiltinShadowingFunction(source, "round", "mg_round");
                 RenameBuiltinShadowingFunction(source, "tanh", "mg_tanh");
                 RenameBuiltinShadowingFunction(source, "fma", "mg_fma");
+                RenameBuiltinShadowingFunction(source, "min3", "mg_min3");
+                RenameBuiltinShadowingFunction(source, "max3", "mg_max3");
+                ModernizeLegacyGLSL(stage, source);
+                InjectDepthRangeBuiltinShim(stage, source);
             }
 
         } // namespace ShaderTranspiler

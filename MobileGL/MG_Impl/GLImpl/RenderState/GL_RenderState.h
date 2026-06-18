@@ -11,7 +11,11 @@
 
 namespace MobileGL::MG_Impl::GLImpl {
     /* @INSERTION_POINT:FUNCTION_DECLARATION@ */
+    void BlendEquationi(GLuint buf, GLenum mode);
+    void BlendEquationSeparatei(GLuint buf, GLenum modeRGB, GLenum modeAlpha);
+    void BlendFunci(GLuint buf, GLenum src, GLenum dst);
     void BlendFuncSeparatei(GLuint buf, GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha);
+    void GetBooleani_v(GLenum target, GLuint index, GLboolean* data);
     void Disablei(GLenum target, GLuint index);
     void Enablei(GLenum target, GLuint index);
     void BlendFunc(GLenum sfactor, GLenum dfactor);
@@ -36,6 +40,7 @@ namespace MobileGL::MG_Impl::GLImpl {
     GLboolean IsEnabled(GLenum cap);
     void Hint(GLenum target, GLenum mode);
     void FrontFace(GLenum mode);
+    void ProvokingVertex(GLenum mode);
     void Enable(GLenum cap);
     void Disable(GLenum cap);
     void DepthRange(GLclampd near_val, GLclampd far_val);

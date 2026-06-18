@@ -10,6 +10,7 @@
 #include <MG_Util/Converters/GLToStr/GLEnumConverter.h>
 #include <MG_Util/ShaderTranspiler/Types.h>
 #include <MG_Util/ShaderTranspiler/ShaderCompiler.h>
+#include <MG_Util/ShaderTranspiler/ShaderSourceProcessor.h>
 #include <MG_Util/Converters/MGToGL/ProgramEnumConverter.h>
 #include <MG_Util/Converters/SPIRVCrossToGL/SpvcTypeConverter.h>
 
@@ -59,6 +60,27 @@ namespace {
 }
 
 namespace MobileGL::MG_State::GLState {
+    void ProgramObject::ResetLinkArtifacts() {
+        m_program.reset();
+        m_generatedSpirv.clear();
+        m_uniformLocations.clear();
+        m_uniformIndexInTProgram.clear();
+        m_uniformSamplerOrImageUnitIndex.clear();
+        m_uniformBlockIndexByName.clear();
+        m_uniformBlockBinding.clear();
+        m_uniformOffsets.clear();
+        m_uniformSizesInBytes.clear();
+        m_globalUboScratch.clear();
+        m_attribs.clear();
+        m_attribTypes.clear();
+        m_activeUniformCount = 0;
+        m_maxUniformLocation = 0;
+        m_uniformNameMaxLength = 0;
+        m_attribInNameMaxLength = 0;
+        m_uniformBlockNameMaxLength = 0;
+        m_linkStatus = false;
+    }
+
     bool ProgramObject::ShaderIsAttached(const SharedPtr<ShaderObject>& shader) {
         MGLOG_D("ProgramObject %u: ShaderIsAttached check for shader %p", m_externalIndex, shader.get());
         auto it = std::find_if(m_shaders.begin(), m_shaders.end(),
@@ -134,6 +156,8 @@ namespace MobileGL::MG_State::GLState {
     void ProgramObject::Link(Bool addDefaultFSIfMissingForRenderingPipelineProgram) {
         MGLOG_D("ProgramObject %u: Link start, shaders to link: %zu", m_externalIndex, m_shaders.size());
         ++m_backendStateVersion;
+        ResetLinkArtifacts();
+        m_infoLog.clear();
         // Remove detached shaders first
         for (const auto& detachedShader : m_detachedShaders) {
             RemoveShader(detachedShader);
@@ -162,7 +186,6 @@ namespace MobileGL::MG_State::GLState {
                                         "log:\n{}\nShader src:\n{}",
                                         MG_Util::ConvertGLEnumToString(shaderTypes[i]), m_shaders[i]->GetInfoLog(),
                                         m_shaders[i]->GetShaderSource());
-                m_linkStatus = false;
                 MGLOG_E("ProgramObject %u: Link failed - shader[%zu] compile status false. InfoLog:\n%s",
                         m_externalIndex, i, m_infoLog.c_str());
                 return;
@@ -185,9 +208,9 @@ namespace MobileGL::MG_State::GLState {
             m_program = result.value();
             MGLOG_D("ProgramObject %u: LinkProgram succeeded, TProgram ptr %p", m_externalIndex, m_program.get());
         } else {
-            m_linkStatus = false;
             m_infoLog = result.error().log;
             MGLOG_E("ProgramObject %u: LinkProgram failed. InfoLog:\n%s", m_externalIndex, m_infoLog.c_str());
+            return;
         }
 
         MGLOG_D("ProgramObject %u: Starting reflection", m_externalIndex);
@@ -298,6 +321,27 @@ namespace MobileGL::MG_State::GLState {
             }
         }
 
+        for (int i = 0; i < m_activeUniformCount; i++) {
+            auto& uniform = m_program->getUniform(i);
+            const auto locationIt = m_uniformLocations.find(uniform.name);
+            if (locationIt == m_uniformLocations.end()) {
+                continue;
+            }
+
+            const Uint location = locationIt->second;
+            if (location >= m_uniformSamplerOrImageUnitIndex.size() || uniform.getType() == nullptr ||
+                !uniform.getType()->isOpaque() || (!uniform.getType()->isTexture() && !uniform.getType()->isImage())) {
+                continue;
+            }
+
+            const int binding = uniform.getBinding();
+            if (binding >= 0 && binding != static_cast<int>(glslang::TQualifier::layoutBindingEnd)) {
+                m_uniformSamplerOrImageUnitIndex[location] = binding;
+                MGLOG_D("ProgramObject %u: Reflection - opaque uniform '%s' location=%u initialUnit=%d",
+                        m_externalIndex, uniform.name.c_str(), location, binding);
+            }
+        }
+
         // ------------ attributes (vertex in) ---------------
         Int inCount = m_program->getNumPipeInputs();
         MGLOG_D("ProgramObject %u: Reflection - pipe input count (attributes) = %d", m_externalIndex, inCount);
@@ -386,11 +430,16 @@ namespace MobileGL::MG_State::GLState {
         MGLOG_D("ProgramObject %u: GenerateBinary - start", m_externalIndex);
         Vector<SharedPtr<glslang::TShader>> shaders(m_shaders.size());
         Vector<GLenum> shaderTypes(m_shaders.size());
+
+        // 1. Compile shaders
         for (SizeT i = 0; i < m_shaders.size(); i++) {
-            auto shaderType = MG_Util::ConvertShaderStageToGLEnum(m_shaders[i]->GetShaderStage());
+            auto shaderStage = m_shaders[i]->GetShaderStage();
+            auto shaderType = MG_Util::ConvertShaderStageToGLEnum(shaderStage);
+            String compileSource = m_shaders[i]->GetShaderSource();
+            PreprocessShaderSource(shaderStage, compileSource);
             shaderTypes[i] = shaderType;
             ShaderAttrib attrib{.shaderType = shaderType,
-                                .sourceStr = m_shaders[i]->GetShaderSource(),
+                                .sourceStr = compileSource,
                                 .flags = 0}; // Will need patched glslang to work
             MGLOG_D("ProgramObject %u: GenerateBinary - compiling shader[%zu] type %u", m_externalIndex, i, shaderType);
             auto res = ShaderCompiler::CompileShader(attrib);
@@ -401,7 +450,7 @@ namespace MobileGL::MG_State::GLState {
                 MGLOG_E("ProgramObject %u: GenerateBinary - CompileShader return code %d, log:\n%s", m_externalIndex,
                         res.error().errc, res.error().log.c_str());
                 MGLOG_E("ProgramObject %u: GenerateBinary - last compiled shader src: \n%s", m_externalIndex,
-                        m_shaders[i]->GetShaderSource().c_str());
+                        compileSource.c_str());
             }
             MOBILEGL_ASSERT(res, "CompileShader failed during binary generation");
             shaders[i] = res.value();
@@ -409,6 +458,7 @@ namespace MobileGL::MG_State::GLState {
                     shaders[i].get());
         }
 
+        // 2. Do actual linking
         ProgramAttrib attrib{.shaders = Move(shaders),
                              .explicitVertexInLocations = m_explicitAttribLocations,
                              .explicitFragmentOutLocations = m_explicitFragDataLocation};
@@ -435,11 +485,16 @@ namespace MobileGL::MG_State::GLState {
         MGLOG_D("ProgramObject %u: GenerateBinary - generated %zu SPIR-V modules", m_externalIndex,
                 m_generatedSpirv.size());
 
+        // 3. Linked SPIR-V generated, sanitize and optimize it
         for (auto& spv : m_generatedSpirv) {
             auto success = ShaderCompiler::SanitizeAndOptimizeBinary(spv, spv);
             MOBILEGL_ASSERT(success, "SanitizeBinary failed");
         }
 
+        // 4. Do reflection (find global UBO etc.)
+        m_uniformSizesInBytes.clear();
+        m_uniformOffsets.clear();
+        m_globalUboScratch.clear();
         for (SizeT i = 0; i < m_generatedSpirv.size(); i++) {
             auto& spv = m_generatedSpirv[i];
 
@@ -454,9 +509,6 @@ namespace MobileGL::MG_State::GLState {
                         "err = %d%s",
                         m_externalIndex, i, result,
                         (result == SPVC_ERROR_INVALID_SPIRV ? ". Probably no global UBO?" : ""));
-                m_uniformSizesInBytes.clear();
-                m_uniformOffsets.clear();
-                m_globalUboScratch.clear();
                 continue;
             } else {
                 auto& meta = session.GetMetadata();
@@ -465,6 +517,9 @@ namespace MobileGL::MG_State::GLState {
                         "plainUniformOffsets=%zu",
                         m_externalIndex, meta.globalUboSize, meta.plainUniformMemberSizesInBytes.size(),
                         meta.plainUniformOffsetsInUBO.size());
+                if (size == 0) {
+                    continue;
+                }
                 m_globalUboScratch.resize(size);
                 m_uniformOffsets.resize(m_maxUniformLocation + 1);
                 for (const auto& [name, offset] : meta.plainUniformOffsetsInUBO) {

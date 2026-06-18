@@ -13,9 +13,19 @@
 #include <MG_State/EGLState/Core.h>
 #include <MG_Impl/GLImpl/Texture/ProxyTexture.h>
 #include <MG_Impl/GLImpl/Framebuffer/GL_Framebuffer.h>
+#include <cstdlib>
 
 namespace MobileGL {
+    namespace {
+        Bool g_isInitialized = false;
+    }
+
     void Initialize() {
+        if (g_isInitialized) {
+            MGLOG_D("MobileGL already initialized; skipping duplicate Initialize()");
+            return;
+        }
+
         MG_Util::Debug::InitFile();
         MGLOG_I("Initializing MobileGL...");
         MG_ConfigLoader::Init();
@@ -28,16 +38,24 @@ namespace MobileGL {
         MGLOG_D("MG_Impl initialized");
         glslang::InitializeProcess();
         MGLOG_D("glslang initialized");
+        g_isInitialized = true;
         MGLOG_I("MobileGL initialized");
     }
 
     void Destroy() {
+        if (!g_isInitialized) {
+            return;
+        }
+
         MGLOG_I("MobileGL closing...");
         glslang::FinalizeProcess();
+        MG_Backend::pActiveBackendObject.reset();
         MG_State::pGLContext.reset();
         MG_State::pEGLContext.reset();
         MG_Impl::GLImpl::TextureImpl::pProxyTextureManager.reset();
         MG_Impl::GLImpl::FramebufferImpl::pDefaultFramebufferInfo.reset();
+        MG_Backend::gBackendFunctionsTable = {};
+        g_isInitialized = false;
         MG_Util::Debug::Close();
 
         // TODO: add and use Destroy functions for other subsystems
@@ -49,6 +67,9 @@ namespace MobileGL {
     }
 
     __attribute__((destructor)) static void AutoDestroy() {
+        if (std::getenv("MOBILEGL_TRACE_SKIP_AUTODESTROY") != nullptr) {
+            return;
+        }
         Destroy();
     }
 #endif

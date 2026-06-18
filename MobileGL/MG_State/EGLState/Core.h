@@ -87,6 +87,7 @@ namespace MobileGL {
                 EGLContextHandle GetCurrentContext() const;
                 EGLDisplayHandle GetCurrentDisplay() const;
                 EGLSurfaceHandle GetCurrentSurface(EGLint readdraw) const;
+                Bool IsDoubleBufferedSurface(EGLSurfaceHandle surface) const;
 
                 // Sync
                 EGLSyncHandle CreateSync(EGLDisplayHandle display, EGLenum type, const EGLAttrib* attribList);
@@ -213,7 +214,7 @@ namespace MobileGL {
                 static std::thread::id CurrentThreadKey();
 
                 EGLDisplayHandle GetOrCreateDisplay(Uint64 nativeDisplayKey, EGLenum platform);
-                EGLConfigHandle CreateDefaultConfig(EGLDisplayHandle display);
+                EGLConfigHandle CreateDefaultConfig(EGLDisplayHandle display, EGLint configId, EGLint stencilSize);
 
                 DisplayObject* TryGetDisplay(EGLDisplayHandle display);
                 const DisplayObject* TryGetDisplay(EGLDisplayHandle display) const;

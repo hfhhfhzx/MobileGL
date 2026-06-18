@@ -110,6 +110,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         void Shutdown();
 
         Bool SetupDraw(FrameContext::FrameData& frame, GLenum mode, Flags<DrawSetupAspect> aspects,
+                       const DrawCmdParam& drawParams,
                        const IndexBufferView* pIndexBufferView = nullptr);
         void ClearAttachmentsOnActiveRenderPass(VkCommandBuffer commandBuffer,
                                                 const RenderPassEntry& compatibleRenderPassEntry);
@@ -119,18 +120,39 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         void ClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat* value);
         void ClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint* value);
         void ClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint* value);
+        void ClearNamedFramebufferfv(const SharedPtr<MG_State::GLState::FramebufferObject>& framebuffer,
+                                     GLenum buffer, GLint drawbuffer, const GLfloat* value);
+        void ClearNamedFramebufferfi(const SharedPtr<MG_State::GLState::FramebufferObject>& framebuffer,
+                                     GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil);
         void BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
                              GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
                              GLbitfield mask, GLenum filter);
+        void BlitNamedFramebuffer(const SharedPtr<MG_State::GLState::FramebufferObject>& readFbo,
+                                  const SharedPtr<MG_State::GLState::FramebufferObject>& drawFbo,
+                                  GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+                                  GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
+                                  GLbitfield mask, GLenum filter);
         void CopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
                        GLint x, GLint y, GLsizei width, GLsizei height);
         void GenerateMipmap(GLenum target);
+        void ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void* pixels);
+        void GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels);
+        void GetTextureImage(const SharedPtr<MG_State::GLState::ITextureObject>& texture,
+                             TextureUploadTarget uploadTarget, GLint level, GLenum format, GLenum type,
+                             GLsizei bufSize, GLvoid* pixels);
+        void DispatchCompute(GLuint numGroupsX, GLuint numGroupsY, GLuint numGroupsZ);
+        void DispatchComputeIndirect(GLintptr indirect);
+        void MemoryBarrier(GLbitfield barriers);
+        static VkMemoryBarrier BuildMemoryBarrierForGlBarriers(GLbitfield barriers);
         void DrawArrays(const DrawCmd& payload);
         void DrawElements(const DrawIndexedCmd& payload);
         void MultiDrawElements(const MultiDrawIndexedCmd& payloads);
+        void MultiDrawElementsIndirectCount(GLenum mode, GLenum type, const void* indirect, GLintptr drawcount,
+                                            GLsizei maxdrawcount, GLsizei stride);
         void Present();
 
         const PhysicalDevice& GetPhysicalDevice() const;
+        VkInstance GetInstance() const;
         Bool IsDrawIndirectCountExtensionEnabled() const;
 
         void RecreateSwapchain();
@@ -170,8 +192,14 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         };
 
         void QueueClearBufferPayload(GLenum buffer, GLint drawbuffer, const ClearAttachmentPayload& clearPayload);
+        void QueueClearBufferPayloadForFramebuffer(const MG_State::GLState::FramebufferObject& framebuffer,
+                                                  GLenum buffer, GLint drawbuffer,
+                                                  const ClearAttachmentPayload& clearPayload);
 
         NativeWindowType m_window = 0;
+        void* m_platformDisplay = nullptr;
+        void* m_platformLibrary = nullptr;
+        void* m_platformCloseDisplay = nullptr;
         VulkanRendererConfig m_config;
 
         // Vulkan objects
@@ -189,6 +217,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         VkQueue m_presentQueue = VK_NULL_HANDLE;
         Bool m_drawIndirectCountExtensionEnabled = false;
         Bool m_indexTypeUint8ExtensionEnabled = false;
+        Bool m_logicOpFeatureEnabled = false;
         using PFNDrawIndexedIndirectCountFunc = void(VKAPI_PTR*)(VkCommandBuffer commandBuffer, VkBuffer buffer,
                                                                  VkDeviceSize offset, VkBuffer countBuffer,
                                                                  VkDeviceSize countBufferOffset, Uint32 maxDrawCount,
@@ -211,6 +240,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         FrameContext m_frameContext;
 
         UniquePtr<PipelineFactory> m_pipelineFactory;
+        UnorderedMap<ProgramFactory::HashType, VkPipeline> m_computePipelines;
         UniquePtr<ProgramFactory> m_programFactory;
         UniquePtr<UniformManager> m_uniformManager;
         UniquePtr<VertexInputStateFactory> m_vertexInputStateFactory;
@@ -241,8 +271,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             ProgramFactory::CompileOptionFlags transformFlags,
             const MG_State::GLState::VertexArrayObject& vao,
             const RenderPassEntry& renderPassEntry);
+        VkPipeline GetOrCreateComputePipeline(const ProgramFactory::VkProgramObject& programObj);
+        void DestroyComputePipelines();
 
-        Bool UploadAndBindVertexBuffers(VkCommandBuffer commandBuffer, const MG_State::GLState::VertexArrayObject& vao);
+        Bool UploadAndBindVertexBuffers(VkCommandBuffer commandBuffer, const MG_State::GLState::VertexArrayObject& vao,
+                                        const DrawCmdParam& drawParams);
         Bool UploadAndBindIndexBuffer(FrameContext::FrameData& frame,
                                      const MG_State::GLState::VertexArrayObject& vao,
                                       const IndexBufferView* pIndexBufferView = nullptr);
@@ -269,6 +302,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                            const IntVec3& storageBaseTexelSize,
                                            VkImageLayout originalLayout,
                                            VkImageLayout finalLayout);
+        Bool SubmitReadbackCommandsAndWait(FrameContext::FrameData& frame);
 
         void ShutdownSwapchain();
 

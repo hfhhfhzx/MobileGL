@@ -21,12 +21,25 @@
 #include <MG_Util/Converters/MGToGL/TextureEnumConverter.h>
 #include <MG_Util/Converters/MGToStr/TextureEnumConverter.h>
 #include <MG_Util/Converters/MGToGL/RenderStateEnumConverter.h>
+#include <MG_Util/Metrics/BufferMetrics.h>
 #include <MG_Util/Texture/PixelStoreProcessor.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#if defined(__linux__) && !defined(__ANDROID__) && __has_include(<X11/Xlib.h>)
+#pragma push_macro("Bool")
+#pragma push_macro("None")
+#include <X11/Xlib.h>
+#pragma pop_macro("None")
+#pragma pop_macro("Bool")
+#endif
 
 namespace MobileGL::MG_Backend::DirectGLES {
     MG_External::EGLFunctionsTable g_EGLFuncs;
     MG_External::GLESFunctionsTable g_GLESFuncs;
     MG_External::GLESCapabilities g_GLESCapabilities;
+
+    static Bool QueryCurrentSurfaceSize(Int& outWidth, Int& outHeight);
 
     enum class DrawSyncBit : Uint32 {
         None = 0,
@@ -42,6 +55,42 @@ namespace MobileGL::MG_Backend::DirectGLES {
     inline DrawSyncBit& operator|=(DrawSyncBit& a, DrawSyncBit b) {
         a = a | b;
         return a;
+    }
+
+    struct DrawElementsIndirectCommand {
+        Uint32 count = 0;
+        Uint32 instanceCount = 0;
+        Uint32 firstIndex = 0;
+        Int32 baseVertex = 0;
+        Uint32 baseInstance = 0;
+    };
+
+    struct DrawArraysIndirectCommand {
+        Uint32 count = 0;
+        Uint32 instanceCount = 0;
+        Uint32 first = 0;
+        Uint32 baseInstance = 0;
+    };
+
+    const Uint8* ResolveIndirectCommandBytes(const void* indirect, SizeT requiredBytes, const char* label) {
+        auto drawBuffer = MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::DrawIndirect).GetBoundObject();
+        if (drawBuffer) {
+            drawBuffer->MarkPersistentMappedRangeDirty();
+            const auto drawData = drawBuffer->GetDataReadOnly();
+            const SizeT commandOffset = reinterpret_cast<SizeT>(indirect);
+            if (!drawData || commandOffset + requiredBytes > drawData->size()) {
+                MGLOG_E("%s skipped: invalid GL_DRAW_INDIRECT_BUFFER binding or range", label);
+                return nullptr;
+            }
+            return drawData->data() + commandOffset;
+        }
+
+        if (!indirect) {
+            MGLOG_E("%s skipped: indirect pointer is null", label);
+            return nullptr;
+        }
+
+        return reinterpret_cast<const Uint8*>(indirect);
     }
 
     namespace DebugImpl {
@@ -94,6 +143,7 @@ namespace MobileGL::MG_Backend::DirectGLES {
 
     namespace BufferImpl {
         void CreateAndSyncBufferObject(const SharedPtr<MG_State::GLState::BufferObject>& bufferObject) {
+            bufferObject->MarkPersistentMappedRangeDirty();
             if (!(bufferObject->GetChangeBits() & BufferChangeBits::DirtyBit)) return;
 
             const auto& backendBufferIt = g_backendBufferObjects.find(bufferObject.get());
@@ -105,6 +155,59 @@ namespace MobileGL::MG_Backend::DirectGLES {
             backendObj->SyncToBackend(bufferObject);
         }
 
+        void SyncBufferBindingPoints(BufferTarget target, GLenum glTarget) {
+#ifdef TRACY_ENABLE
+            ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
+#endif
+            auto bindingPointCnt = MG_State::pGLContext->GetBufferBindingPointCount(target);
+            for (SizeT i = 0; i < bindingPointCnt; ++i) {
+                auto& point = MG_State::pGLContext->GetBufferBindingPoint(target, i);
+                auto& obj = point.GetBoundObject();
+                if (!obj) {
+                    g_GLESFuncs.glBindBufferBase(glTarget, static_cast<GLuint>(i), 0);
+                    continue;
+                }
+
+                CreateAndSyncBufferObject(obj);
+                const auto& backendBufferIt = g_backendBufferObjects.find(obj.get());
+                if (backendBufferIt == g_backendBufferObjects.end()) {
+                    MGLOG_E("No backend buffer found for %s binding point %zu.",
+                            MG_Util::ConvertGLEnumToString(glTarget).c_str(), i);
+                    continue;
+                }
+
+                const auto& range = point.GetRange();
+                auto backendBufferId = backendBufferIt->second->GetBackendBufferId();
+                if (range.start == 0 && range.end >= obj->GetSize()) {
+                    g_GLESFuncs.glBindBufferBase(glTarget, static_cast<GLuint>(i), backendBufferId);
+                } else {
+                    const auto start = std::min(range.start, obj->GetSize());
+                    const auto end = std::min(range.end, obj->GetSize());
+                    g_GLESFuncs.glBindBufferRange(glTarget, static_cast<GLuint>(i), backendBufferId,
+                                                  static_cast<GLintptr>(start), static_cast<GLsizeiptr>(end - start));
+                }
+            }
+        }
+
+        void SyncBoundBuffer(BufferTarget target, GLenum glTarget) {
+#ifdef TRACY_ENABLE
+            ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
+#endif
+            auto& bufferObject = MG_State::pGLContext->GetBufferBindingSlot(target).GetBoundObject();
+            if (!bufferObject) {
+                g_GLESFuncs.glBindBuffer(glTarget, 0);
+                return;
+            }
+
+            CreateAndSyncBufferObject(bufferObject);
+            const auto& backendBufferIt = g_backendBufferObjects.find(bufferObject.get());
+            if (backendBufferIt == g_backendBufferObjects.end()) {
+                MGLOG_E("No backend buffer found for %s.", MG_Util::ConvertGLEnumToString(glTarget).c_str());
+                return;
+            }
+            backendBufferIt->second->Bind(glTarget);
+        }
+
         void SyncNeccessaryBuffers(Bool includeIBO = false, Bool includeIndirectBuffer = false) {
 #ifdef TRACY_ENABLE
             ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
@@ -112,7 +215,7 @@ namespace MobileGL::MG_Backend::DirectGLES {
             g_backendBufferObjects.CollectGarbageIfNeeded();
 
             // All buffers we need are:
-            //   1.VBO 2.IBO (if needed) 3.UBO 4.IndirectBuffer (if needed) 5.SSBO (TODO)
+            //   1.VBO 2.IBO (if needed) 3.UBO 4.IndirectBuffer (if needed)
             // PBO is not needed since it should be handled in frontend
 
             const auto& currentVAOObject = MG_State::pGLContext->GetBoundVertexArray();
@@ -147,14 +250,18 @@ namespace MobileGL::MG_Backend::DirectGLES {
                 }
             }
 
-            // UBO
-            auto uboBindingPointCnt = MG_State::pGLContext->GetBufferBindingPointCount(BufferTarget::Uniform);
-            for (SizeT i = 0; i < uboBindingPointCnt; ++i) {
-                auto& point = MG_State::pGLContext->GetBufferBindingPoint(BufferTarget::Uniform, i);
-                auto& obj = point.GetBoundObject();
-                if (obj) {
-                    CreateAndSyncBufferObject(obj);
-                }
+            SyncBufferBindingPoints(BufferTarget::Uniform, GL_UNIFORM_BUFFER);
+        }
+
+        void SyncComputeBuffers(Bool includeDispatchIndirectBuffer) {
+#ifdef TRACY_ENABLE
+            ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
+#endif
+            g_backendBufferObjects.CollectGarbageIfNeeded();
+            SyncBufferBindingPoints(BufferTarget::Uniform, GL_UNIFORM_BUFFER);
+            SyncBufferBindingPoints(BufferTarget::ShaderStorage, GL_SHADER_STORAGE_BUFFER);
+            if (includeDispatchIndirectBuffer) {
+                SyncBoundBuffer(BufferTarget::DispatchIndirect, GL_DISPATCH_INDIRECT_BUFFER);
             }
         }
     } // namespace BufferImpl
@@ -234,6 +341,31 @@ namespace MobileGL::MG_Backend::DirectGLES {
                 }
             }
         }
+
+        void SyncImageTextureBinding(Uint unit) {
+#ifdef TRACY_ENABLE
+            ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
+#endif
+            auto& imageBinding = MG_State::pGLContext->GetImageTextureBinding(static_cast<Int>(unit));
+            if (!imageBinding.Texture) {
+                g_GLESFuncs.glBindImageTexture(unit, 0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+                return;
+            }
+
+            auto& backendTexture = SyncTextureObjectToBackend(imageBinding.Texture);
+            g_GLESFuncs.glBindImageTexture(unit, backendTexture->GetBackendTextureId(), imageBinding.Level,
+                                           imageBinding.Layered, imageBinding.Layer, imageBinding.Access,
+                                           imageBinding.Format);
+        }
+
+        void SyncImageTextureBindings() {
+#ifdef TRACY_ENABLE
+            ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
+#endif
+            for (Uint unit = 0; unit < MG_State::GLState::TextureState::MAX_TEXTURE_IMAGE_UNITS; ++unit) {
+                SyncImageTextureBinding(unit);
+            }
+        }
     } // namespace TextureImpl
 
     namespace FramebufferImpl {
@@ -286,19 +418,30 @@ namespace MobileGL::MG_Backend::DirectGLES {
 
     namespace RenderStateImpl {
         static Uint16 g_syncedRenderStateVersion = 0;
+        static Bool g_hasSyncedRenderState = false;
         static RenderStateParameters g_syncedRenderStateParameters;
+        static IntVec4 g_syncedBackendViewport = IntVec4(-1, -1, -1, -1);
         void SyncRenderState() {
 #ifdef TRACY_ENABLE
             ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
             Uint16 currentRenderStateVersion = MG_State::pGLContext->GetRenderStateParametersVersion();
-            if (currentRenderStateVersion == g_syncedRenderStateVersion) return;
+            if (g_hasSyncedRenderState && currentRenderStateVersion == g_syncedRenderStateVersion) return;
 
             const auto& parameters = MG_State::pGLContext->GetRenderStateParameters();
 
-            if (parameters.Viewport != g_syncedRenderStateParameters.Viewport) {
-                g_GLESFuncs.glViewport(parameters.Viewport.x(), parameters.Viewport.y(), parameters.Viewport.z(),
-                                       parameters.Viewport.w());
+            IntVec4 backendViewport = parameters.Viewport;
+            if (backendViewport.z() <= 0 || backendViewport.w() <= 0) {
+                Int surfaceWidth = 0;
+                Int surfaceHeight = 0;
+                if (QueryCurrentSurfaceSize(surfaceWidth, surfaceHeight)) {
+                    backendViewport = IntVec4(0, 0, surfaceWidth, surfaceHeight);
+                }
+            }
+            if (backendViewport != g_syncedBackendViewport) {
+                g_GLESFuncs.glViewport(backendViewport.x(), backendViewport.y(), backendViewport.z(),
+                                       backendViewport.w());
+                g_syncedBackendViewport = backendViewport;
             }
 
 #define SYNC_CAPABILITY(cap_mg, cap_gl)                                                                                \
@@ -310,7 +453,16 @@ namespace MobileGL::MG_Backend::DirectGLES {
         }                                                                                                              \
     }
             SYNC_CAPABILITY(DepthTest, GL_DEPTH_TEST);
+            SYNC_CAPABILITY(ColorLogicOp, GL_COLOR_LOGIC_OP);
+            SYNC_CAPABILITY(Dither, GL_DITHER);
+            SYNC_CAPABILITY(Multisample, GL_MULTISAMPLE);
+            SYNC_CAPABILITY(SampleAlphaToCoverage, GL_SAMPLE_ALPHA_TO_COVERAGE);
+            SYNC_CAPABILITY(SampleCoverage, GL_SAMPLE_COVERAGE);
+            SYNC_CAPABILITY(SampleMask, GL_SAMPLE_MASK);
+            SYNC_CAPABILITY(PolygonOffsetFill, GL_POLYGON_OFFSET_FILL);
+            SYNC_CAPABILITY(RasterizerDiscard, GL_RASTERIZER_DISCARD);
             SYNC_CAPABILITY(ScissorTest, GL_SCISSOR_TEST);
+            SYNC_CAPABILITY(StencilTest, GL_STENCIL_TEST);
             SYNC_CAPABILITY(CullFace, GL_CULL_FACE);
 
 #undef SYNC_CAPABILITY
@@ -423,6 +575,34 @@ namespace MobileGL::MG_Backend::DirectGLES {
                 if (parameters.DepthMask != g_syncedRenderStateParameters.DepthMask) {
                     g_GLESFuncs.glDepthMask(parameters.DepthMask ? GL_TRUE : GL_FALSE);
                 }
+                if (parameters.DepthRange != g_syncedRenderStateParameters.DepthRange) {
+                    g_GLESFuncs.glDepthRangef(parameters.DepthRange.x(), parameters.DepthRange.y());
+                }
+            }
+
+            { // Stencil state
+                for (SizeT faceIndex = 0; faceIndex < parameters.StencilStates.size(); ++faceIndex) {
+                    const StencilFaceState& current = parameters.StencilStates[faceIndex];
+                    const StencilFaceState& synced = g_syncedRenderStateParameters.StencilStates[faceIndex];
+                    const GLenum glFace = faceIndex == 0 ? GL_FRONT : GL_BACK;
+
+                    if (current.Func != synced.Func || current.Ref != synced.Ref ||
+                        current.ValueMask != synced.ValueMask) {
+                        g_GLESFuncs.glStencilFuncSeparate(
+                            glFace, MG_Util::ConvertDepthTestFuncToGLEnum(current.Func), current.Ref,
+                            current.ValueMask);
+                    }
+                    if (current.WriteMask != synced.WriteMask) {
+                        g_GLESFuncs.glStencilMaskSeparate(glFace, current.WriteMask);
+                    }
+                    if (current.FailOp != synced.FailOp || current.PassDepthFailOp != synced.PassDepthFailOp ||
+                        current.PassDepthPassOp != synced.PassDepthPassOp) {
+                        g_GLESFuncs.glStencilOpSeparate(
+                            glFace, MG_Util::ConvertStencilOperationToGLEnum(current.FailOp),
+                            MG_Util::ConvertStencilOperationToGLEnum(current.PassDepthFailOp),
+                            MG_Util::ConvertStencilOperationToGLEnum(current.PassDepthPassOp));
+                    }
+                }
             }
 
             { // Color mask
@@ -441,12 +621,20 @@ namespace MobileGL::MG_Backend::DirectGLES {
                 if (parameters.ClearDepth != g_syncedRenderStateParameters.ClearDepth) {
                     g_GLESFuncs.glClearDepthf(parameters.ClearDepth);
                 }
+                if (parameters.BlendColor != g_syncedRenderStateParameters.BlendColor) {
+                    const FloatVec4& blendColor = parameters.BlendColor;
+                    g_GLESFuncs.glBlendColor(blendColor.x(), blendColor.y(), blendColor.z(), blendColor.w());
+                }
             }
 
             { // Cull face mode
                 if (parameters.CullFaceModeSetting != g_syncedRenderStateParameters.CullFaceModeSetting) {
                     const CullFaceMode& cfm = parameters.CullFaceModeSetting;
                     g_GLESFuncs.glCullFace(MG_Util::ConvertCullFaceModeToGLEnum(cfm));
+                }
+                if (parameters.FrontFaceModeSetting != g_syncedRenderStateParameters.FrontFaceModeSetting) {
+                    const FrontFaceMode& ffm = parameters.FrontFaceModeSetting;
+                    g_GLESFuncs.glFrontFace(MG_Util::ConvertFrontFaceModeToGLEnum(ffm));
                 }
             }
 
@@ -457,8 +645,48 @@ namespace MobileGL::MG_Backend::DirectGLES {
                 }
             }
 
+            { // Logic op
+                if (parameters.LogicOp != g_syncedRenderStateParameters.LogicOp) {
+                    g_GLESFuncs.glLogicOp(MG_Util::ConvertLogicOperationToGLEnum(parameters.LogicOp));
+                }
+            }
+
+            { // Polygon offset
+                if (parameters.PolygonOffsetFactor != g_syncedRenderStateParameters.PolygonOffsetFactor ||
+                    parameters.PolygonOffsetUnits != g_syncedRenderStateParameters.PolygonOffsetUnits) {
+                    g_GLESFuncs.glPolygonOffset(parameters.PolygonOffsetFactor, parameters.PolygonOffsetUnits);
+                }
+            }
+
+            { // Line width
+                if (parameters.LineWidth != g_syncedRenderStateParameters.LineWidth) {
+                    g_GLESFuncs.glLineWidth(parameters.LineWidth);
+                }
+            }
+
+            { // Point size
+                if (parameters.PointSize != g_syncedRenderStateParameters.PointSize) {
+                    g_GLESFuncs.glPointSize(parameters.PointSize);
+                }
+            }
+
+            { // Sample coverage
+                if (parameters.SampleCoverageValue != g_syncedRenderStateParameters.SampleCoverageValue ||
+                    parameters.SampleCoverageInvert != g_syncedRenderStateParameters.SampleCoverageInvert) {
+                    g_GLESFuncs.glSampleCoverage(parameters.SampleCoverageValue,
+                                                ToGLBoolean(parameters.SampleCoverageInvert));
+                }
+            }
+
+            { // Sample mask
+                if (g_GLESFuncs.glSampleMaski && parameters.SampleMaskValue != g_syncedRenderStateParameters.SampleMaskValue) {
+                    g_GLESFuncs.glSampleMaski(0, parameters.SampleMaskValue);
+                }
+            }
+
             g_syncedRenderStateVersion = currentRenderStateVersion;
             g_syncedRenderStateParameters = parameters;
+            g_hasSyncedRenderState = true;
         }
     } // namespace RenderStateImpl
 
@@ -510,6 +738,41 @@ namespace MobileGL::MG_Backend::DirectGLES {
             g_GLESFuncs.glBindFramebuffer(target == FramebufferTarget::Draw ? GL_DRAW_FRAMEBUFFER : GL_READ_FRAMEBUFFER,
                                           0);
         }
+    }
+
+    void SyncAndBindFramebufferObject(const SharedPtr<MG_State::GLState::FramebufferObject>& framebuffer,
+                                      FramebufferTarget target, Bool forceSync = false) {
+#ifdef TRACY_ENABLE
+        ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
+#endif
+        if (!framebuffer || framebuffer == MG_Impl::GLImpl::FramebufferImpl::pDefaultFramebufferInfo->defaultFBO) {
+            g_GLESFuncs.glBindFramebuffer(target == FramebufferTarget::Draw ? GL_DRAW_FRAMEBUFFER : GL_READ_FRAMEBUFFER,
+                                          0);
+            return;
+        }
+
+        auto& registry = FramebufferImpl::g_backendFramebufferObjects;
+        const auto& backendFBOIt = registry.find(framebuffer.get());
+        const Bool exists = backendFBOIt != registry.end();
+        auto& backendObj = exists ? backendFBOIt->second : registry.GetOrCreate(framebuffer);
+        if (!exists) {
+            backendObj = MakeShared<FramebufferImpl::BackendFramebufferObject>();
+        }
+        if (forceSync) {
+            backendObj->InvalidateSyncedState();
+        }
+
+        backendObj->SyncToBackend(framebuffer, target);
+        backendObj->Bind(target);
+    }
+
+    void ForceBindCurrentFBO(FramebufferTarget target) {
+#ifdef TRACY_ENABLE
+        ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
+#endif
+        auto& slot = MG_State::pGLContext->GetFramebufferBindingSlot(target);
+        SyncAndBindFramebufferObject(slot.GetBoundObject(), target);
+        FramebufferImpl::g_fboBindVersions[(SizeT)target] = slot.GetVersion();
     }
 
     void PrepareForDraw(DrawSyncBit syncBit) {
@@ -588,6 +851,7 @@ namespace MobileGL::MG_Backend::DirectGLES {
             if (backendProgramIt != PrgramImpl::g_backendProgramObjects.end()) {
                 backendProgramIt->second->Use();
                 auto backendProgramId = backendProgramIt->second->GetBackendProgramId();
+
                 // Global UBO
                 if (currentProgram->GetUBOSize() > 0) {
 #ifdef TRACY_ENABLE
@@ -600,11 +864,15 @@ namespace MobileGL::MG_Backend::DirectGLES {
 
                     Uint blockIndex = g_GLESFuncs.glGetUniformBlockIndex(backendProgramId,
                                                                          MG_Util::ShaderTranspiler::GLOBAL_UBO_NAME);
+                    if (blockIndex == GL_INVALID_INDEX) {
+                        MGLOG_W("Program %u has frontend global UBO storage, but backend has no %s block.",
+                                currentProgram->GetExternalIndex(), MG_Util::ShaderTranspiler::GLOBAL_UBO_NAME);
+                    } else {
+                        g_GLESFuncs.glUniformBlockBinding(backendProgramId, blockIndex, 0);
 
-                    g_GLESFuncs.glUniformBlockBinding(backendProgramId, blockIndex, 0);
-
-                    g_GLESFuncs.glBindBufferBase(GL_UNIFORM_BUFFER, 0,
-                                                 backendProgramIt->second->GetBackendGlobalUBOId());
+                        g_GLESFuncs.glBindBufferBase(GL_UNIFORM_BUFFER, 0,
+                                                     backendProgramIt->second->GetBackendGlobalUBOId());
+                    }
                 }
 
                 {
@@ -655,10 +923,11 @@ namespace MobileGL::MG_Backend::DirectGLES {
 #endif
                     // Sampler unit binding
                     auto maxUniformLoc = currentProgram->GetMaxUniformLocation();
-                    for (int loc = 0; loc < maxUniformLoc; ++loc) {
+                    for (Uint loc = 0; loc <= maxUniformLoc; ++loc) {
+                        auto& name = currentProgram->GetUniformName(loc);
+                        if (name.empty()) continue;
                         auto unit = currentProgram->GetUniformSamplerOrImageUnitIndex(loc);
                         if (unit == -1) continue;
-                        auto& name = currentProgram->GetUniformName(loc);
                         auto locAtBackend = g_GLESFuncs.glGetUniformLocation(
                             backendProgramIt->second->GetBackendProgramId(), name.c_str());
                         g_GLESFuncs.glUniform1i(locAtBackend, unit);
@@ -685,6 +954,66 @@ namespace MobileGL::MG_Backend::DirectGLES {
                 MGLOG_E("No backend program found (maybe not synced) for current program, cannot use program.");
             }
         }
+    }
+
+    void SetCurrentBaseInstance(Uint32 baseInstance) {
+        const auto& currentProgram = MG_State::pGLContext->GetCurrentProgram();
+        if (!currentProgram || !currentProgram->GetLinkStatus()) {
+            return;
+        }
+        const auto& backendProgramIt = PrgramImpl::g_backendProgramObjects.find(currentProgram.get());
+        if (backendProgramIt != PrgramImpl::g_backendProgramObjects.end()) {
+            backendProgramIt->second->SetBaseInstance(baseInstance);
+        }
+    }
+
+    void PrepareForCompute(Bool includeDispatchIndirectBuffer) {
+#ifdef TRACY_ENABLE
+        ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
+#endif
+        BufferImpl::SyncComputeBuffers(includeDispatchIndirectBuffer);
+        TextureImpl::SyncNeccessaryTextures();
+        TextureImpl::SyncImageTextureBindings();
+        PrgramImpl::SyncCurrentProgram();
+
+        const auto& currentProgram = MG_State::pGLContext->GetCurrentProgram();
+        if (!currentProgram || !currentProgram->GetLinkStatus()) {
+            g_GLESFuncs.glUseProgram(0);
+            return;
+        }
+
+        const auto& backendProgramIt = PrgramImpl::g_backendProgramObjects.find(currentProgram.get());
+        if (backendProgramIt != PrgramImpl::g_backendProgramObjects.end()) {
+            backendProgramIt->second->Use();
+        } else {
+            g_GLESFuncs.glUseProgram(0);
+            MGLOG_E("No backend program found (maybe not synced) for current compute program.");
+        }
+    }
+
+    GLuint GetBackendProgramId(GLuint program) {
+        if (!MG_State::pGLContext->ValidateProgramName(program)) {
+            MGLOG_E("Invalid frontend program object: %u", program);
+            return 0;
+        }
+
+        auto& programObject = MG_State::pGLContext->GetProgramObject(program);
+        if (!programObject) {
+            MGLOG_E("Program object %u is null.", program);
+            return 0;
+        }
+
+        const auto& backendProgramIt = PrgramImpl::g_backendProgramObjects.find(programObject.get());
+        Bool exist = (backendProgramIt != PrgramImpl::g_backendProgramObjects.end());
+        auto& backendObj =
+            exist ? backendProgramIt->second : PrgramImpl::g_backendProgramObjects.GetOrCreate(programObject);
+        if (!exist) {
+            backendObj = MakeShared<PrgramImpl::BackendProgramObjectImpl>();
+        }
+        if (!backendObj->GetBackendProgramId()) {
+            backendObj->SyncToBackend(programObject);
+        }
+        return backendObj->GetBackendProgramId();
     }
 
     void Clear(GLbitfield mask) {
@@ -715,6 +1044,13 @@ namespace MobileGL::MG_Backend::DirectGLES {
 #endif
         DrawSyncBit syncBit = DrawSyncBit::None;
         PrepareForDraw(syncBit);
+        const auto& currentVAO = MG_State::pGLContext->GetBoundVertexArray();
+        if (currentVAO) {
+            const auto& backendVAOIt = VertexArrayImpl::g_backendVertexArrayObjects.find(currentVAO.get());
+            if (backendVAOIt != VertexArrayImpl::g_backendVertexArrayObjects.end()) {
+                backendVAOIt->second->SyncClientSideAttributesForDrawArrays(currentVAO, first, count);
+            }
+        }
         g_GLESFuncs.glDrawArrays(mode, first, count);
     }
 
@@ -757,28 +1093,161 @@ namespace MobileGL::MG_Backend::DirectGLES {
 #if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG && MOBILEGL_ENABLE_SCOPE_MARKER
         DebugImpl::OpenGLScopeMarker marker(__func__);
 #endif
-        DrawSyncBit syncBit = DrawSyncBit::IndexBuffer | DrawSyncBit::IndirectBuffer;
+        if (drawcount <= 0) {
+            return;
+        }
+        if (stride == 0) {
+            stride = sizeof(DrawElementsIndirectCommand);
+        }
+        if (stride < static_cast<GLsizei>(sizeof(DrawElementsIndirectCommand))) {
+            MGLOG_E("MultiDrawElementsIndirect skipped: stride %d is smaller than command size %zu",
+                    stride, sizeof(DrawElementsIndirectCommand));
+            return;
+        }
+
+        DrawSyncBit syncBit = DrawSyncBit::IndexBuffer | DrawSyncBit::IndirectBuffer | DrawSyncBit::Instancing;
         PrepareForDraw(syncBit);
 
-        for (GLsizei i = 0; i < drawcount; ++i) {
-            const GLvoid* cmd = reinterpret_cast<const GLvoid*>(reinterpret_cast<const uint8_t*>(indirect) +
-                                                                i * (stride ? stride : sizeof(GLsizei) * 4));
-            g_GLESFuncs.glDrawElementsIndirect(mode, type, cmd);
+        const SizeT indexSize = MG_Util::GetGLTypeSize(type);
+        if (indexSize == 0) {
+            MGLOG_E("MultiDrawElementsIndirect skipped: unsupported index type 0x%x", type);
+            return;
         }
+
+        const auto* commandBytes = ResolveIndirectCommandBytes(
+            indirect,
+            static_cast<SizeT>(stride) * static_cast<SizeT>(drawcount - 1) + sizeof(DrawElementsIndirectCommand),
+            "MultiDrawElementsIndirect");
+        if (!commandBytes) {
+            return;
+        }
+
+        for (GLsizei i = 0; i < drawcount; ++i) {
+            DrawElementsIndirectCommand cmd{};
+            std::memcpy(&cmd, commandBytes + static_cast<SizeT>(i) * stride, sizeof(cmd));
+            if (cmd.count == 0 || cmd.instanceCount == 0) {
+                continue;
+            }
+            SetCurrentBaseInstance(cmd.baseInstance);
+            const auto indexByteOffset = static_cast<SizeT>(cmd.firstIndex) * indexSize;
+            g_GLESFuncs.glDrawElementsInstancedBaseVertex(
+                mode, static_cast<GLsizei>(cmd.count), type, reinterpret_cast<const GLvoid*>(indexByteOffset),
+                static_cast<GLsizei>(cmd.instanceCount), cmd.baseVertex);
+        }
+        SetCurrentBaseInstance(0);
+    }
+
+    void MultiDrawElementsIndirectCount(GLenum mode, GLenum type, const void* indirect, GLintptr drawcount,
+                                        GLsizei maxdrawcount, GLsizei stride) {
+#if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG && MOBILEGL_ENABLE_SCOPE_MARKER
+        DebugImpl::OpenGLScopeMarker marker(__func__);
+#endif
+        if (maxdrawcount <= 0) {
+            return;
+        }
+        if (stride == 0) {
+            stride = sizeof(DrawElementsIndirectCommand);
+        }
+        if (stride < static_cast<GLsizei>(sizeof(DrawElementsIndirectCommand))) {
+            MGLOG_E("MultiDrawElementsIndirectCount skipped: stride %d is smaller than command size %zu",
+                    stride, sizeof(DrawElementsIndirectCommand));
+            return;
+        }
+
+        DrawSyncBit syncBit = DrawSyncBit::IndexBuffer | DrawSyncBit::IndirectBuffer | DrawSyncBit::Instancing;
+        PrepareForDraw(syncBit);
+
+        const SizeT indexSize = MG_Util::GetGLTypeSize(type);
+        if (indexSize == 0) {
+            MGLOG_E("MultiDrawElementsIndirectCount skipped: unsupported index type 0x%x", type);
+            return;
+        }
+
+        auto drawBuffer = MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::DrawIndirect).GetBoundObject();
+        auto parameterBuffer = MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::Parameter).GetBoundObject();
+        if (!drawBuffer) {
+            MGLOG_E("MultiDrawElementsIndirectCount skipped: no GL_DRAW_INDIRECT_BUFFER is bound");
+            return;
+        }
+        if (!parameterBuffer) {
+            MGLOG_E("MultiDrawElementsIndirectCount skipped: no GL_PARAMETER_BUFFER is bound");
+            return;
+        }
+
+        drawBuffer->MarkPersistentMappedRangeDirty();
+        parameterBuffer->MarkPersistentMappedRangeDirty();
+        const auto drawData = drawBuffer->GetDataReadOnly();
+        const auto parameterData = parameterBuffer->GetDataReadOnly();
+
+        const SizeT commandOffset = reinterpret_cast<SizeT>(indirect);
+        const SizeT commandBytes = commandOffset + static_cast<SizeT>(stride) * static_cast<SizeT>(maxdrawcount - 1) +
+            sizeof(DrawElementsIndirectCommand);
+        if (!drawData || commandBytes > drawData->size()) {
+            MGLOG_E("MultiDrawElementsIndirectCount skipped: invalid GL_DRAW_INDIRECT_BUFFER binding or range");
+            return;
+        }
+        if (!parameterData || drawcount < 0 || static_cast<SizeT>(drawcount) + sizeof(Uint32) > parameterData->size()) {
+            MGLOG_E("MultiDrawElementsIndirectCount skipped: invalid GL_PARAMETER_BUFFER binding or range");
+            return;
+        }
+
+        Uint32 actualDrawCount = 0;
+        std::memcpy(&actualDrawCount, parameterData->data() + drawcount, sizeof(actualDrawCount));
+        actualDrawCount = std::min<Uint32>(actualDrawCount, static_cast<Uint32>(maxdrawcount));
+        for (Uint32 i = 0; i < actualDrawCount; ++i) {
+            DrawElementsIndirectCommand cmd{};
+            std::memcpy(&cmd, drawData->data() + commandOffset + static_cast<SizeT>(i) * stride, sizeof(cmd));
+            if (cmd.count == 0 || cmd.instanceCount == 0) {
+                continue;
+            }
+            SetCurrentBaseInstance(cmd.baseInstance);
+            const auto indexByteOffset = static_cast<SizeT>(cmd.firstIndex) * indexSize;
+            g_GLESFuncs.glDrawElementsInstancedBaseVertex(
+                mode, static_cast<GLsizei>(cmd.count), type, reinterpret_cast<const GLvoid*>(indexByteOffset),
+                static_cast<GLsizei>(cmd.instanceCount), cmd.baseVertex);
+        }
+        SetCurrentBaseInstance(0);
     }
 
     void MultiDrawArraysIndirect(GLenum mode, const void* indirect, GLsizei drawcount, GLsizei stride) {
 #if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG && MOBILEGL_ENABLE_SCOPE_MARKER
         DebugImpl::OpenGLScopeMarker marker(__func__);
 #endif
-        DrawSyncBit syncBit = DrawSyncBit::IndirectBuffer;
+        if (drawcount <= 0) {
+            return;
+        }
+        if (stride == 0) {
+            stride = sizeof(DrawArraysIndirectCommand);
+        }
+        if (stride < static_cast<GLsizei>(sizeof(DrawArraysIndirectCommand))) {
+            MGLOG_E("MultiDrawArraysIndirect skipped: stride %d is smaller than command size %zu",
+                    stride, sizeof(DrawArraysIndirectCommand));
+            return;
+        }
+
+        DrawSyncBit syncBit = DrawSyncBit::IndirectBuffer | DrawSyncBit::Instancing;
         PrepareForDraw(syncBit);
 
-        for (GLsizei i = 0; i < drawcount; ++i) {
-            const GLvoid* cmd = reinterpret_cast<const GLvoid*>(reinterpret_cast<const uint8_t*>(indirect) +
-                                                                i * (stride ? stride : sizeof(GLsizei) * 4));
-            g_GLESFuncs.glDrawArraysIndirect(mode, cmd);
+        const auto* commandBytes = ResolveIndirectCommandBytes(
+            indirect,
+            static_cast<SizeT>(stride) * static_cast<SizeT>(drawcount - 1) + sizeof(DrawArraysIndirectCommand),
+            "MultiDrawArraysIndirect");
+        if (!commandBytes) {
+            return;
         }
+
+        for (GLsizei i = 0; i < drawcount; ++i) {
+            DrawArraysIndirectCommand cmd{};
+            std::memcpy(&cmd, commandBytes + static_cast<SizeT>(i) * stride, sizeof(cmd));
+            if (cmd.count == 0 || cmd.instanceCount == 0) {
+                continue;
+            }
+            SetCurrentBaseInstance(cmd.baseInstance);
+            g_GLESFuncs.glDrawArraysInstanced(
+                mode, static_cast<GLint>(cmd.first), static_cast<GLsizei>(cmd.count),
+                static_cast<GLsizei>(cmd.instanceCount));
+        }
+        SetCurrentBaseInstance(0);
     }
 
     void DrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type,
@@ -796,8 +1265,11 @@ namespace MobileGL::MG_Backend::DirectGLES {
 
     void DrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                                      GLsizei instancecount, GLint basevertex, GLuint baseinstance) {
-        // Not supported in OpenGL ES
-        MGLOG_W("DrawElementsInstancedBaseVertexBaseInstance is not supported in OpenGL ES.");
+        DrawSyncBit syncBit = DrawSyncBit::IndexBuffer | DrawSyncBit::Instancing;
+        PrepareForDraw(syncBit);
+        SetCurrentBaseInstance(baseinstance);
+        g_GLESFuncs.glDrawElementsInstancedBaseVertex(mode, count, type, indices, instancecount, basevertex);
+        SetCurrentBaseInstance(0);
     }
 
     void DrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* indices,
@@ -809,8 +1281,11 @@ namespace MobileGL::MG_Backend::DirectGLES {
 
     void DrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                            GLsizei instancecount, GLuint baseinstance) {
-        // Not supported in OpenGL ES
-        MGLOG_W("DrawElementsInstancedBaseInstance is not supported in OpenGL ES.");
+        DrawSyncBit syncBit = DrawSyncBit::IndexBuffer | DrawSyncBit::Instancing;
+        PrepareForDraw(syncBit);
+        SetCurrentBaseInstance(baseinstance);
+        g_GLESFuncs.glDrawElementsInstanced(mode, count, type, indices, instancecount);
+        SetCurrentBaseInstance(0);
     }
 
     void DrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei instancecount) {
@@ -820,15 +1295,42 @@ namespace MobileGL::MG_Backend::DirectGLES {
     }
 
     void DrawElementsIndirect(GLenum mode, GLenum type, const void* indirect) {
-        DrawSyncBit syncBit = DrawSyncBit::IndexBuffer | DrawSyncBit::IndirectBuffer;
+        DrawSyncBit syncBit = DrawSyncBit::IndexBuffer | DrawSyncBit::IndirectBuffer | DrawSyncBit::Instancing;
         PrepareForDraw(syncBit);
-        g_GLESFuncs.glDrawElementsIndirect(mode, type, indirect);
+
+        const SizeT indexSize = MG_Util::GetGLTypeSize(type);
+        if (indexSize == 0) {
+            MGLOG_E("DrawElementsIndirect skipped: unsupported index type 0x%x", type);
+            return;
+        }
+
+        const auto* commandBytes =
+            ResolveIndirectCommandBytes(indirect, sizeof(DrawElementsIndirectCommand), "DrawElementsIndirect");
+        if (!commandBytes) {
+            return;
+        }
+
+        DrawElementsIndirectCommand cmd{};
+        std::memcpy(&cmd, commandBytes, sizeof(cmd));
+        if (cmd.count == 0 || cmd.instanceCount == 0) {
+            return;
+        }
+
+        SetCurrentBaseInstance(cmd.baseInstance);
+        const auto indexByteOffset = static_cast<SizeT>(cmd.firstIndex) * indexSize;
+        g_GLESFuncs.glDrawElementsInstancedBaseVertex(
+            mode, static_cast<GLsizei>(cmd.count), type, reinterpret_cast<const GLvoid*>(indexByteOffset),
+            static_cast<GLsizei>(cmd.instanceCount), cmd.baseVertex);
+        SetCurrentBaseInstance(0);
     }
 
     void DrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei instancecount,
                                          GLuint baseinstance) {
-        // Not supported in OpenGL ES
-        MGLOG_W("DrawArraysInstancedBaseInstance is not supported in OpenGL ES.");
+        DrawSyncBit syncBit = DrawSyncBit::Instancing;
+        PrepareForDraw(syncBit);
+        SetCurrentBaseInstance(baseinstance);
+        g_GLESFuncs.glDrawArraysInstanced(mode, first, count, instancecount);
+        SetCurrentBaseInstance(0);
     }
 
     void DrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
@@ -838,9 +1340,26 @@ namespace MobileGL::MG_Backend::DirectGLES {
     }
 
     void DrawArraysIndirect(GLenum mode, const void* indirect) {
-        DrawSyncBit syncBit = DrawSyncBit::IndirectBuffer;
+        DrawSyncBit syncBit = DrawSyncBit::IndirectBuffer | DrawSyncBit::Instancing;
         PrepareForDraw(syncBit);
-        g_GLESFuncs.glDrawArraysIndirect(mode, indirect);
+
+        const auto* commandBytes =
+            ResolveIndirectCommandBytes(indirect, sizeof(DrawArraysIndirectCommand), "DrawArraysIndirect");
+        if (!commandBytes) {
+            return;
+        }
+
+        DrawArraysIndirectCommand cmd{};
+        std::memcpy(&cmd, commandBytes, sizeof(cmd));
+        if (cmd.count == 0 || cmd.instanceCount == 0) {
+            return;
+        }
+
+        SetCurrentBaseInstance(cmd.baseInstance);
+        g_GLESFuncs.glDrawArraysInstanced(
+            mode, static_cast<GLint>(cmd.first), static_cast<GLsizei>(cmd.count),
+            static_cast<GLsizei>(cmd.instanceCount));
+        SetCurrentBaseInstance(0);
     }
 
     void BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1,
@@ -873,6 +1392,31 @@ namespace MobileGL::MG_Backend::DirectGLES {
         DebugImpl::ErrorLopper::Loop([file = __FILE__, line = __LINE__](auto err) {
             MGLOG_D("ES error (%s:%d): %s", file, line, MG_Util::ConvertGLEnumToString(err).c_str());
         });
+    }
+
+    void BlitNamedFramebuffer(const SharedPtr<MG_State::GLState::FramebufferObject>& readFramebuffer,
+                              const SharedPtr<MG_State::GLState::FramebufferObject>& drawFramebuffer,
+                              GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+                              GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
+                              GLbitfield mask, GLenum filter) {
+#if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG && MOBILEGL_ENABLE_SCOPE_MARKER
+        DebugImpl::OpenGLScopeMarker marker(__func__);
+#endif
+        TextureImpl::SyncNeccessaryTextures();
+        RenderStateImpl::SyncRenderState();
+
+        SyncAndBindFramebufferObject(readFramebuffer, FramebufferTarget::Read, true);
+        SyncAndBindFramebufferObject(drawFramebuffer, FramebufferTarget::Draw, true);
+
+        MGLOG_D("ES %s(%d, %d, %d, %d, %d, %d, %d, %d, 0x%x, %s)", __func__, srcX0, srcY0, srcX1, srcY1,
+                dstX0, dstY0, dstX1, dstY1, mask, MG_Util::ConvertGLEnumToString(filter).c_str());
+        g_GLESFuncs.glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
+        DebugImpl::ErrorLopper::Loop([file = __FILE__, line = __LINE__](auto err) {
+            MGLOG_D("ES error (%s:%d): %s", file, line, MG_Util::ConvertGLEnumToString(err).c_str());
+        });
+
+        ForceBindCurrentFBO(FramebufferTarget::Read);
+        ForceBindCurrentFBO(FramebufferTarget::Draw);
     }
 
     Bool UpdateTextureBindingAtTarget(GLenum target) {
@@ -1132,6 +1676,221 @@ namespace MobileGL::MG_Backend::DirectGLES {
         return g_GLESFuncs.glGetString(name);
     }
 
+    void DispatchCompute(GLuint numGroupsX, GLuint numGroupsY, GLuint numGroupsZ) {
+#if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG && MOBILEGL_ENABLE_SCOPE_MARKER
+        DebugImpl::OpenGLScopeMarker marker(__func__);
+#endif
+        PrepareForCompute(false);
+        g_GLESFuncs.glDispatchCompute(numGroupsX, numGroupsY, numGroupsZ);
+    }
+
+    void DispatchComputeIndirect(GLintptr indirect) {
+#if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG && MOBILEGL_ENABLE_SCOPE_MARKER
+        DebugImpl::OpenGLScopeMarker marker(__func__);
+#endif
+        PrepareForCompute(true);
+        g_GLESFuncs.glDispatchComputeIndirect(indirect);
+    }
+
+    void MemoryBarrier(GLbitfield barriers) {
+        g_GLESFuncs.glMemoryBarrier(barriers);
+    }
+
+    void MemoryBarrierByRegion(GLbitfield barriers) {
+        g_GLESFuncs.glMemoryBarrierByRegion(barriers);
+    }
+
+    void BindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer, GLenum access,
+                          GLenum format) {
+        (void)texture;
+        (void)level;
+        (void)layered;
+        (void)layer;
+        (void)access;
+        (void)format;
+        TextureImpl::SyncImageTextureBinding(unit);
+    }
+
+    void GetIntegeri_v(GLenum target, GLuint index, GLint* data) {
+        if (!data) return;
+
+        switch (target) {
+        case GL_SHADER_STORAGE_BUFFER_BINDING: {
+            auto& point = MG_State::pGLContext->GetBufferBindingPoint(BufferTarget::ShaderStorage, index);
+            auto& obj = point.GetBoundObject();
+            *data = obj ? static_cast<GLint>(obj->GetExternalIndex()) : 0;
+            return;
+        }
+        case GL_SHADER_STORAGE_BUFFER_START: {
+            auto& point = MG_State::pGLContext->GetBufferBindingPoint(BufferTarget::ShaderStorage, index);
+            *data = static_cast<GLint>(point.GetRange().start);
+            return;
+        }
+        case GL_SHADER_STORAGE_BUFFER_SIZE: {
+            auto& point = MG_State::pGLContext->GetBufferBindingPoint(BufferTarget::ShaderStorage, index);
+            auto& obj = point.GetBoundObject();
+            if (!obj) {
+                *data = 0;
+                return;
+            }
+            const auto& range = point.GetRange();
+            const auto start = std::min(range.start, obj->GetSize());
+            const auto end = std::min(range.end, obj->GetSize());
+            *data = static_cast<GLint>(end - start);
+            return;
+        }
+        case GL_IMAGE_BINDING_NAME: {
+            if (index >= MG_State::GLState::TextureState::MAX_TEXTURE_IMAGE_UNITS) {
+                *data = 0;
+                return;
+            }
+            auto& imageBinding = MG_State::pGLContext->GetImageTextureBinding(static_cast<Int>(index));
+            *data = imageBinding.Texture ? static_cast<GLint>(imageBinding.Texture->GetExternalIndex()) : 0;
+            return;
+        }
+        case GL_IMAGE_BINDING_LEVEL: {
+            if (index >= MG_State::GLState::TextureState::MAX_TEXTURE_IMAGE_UNITS) {
+                *data = 0;
+                return;
+            }
+            auto& imageBinding = MG_State::pGLContext->GetImageTextureBinding(static_cast<Int>(index));
+            *data = imageBinding.Level;
+            return;
+        }
+        case GL_IMAGE_BINDING_LAYERED: {
+            if (index >= MG_State::GLState::TextureState::MAX_TEXTURE_IMAGE_UNITS) {
+                *data = 0;
+                return;
+            }
+            auto& imageBinding = MG_State::pGLContext->GetImageTextureBinding(static_cast<Int>(index));
+            *data = imageBinding.Layered;
+            return;
+        }
+        case GL_IMAGE_BINDING_LAYER: {
+            if (index >= MG_State::GLState::TextureState::MAX_TEXTURE_IMAGE_UNITS) {
+                *data = 0;
+                return;
+            }
+            auto& imageBinding = MG_State::pGLContext->GetImageTextureBinding(static_cast<Int>(index));
+            *data = imageBinding.Layer;
+            return;
+        }
+        case GL_IMAGE_BINDING_ACCESS: {
+            if (index >= MG_State::GLState::TextureState::MAX_TEXTURE_IMAGE_UNITS) {
+                *data = 0;
+                return;
+            }
+            auto& imageBinding = MG_State::pGLContext->GetImageTextureBinding(static_cast<Int>(index));
+            *data = static_cast<GLint>(imageBinding.Access);
+            return;
+        }
+        case GL_IMAGE_BINDING_FORMAT: {
+            if (index >= MG_State::GLState::TextureState::MAX_TEXTURE_IMAGE_UNITS) {
+                *data = 0;
+                return;
+            }
+            auto& imageBinding = MG_State::pGLContext->GetImageTextureBinding(static_cast<Int>(index));
+            *data = static_cast<GLint>(imageBinding.Format);
+            return;
+        }
+        default:
+            if (g_GLESFuncs.glGetIntegeri_v) {
+                g_GLESFuncs.glGetIntegeri_v(target, index, data);
+            } else {
+                *data = 0;
+            }
+            return;
+        }
+    }
+
+    void GetInteger64i_v(GLenum target, GLuint index, GLint64* data) {
+        if (!data) return;
+
+        switch (target) {
+        case GL_SHADER_STORAGE_BUFFER_START: {
+            auto& point = MG_State::pGLContext->GetBufferBindingPoint(BufferTarget::ShaderStorage, index);
+            *data = static_cast<GLint64>(point.GetRange().start);
+            return;
+        }
+        case GL_SHADER_STORAGE_BUFFER_SIZE: {
+            auto& point = MG_State::pGLContext->GetBufferBindingPoint(BufferTarget::ShaderStorage, index);
+            auto& obj = point.GetBoundObject();
+            if (!obj) {
+                *data = 0;
+                return;
+            }
+            const auto& range = point.GetRange();
+            const auto start = std::min(range.start, obj->GetSize());
+            const auto end = std::min(range.end, obj->GetSize());
+            *data = static_cast<GLint64>(end - start);
+            return;
+        }
+        default:
+            if (g_GLESFuncs.glGetInteger64i_v) {
+                g_GLESFuncs.glGetInteger64i_v(target, index, data);
+            } else {
+                *data = 0;
+            }
+            return;
+        }
+    }
+
+    void GetProgramiv(GLuint program, GLenum pname, GLint* params) {
+        if (!params) return;
+        GLuint backendProgramId = GetBackendProgramId(program);
+        if (!backendProgramId) {
+            params[0] = 0;
+            return;
+        }
+        g_GLESFuncs.glGetProgramiv(backendProgramId, pname, params);
+    }
+
+    void GetProgramInterfaceiv(GLuint program, GLenum programInterface, GLenum pname, GLint* params) {
+        GLuint backendProgramId = GetBackendProgramId(program);
+        if (!backendProgramId) return;
+        g_GLESFuncs.glGetProgramInterfaceiv(backendProgramId, programInterface, pname, params);
+    }
+
+    GLuint GetProgramResourceIndex(GLuint program, GLenum programInterface, const GLchar* name) {
+        GLuint backendProgramId = GetBackendProgramId(program);
+        if (!backendProgramId) return GL_INVALID_INDEX;
+        return g_GLESFuncs.glGetProgramResourceIndex(backendProgramId, programInterface, name);
+    }
+
+    void GetProgramResourceName(GLuint program, GLenum programInterface, GLuint index, GLsizei bufSize, GLsizei* length,
+                                GLchar* name) {
+        GLuint backendProgramId = GetBackendProgramId(program);
+        if (!backendProgramId) return;
+        g_GLESFuncs.glGetProgramResourceName(backendProgramId, programInterface, index, bufSize, length, name);
+    }
+
+    void GetProgramResourceiv(GLuint program, GLenum programInterface, GLuint index, GLsizei propCount,
+                              const GLenum* props, GLsizei bufSize, GLsizei* length, GLint* params) {
+        GLuint backendProgramId = GetBackendProgramId(program);
+        if (!backendProgramId) return;
+        g_GLESFuncs.glGetProgramResourceiv(backendProgramId, programInterface, index, propCount, props, bufSize, length,
+                                           params);
+    }
+
+    GLint GetProgramResourceLocation(GLuint program, GLenum programInterface, const GLchar* name) {
+        GLuint backendProgramId = GetBackendProgramId(program);
+        if (!backendProgramId) return -1;
+        return g_GLESFuncs.glGetProgramResourceLocation(backendProgramId, programInterface, name);
+    }
+
+    GLint GetProgramResourceLocationIndex(GLuint program, GLenum programInterface, const GLchar* name) {
+        (void)program;
+        (void)programInterface;
+        (void)name;
+        return -1;
+    }
+
+    void ShaderStorageBlockBinding(GLuint program, GLuint storageBlockIndex, GLuint storageBlockBinding) {
+        GLuint backendProgramId = GetBackendProgramId(program);
+        if (!backendProgramId) return;
+        g_GLESFuncs.glShaderStorageBlockBinding(backendProgramId, storageBlockIndex, storageBlockBinding);
+    }
+
     void ClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {
         TextureImpl::SyncNeccessaryTextures();
         FramebufferImpl::SyncCurrentFBO();
@@ -1168,6 +1927,40 @@ namespace MobileGL::MG_Backend::DirectGLES {
         BindCurrentFBO(FramebufferTarget::Draw);
 
         g_GLESFuncs.glClearBufferuiv(buffer, drawbuffer, value);
+    }
+
+    void ClearNamedFramebufferfv(const SharedPtr<MG_State::GLState::FramebufferObject>& framebuffer,
+                                 GLenum buffer, GLint drawbuffer, const GLfloat* value) {
+#if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG && MOBILEGL_ENABLE_SCOPE_MARKER
+        DebugImpl::OpenGLScopeMarker marker(__func__);
+#endif
+        TextureImpl::SyncNeccessaryTextures();
+        RenderStateImpl::SyncRenderState();
+
+        SyncAndBindFramebufferObject(framebuffer, FramebufferTarget::Draw, true);
+        g_GLESFuncs.glClearBufferfv(buffer, drawbuffer, value);
+        DebugImpl::ErrorLopper::Loop([file = __FILE__, line = __LINE__](auto err) {
+            MGLOG_D("ES error (%s:%d): %s", file, line, MG_Util::ConvertGLEnumToString(err).c_str());
+        });
+
+        ForceBindCurrentFBO(FramebufferTarget::Draw);
+    }
+
+    void ClearNamedFramebufferfi(const SharedPtr<MG_State::GLState::FramebufferObject>& framebuffer,
+                                 GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {
+#if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG && MOBILEGL_ENABLE_SCOPE_MARKER
+        DebugImpl::OpenGLScopeMarker marker(__func__);
+#endif
+        TextureImpl::SyncNeccessaryTextures();
+        RenderStateImpl::SyncRenderState();
+
+        SyncAndBindFramebufferObject(framebuffer, FramebufferTarget::Draw, true);
+        g_GLESFuncs.glClearBufferfi(buffer, drawbuffer, depth, stencil);
+        DebugImpl::ErrorLopper::Loop([file = __FILE__, line = __LINE__](auto err) {
+            MGLOG_D("ES error (%s:%d): %s", file, line, MG_Util::ConvertGLEnumToString(err).c_str());
+        });
+
+        ForceBindCurrentFBO(FramebufferTarget::Draw);
     }
 
     class TempPixelStoreParameterSync {
@@ -1502,9 +2295,243 @@ namespace MobileGL::MG_Backend::DirectGLES {
     static EGLContext g_Context = EGL_NO_CONTEXT;
     static EGLSurface g_Surface = EGL_NO_SURFACE;
     static EGLConfig g_Config = nullptr;
-    Bool InitWindowSurface(NativeWindowType window) {
-        // TODO: handle custom EGL paramters
-        if (!window) return false;
+
+    static Bool QueryCurrentSurfaceSize(Int& outWidth, Int& outHeight) {
+        outWidth = 0;
+        outHeight = 0;
+        if (!g_EGLFuncs.eglQuerySurface || g_Display == EGL_NO_DISPLAY || g_Surface == EGL_NO_SURFACE) {
+            return false;
+        }
+
+        EGLint width = 0;
+        EGLint height = 0;
+        if (!g_EGLFuncs.eglQuerySurface(g_Display, g_Surface, EGL_WIDTH, &width) ||
+            !g_EGLFuncs.eglQuerySurface(g_Display, g_Surface, EGL_HEIGHT, &height) ||
+            width <= 0 || height <= 0) {
+            return false;
+        }
+
+        outWidth = static_cast<Int>(width);
+        outHeight = static_cast<Int>(height);
+        return true;
+    }
+
+    static Bool PresentStatsEnabled() {
+        const char* value = std::getenv("MOBILEGL_GLES_PRESENT_STATS");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }
+
+    static void DumpDefaultFramebufferStats() {
+        if (!PresentStatsEnabled() || !g_GLESFuncs.glReadPixels || !g_EGLFuncs.eglQuerySurface ||
+            g_Display == EGL_NO_DISPLAY || g_Surface == EGL_NO_SURFACE) {
+            return;
+        }
+
+        Int width = 0;
+        Int height = 0;
+        if (!QueryCurrentSurfaceSize(width, height)) {
+            return;
+        }
+
+        GLint viewport[4] = {0, 0, 0, 0};
+        g_GLESFuncs.glGetIntegerv(GL_VIEWPORT, viewport);
+        GLint previousReadFramebuffer = 0;
+        g_GLESFuncs.glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFramebuffer);
+        g_GLESFuncs.glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+
+        Vector<Uint8> pixels(static_cast<SizeT>(width) * static_cast<SizeT>(height) * 4);
+        g_GLESFuncs.glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+
+        SizeT nonBlack = 0;
+        SizeT nonZeroAlpha = 0;
+        for (SizeT offset = 0; offset + 3 < pixels.size(); offset += 4) {
+            if (pixels[offset] != 0 || pixels[offset + 1] != 0 || pixels[offset + 2] != 0) {
+                ++nonBlack;
+            }
+            if (pixels[offset + 3] != 0) {
+                ++nonZeroAlpha;
+            }
+        }
+
+        g_GLESFuncs.glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(previousReadFramebuffer));
+        std::fprintf(stderr,
+                     "MOBILEGL_GLES_PRESENT_STATS nonBlack=%zu/%zu alpha=%zu/%zu size=%dx%d viewport=%d,%d,%d,%d\n",
+                     nonBlack, pixels.size() / 4, nonZeroAlpha, pixels.size() / 4, width, height,
+                     viewport[0], viewport[1], viewport[2], viewport[3]);
+    }
+
+#if defined(__linux__) && !defined(__ANDROID__)
+    static void* OpenX11Lib() {
+        void* x11Lib = dlopen("libX11.so.6", RTLD_LOCAL | RTLD_NOW);
+        if (!x11Lib) {
+            x11Lib = dlopen("libX11.so", RTLD_LOCAL | RTLD_NOW);
+        }
+        return x11Lib;
+    }
+#endif
+
+    static EGLint QueryDefaultX11VisualId() {
+#if defined(__linux__) && !defined(__ANDROID__)
+        const char* displayName = std::getenv("DISPLAY");
+        if (!displayName) {
+            return 0;
+        }
+
+        void* x11Lib = OpenX11Lib();
+        if (!x11Lib) {
+            return 0;
+        }
+
+        using XOpenDisplayFn = void* (*)(const char*);
+        using XDefaultScreenFn = int (*)(void*);
+        using XDefaultVisualFn = void* (*)(void*, int);
+        using XVisualIDFromVisualFn = unsigned long (*)(void*);
+        using XCloseDisplayFn = int (*)(void*);
+
+        auto* xOpenDisplay = reinterpret_cast<XOpenDisplayFn>(dlsym(x11Lib, "XOpenDisplay"));
+        auto* xDefaultScreen = reinterpret_cast<XDefaultScreenFn>(dlsym(x11Lib, "XDefaultScreen"));
+        auto* xDefaultVisual = reinterpret_cast<XDefaultVisualFn>(dlsym(x11Lib, "XDefaultVisual"));
+        auto* xVisualIDFromVisual = reinterpret_cast<XVisualIDFromVisualFn>(dlsym(x11Lib, "XVisualIDFromVisual"));
+        auto* xCloseDisplay = reinterpret_cast<XCloseDisplayFn>(dlsym(x11Lib, "XCloseDisplay"));
+        if (!xOpenDisplay || !xDefaultScreen || !xDefaultVisual || !xVisualIDFromVisual || !xCloseDisplay) {
+            dlclose(x11Lib);
+            return 0;
+        }
+
+        void* display = xOpenDisplay(displayName);
+        if (!display) {
+            dlclose(x11Lib);
+            return 0;
+        }
+        const int screen = xDefaultScreen(display);
+        void* visual = xDefaultVisual(display, screen);
+        const auto visualId = visual ? static_cast<EGLint>(xVisualIDFromVisual(visual)) : 0;
+        xCloseDisplay(display);
+        dlclose(x11Lib);
+        return visualId;
+#else
+        return 0;
+#endif
+    }
+
+    static EGLint QueryX11WindowVisualId(NativeWindowType window) {
+#if defined(__linux__) && !defined(__ANDROID__) && __has_include(<X11/Xlib.h>)
+        if (!window) {
+            return 0;
+        }
+        const char* displayName = std::getenv("DISPLAY");
+        if (!displayName) {
+            return 0;
+        }
+
+        void* x11Lib = OpenX11Lib();
+        if (!x11Lib) {
+            return 0;
+        }
+
+        using XOpenDisplayFn = Display* (*)(const char*);
+        using XGetWindowAttributesFn = int (*)(Display*, Window, XWindowAttributes*);
+        using XVisualIDFromVisualFn = unsigned long (*)(Visual*);
+        using XCloseDisplayFn = int (*)(Display*);
+
+        auto* xOpenDisplay = reinterpret_cast<XOpenDisplayFn>(dlsym(x11Lib, "XOpenDisplay"));
+        auto* xGetWindowAttributes =
+            reinterpret_cast<XGetWindowAttributesFn>(dlsym(x11Lib, "XGetWindowAttributes"));
+        auto* xVisualIDFromVisual = reinterpret_cast<XVisualIDFromVisualFn>(dlsym(x11Lib, "XVisualIDFromVisual"));
+        auto* xCloseDisplay = reinterpret_cast<XCloseDisplayFn>(dlsym(x11Lib, "XCloseDisplay"));
+        if (!xOpenDisplay || !xGetWindowAttributes || !xVisualIDFromVisual || !xCloseDisplay) {
+            dlclose(x11Lib);
+            return 0;
+        }
+
+        Display* display = xOpenDisplay(displayName);
+        if (!display) {
+            dlclose(x11Lib);
+            return 0;
+        }
+
+        XWindowAttributes attrs{};
+        EGLint visualId = 0;
+        if (xGetWindowAttributes(display, static_cast<Window>(window), &attrs) && attrs.visual) {
+            visualId = static_cast<EGLint>(xVisualIDFromVisual(attrs.visual));
+        }
+        xCloseDisplay(display);
+        dlclose(x11Lib);
+        return visualId;
+#else
+        (void)window;
+        return 0;
+#endif
+    }
+
+    static Bool GetConfigAttrib(EGLConfig config, EGLint attr, EGLint& value) {
+        return g_EGLFuncs.eglGetConfigAttrib && g_EGLFuncs.eglGetConfigAttrib(g_Display, config, attr, &value);
+    }
+
+    static Bool ConfigSupports(EGLConfig config, EGLint surfaceBit) {
+        EGLint surfaceType = 0;
+        EGLint renderableType = 0;
+        if (!GetConfigAttrib(config, EGL_SURFACE_TYPE, surfaceType)) {
+            return false;
+        }
+        if (!GetConfigAttrib(config, EGL_RENDERABLE_TYPE, renderableType)) {
+            return false;
+        }
+        return (surfaceType & surfaceBit) && (renderableType & EGL_OPENGL_ES3_BIT);
+    }
+
+    static Bool ChooseConfigForSurface(EGLint surfaceBit, EGLConfig& outConfig,
+                                       NativeWindowType window = static_cast<NativeWindowType>(0)) {
+        const EGLint configAttribs[] = {EGL_SURFACE_TYPE, surfaceBit, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+                                        EGL_RED_SIZE,     8,          EGL_GREEN_SIZE,      8,
+                                        EGL_BLUE_SIZE,    8,          EGL_ALPHA_SIZE,      8,
+                                        EGL_DEPTH_SIZE,   24,         EGL_STENCIL_SIZE,    8,
+                                        EGL_NONE};
+
+        EGLint numConfigs = 0;
+        if (!g_EGLFuncs.eglChooseConfig(g_Display, configAttribs, nullptr, 0, &numConfigs) || numConfigs == 0) {
+            return false;
+        }
+
+        Vector<EGLConfig> configs(static_cast<SizeT>(numConfigs));
+        if (!g_EGLFuncs.eglChooseConfig(g_Display, configAttribs, configs.data(), numConfigs, &numConfigs) ||
+            numConfigs == 0) {
+            return false;
+        }
+        configs.resize(static_cast<SizeT>(numConfigs));
+
+        if (surfaceBit == EGL_WINDOW_BIT) {
+            const EGLint windowVisualId = QueryX11WindowVisualId(window);
+            const EGLint visualIds[] = {windowVisualId, QueryDefaultX11VisualId()};
+            for (const auto visualId : visualIds) {
+                if (visualId == 0) {
+                    continue;
+                }
+                for (const auto config : configs) {
+                    EGLint nativeVisualId = 0;
+                    if (ConfigSupports(config, surfaceBit) &&
+                        GetConfigAttrib(config, EGL_NATIVE_VISUAL_ID, nativeVisualId) &&
+                        nativeVisualId == visualId) {
+                        outConfig = config;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        for (const auto config : configs) {
+            if (ConfigSupports(config, surfaceBit)) {
+                outConfig = config;
+                return true;
+            }
+        }
+
+        outConfig = configs.front();
+        return true;
+    }
+
+    static Bool InitDisplayAndContext(EGLint surfaceBit, NativeWindowType window = static_cast<NativeWindowType>(0)) {
+        DestroyEGLContext();
 
         g_Display = g_EGLFuncs.eglGetDisplay(EGL_DEFAULT_DISPLAY);
         if (g_Display == EGL_NO_DISPLAY) return false;
@@ -1512,32 +2539,18 @@ namespace MobileGL::MG_Backend::DirectGLES {
         if (!g_EGLFuncs.eglInitialize(g_Display, nullptr, nullptr)) return false;
         g_EGLFuncs.eglBindAPI(EGL_OPENGL_ES_API);
 
-        const EGLint configAttribs[] = {EGL_SURFACE_TYPE,
-                                        EGL_WINDOW_BIT,
-                                        EGL_RENDERABLE_TYPE,
-                                        EGL_OPENGL_ES3_BIT,
-                                        EGL_RED_SIZE,
-                                        8,
-                                        EGL_GREEN_SIZE,
-                                        8,
-                                        EGL_BLUE_SIZE,
-                                        8,
-                                        EGL_ALPHA_SIZE,
-                                        8,
-                                        EGL_DEPTH_SIZE,
-                                        24,
-                                        EGL_STENCIL_SIZE,
-                                        8,
-                                        EGL_NONE};
-
-        EGLint numConfigs = 0;
-        if (!g_EGLFuncs.eglChooseConfig(g_Display, configAttribs, &g_Config, 1, &numConfigs) || numConfigs == 0)
-            return false;
+        if (!ChooseConfigForSurface(surfaceBit, g_Config, window)) return false;
 
         const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
 
         g_Context = g_EGLFuncs.eglCreateContext(g_Display, g_Config, EGL_NO_CONTEXT, contextAttribs);
-        if (g_Context == EGL_NO_CONTEXT) return false;
+        return g_Context != EGL_NO_CONTEXT;
+    }
+
+    Bool InitWindowSurface(NativeWindowType window) {
+        if (!window) return false;
+
+        if (!InitDisplayAndContext(EGL_WINDOW_BIT, window)) return false;
 
         g_Surface = g_EGLFuncs.eglCreateWindowSurface(g_Display, g_Config, window, nullptr);
         if (g_Surface == EGL_NO_SURFACE) return false;
@@ -1549,10 +2562,23 @@ namespace MobileGL::MG_Backend::DirectGLES {
         return true;
     }
 
+    Bool InitPbufferSurface(EGLint width, EGLint height) {
+        if (width <= 0 || height <= 0) return false;
+        if (!InitDisplayAndContext(EGL_PBUFFER_BIT)) return false;
+
+        const EGLint surfaceAttribs[] = {EGL_WIDTH, width, EGL_HEIGHT, height, EGL_NONE};
+        g_Surface = g_EGLFuncs.eglCreatePbufferSurface(g_Display, g_Config, surfaceAttribs);
+        if (g_Surface == EGL_NO_SURFACE) return false;
+
+        if (!g_EGLFuncs.eglMakeCurrent(g_Display, g_Surface, g_Surface, g_Context)) return false;
+
+        MGLOG_D("EGL pbuffer context created successfully: display=%p, surface=%p, context=%p. size=%dx%d", g_Display,
+                g_Surface, g_Context, width, height);
+        return true;
+    }
+
     void Present() {
-        if (g_Display != EGL_NO_DISPLAY && g_Surface != EGL_NO_SURFACE) {
             g_EGLFuncs.eglSwapBuffers(g_Display, g_Surface);
-        }
     }
 
     void DestroyEGLContext() {

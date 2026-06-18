@@ -8,36 +8,65 @@
 
 #include "GL_Sync.h"
 
-#include "MG_State/GLState/Core.h"
-
 namespace MobileGL::MG_Impl::GLImpl {
-    GLsync FenceSync_Backend(GLenum condition, GLbitfield flags) {
-        return 0;
+    namespace {
+        int g_stubSyncObject = 0;
     }
 
-    GLenum ClientWaitSync_Backend(GLsync sync, GLbitfield flags, GLuint64 timeout) {
-        return 0;
-    }
-
-    void DeleteSync_Backend(GLsync sync) {}
-
-    GLsync FenceSync_State(GLenum condition, GLbitfield flags) {
-        return 0;
-    }
-
-    GLenum ClientWaitSync_State(GLsync sync, GLbitfield flags, GLuint64 timeout) {
-        return 0;
-    }
-
-    void DeleteSync_State(GLsync sync) {}
+    // glSync semantics not really needed right now, stubbing them out
 
     GLsync FenceSync(GLenum condition, GLbitfield flags) {
-        return 0;
+        (void)condition;
+        (void)flags;
+        return reinterpret_cast<GLsync>(&g_stubSyncObject);
+    }
+
+    GLboolean IsSync(GLsync sync) {
+        return sync != nullptr ? GL_TRUE : GL_FALSE;
     }
 
     GLenum ClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
-        return 0;
+        (void)sync;
+        (void)flags;
+        (void)timeout;
+        return GL_ALREADY_SIGNALED;
     }
 
-    void DeleteSync(GLsync sync) {}
+    void WaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
+        (void)sync;
+        (void)flags;
+        (void)timeout;
+    }
+
+    void DeleteSync(GLsync sync) {
+        (void)sync;
+    }
+
+    void GetSynciv(GLsync sync, GLenum pname, GLsizei bufSize, GLsizei* length, GLint* values) {
+        (void)sync;
+        GLint value = 0;
+        switch (pname) {
+        case GL_OBJECT_TYPE:
+            value = GL_SYNC_FENCE;
+            break;
+        case GL_SYNC_STATUS:
+            value = GL_SIGNALED;
+            break;
+        case GL_SYNC_CONDITION:
+            value = GL_SYNC_GPU_COMMANDS_COMPLETE;
+            break;
+        case GL_SYNC_FLAGS:
+            value = 0;
+            break;
+        default:
+            break;
+        }
+
+        if (length) {
+            *length = bufSize > 0 && values ? 1 : 0;
+        }
+        if (bufSize > 0 && values) {
+            values[0] = value;
+        }
+    }
 } // namespace MobileGL::MG_Impl::GLImpl

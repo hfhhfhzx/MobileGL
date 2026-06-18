@@ -16,33 +16,42 @@
 namespace MobileGL::MG_State::GLState {
     void ShaderObject::SetShaderSource(const String& source) {
         m_source = source;
+        m_shader.reset();
+        m_compileStatus = false;
+        m_infoLog.clear();
     }
 
     void ShaderObject::SetShaderSource(String&& source) {
         m_source = Move(source);
+        m_shader.reset();
+        m_compileStatus = false;
+        m_infoLog.clear();
     }
 
     void ShaderObject::Compile() {
         using namespace MG_Util::ShaderTranspiler;
-        MG_Util::ShaderTranspiler::PreprocessShaderSource(m_stage, m_source);
+        String compileSource = m_source;
+        MG_Util::ShaderTranspiler::PreprocessShaderSource(m_stage, compileSource);
 
         // Compile for OpenGL here, so that we can do validation and link
         // like a real OpenGL driver at linking stage
         // Will compile for other backends later.
         ShaderAttrib attrib{.shaderType = MG_Util::ConvertShaderStageToGLEnum(m_stage),
-                            .sourceStr = m_source,
+                            .sourceStr = compileSource,
                             .flags = ShaderCompileBits::CompileForOpenGL};
 
         auto result = ShaderCompiler::CompileShader(attrib);
         if (result) {
             m_compileStatus = true;
             m_shader = result.value();
+            m_infoLog.clear();
         } else {
             m_compileStatus = false;
+            m_shader.reset();
             m_infoLog = result.error().log;
             MGLOG_D("ShaderObject::Compile: Shader %d compilation failed.\nSource:\n%s\nInfoLog:\n%s\nSetting "
                     "m_compileStatus = false as a result.",
-                    m_externalIndex, m_source.c_str(), m_infoLog.c_str());
+                    m_externalIndex, compileSource.c_str(), m_infoLog.c_str());
         }
     }
 

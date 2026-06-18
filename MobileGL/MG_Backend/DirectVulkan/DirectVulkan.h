@@ -17,6 +17,10 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     void ClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat* value);
     void ClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint* value);
     void ClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint* value);
+    void ClearNamedFramebufferfv(const SharedPtr<MG_State::GLState::FramebufferObject>& framebuffer, GLenum buffer,
+                                 GLint drawbuffer, const GLfloat* value);
+    void ClearNamedFramebufferfi(const SharedPtr<MG_State::GLState::FramebufferObject>& framebuffer, GLenum buffer,
+                                 GLint drawbuffer, GLfloat depth, GLint stencil);
     void Clear(GLbitfield mask);
     void DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices);
     void DrawArrays(GLenum mode, GLint first, GLsizei count);
@@ -27,6 +31,10 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                      GLsizei drawcount, const GLint* basevertex);
     void MultiDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect, GLsizei drawcount, GLsizei stride);
     void MultiDrawArraysIndirect(GLenum mode, const void* indirect, GLsizei drawcount, GLsizei stride);
+    void MultiDrawElementsIndirectCount(GLenum mode, GLenum type, const void* indirect, GLintptr drawcount,
+                                        GLsizei maxdrawcount, GLsizei stride);
+    void MultiDrawArraysIndirectCount(GLenum mode, const void* indirect, GLintptr drawcount,
+                                      GLsizei maxdrawcount, GLsizei stride);
     void DrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type,
                                      const void* indices, GLint basevertex);
     void DrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices);
@@ -44,12 +52,37 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     void DrawArraysIndirect(GLenum mode, const void* indirect);
     void BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1,
                          GLint dstY1, GLbitfield mask, GLenum filter);
+    void BlitNamedFramebuffer(const SharedPtr<MG_State::GLState::FramebufferObject>& readFramebuffer,
+                              const SharedPtr<MG_State::GLState::FramebufferObject>& drawFramebuffer,
+                              GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+                              GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
+                              GLbitfield mask, GLenum filter);
     void CopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width,
                         GLsizei height, GLint border);
     void CopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width,
                            GLsizei height);
     void GenerateMipmap(GLenum target);
+    void DispatchCompute(GLuint numGroupsX, GLuint numGroupsY, GLuint numGroupsZ);
+    void DispatchComputeIndirect(GLintptr indirect);
+    void MemoryBarrier(GLbitfield barriers);
+    void MemoryBarrierByRegion(GLbitfield barriers);
+    void BindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer, GLenum access,
+                          GLenum format);
+    void GetIntegeri_v(GLenum target, GLuint index, GLint* data);
+    void GetInteger64i_v(GLenum target, GLuint index, GLint64* data);
+    void GetProgramiv(GLuint program, GLenum pname, GLint* params);
+    void GetProgramInterfaceiv(GLuint program, GLenum programInterface, GLenum pname, GLint* params);
+    GLuint GetProgramResourceIndex(GLuint program, GLenum programInterface, const GLchar* name);
+    void GetProgramResourceName(GLuint program, GLenum programInterface, GLuint index, GLsizei bufSize,
+                                GLsizei* length, GLchar* name);
+    void GetProgramResourceiv(GLuint program, GLenum programInterface, GLuint index, GLsizei propCount,
+                              const GLenum* props, GLsizei bufSize, GLsizei* length, GLint* params);
+    GLint GetProgramResourceLocation(GLuint program, GLenum programInterface, const GLchar* name);
+    GLint GetProgramResourceLocationIndex(GLuint program, GLenum programInterface, const GLchar* name);
+    void ShaderStorageBlockBinding(GLuint program, GLuint storageBlockIndex, GLuint storageBlockBinding);
     void ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void* pixels);
     void GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels);
+    void GetTextureImage(const SharedPtr<MG_State::GLState::ITextureObject>& texture, TextureUploadTarget uploadTarget,
+                         GLint level, GLenum format, GLenum type, GLsizei bufSize, GLvoid* pixels);
     void Present();
 } // namespace MobileGL::MG_Backend::DirectVulkan

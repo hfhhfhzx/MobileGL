@@ -34,9 +34,23 @@ namespace MobileGL::MG_Impl::EGLImpl {
         MG_Backend::WindowBackend DetectWindowBackend() {
 #if defined(ANDROID) || defined(__ANDROID__)
             return MG_Backend::WindowBackend::Android;
+#elif defined(__linux__)
+            return MG_Backend::WindowBackend::X11;
 #else
             return MG_Backend::WindowBackend::Unknown;
 #endif
+        }
+
+        EGLint GetAttribValue(const EGLint* attribList, EGLint attrib, EGLint defaultValue) {
+            if (!attribList) {
+                return defaultValue;
+            }
+            for (SizeT i = 0; attribList[i] != EGL_NONE; i += 2) {
+                if (attribList[i] == attrib) {
+                    return attribList[i + 1];
+                }
+            }
+            return defaultValue;
         }
 
         template <typename NativeType>
@@ -230,13 +244,22 @@ namespace MobileGL::MG_Impl::EGLImpl {
         if (!state) {
             return EGL_FALSE;
         }
-        return state->TerminateDisplay(dpy) ? EGL_TRUE : EGL_FALSE;
+        if (!state->TerminateDisplay(dpy)) {
+            return EGL_FALSE;
+        }
+        if (auto* backendObject = MG_Backend::pActiveBackendObject.get()) {
+            backendObject->ReleaseEGLResources();
+        }
+        return EGL_TRUE;
     }
 
     EGLBoolean ReleaseThread() {
         auto* state = GetState();
         if (!state) {
             return EGL_FALSE;
+        }
+        if (auto* backendObject = MG_Backend::pActiveBackendObject.get()) {
+            (void)backendObject->MakeEGLCurrent(EGL_NO_DISPLAY, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         }
         state->ReleaseThread();
         return EGL_TRUE;
@@ -330,7 +353,24 @@ namespace MobileGL::MG_Impl::EGLImpl {
         if (!state) {
             return EGL_NO_SURFACE;
         }
-        return state->CreatePbufferSurface(dpy, config, attrib_list);
+        const EGLint width = GetAttribValue(attrib_list, EGL_WIDTH, 1);
+        const EGLint height = GetAttribValue(attrib_list, EGL_HEIGHT, 1);
+        EGLSurface surface = state->CreatePbufferSurface(dpy, config, attrib_list);
+        if (surface == EGL_NO_SURFACE) {
+            return EGL_NO_SURFACE;
+        }
+
+        auto* backendObject = GetBackendObject(state);
+        if (!backendObject) {
+            return EGL_NO_SURFACE;
+        }
+        if (!backendObject->CreateEGLPbufferSurface(width, height)) {
+            state->DestroySurface(dpy, surface);
+            state->SetError(EGL_BAD_ALLOC);
+            return EGL_NO_SURFACE;
+        }
+
+        return surface;
     }
 
     EGLBoolean BindTexImage(EGLDisplay dpy, EGLSurface surface, EGLint buffer) {

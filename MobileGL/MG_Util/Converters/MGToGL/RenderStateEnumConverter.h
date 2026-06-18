@@ -14,9 +14,13 @@ namespace MobileGL {
     namespace MG_Util {
         GLenum ConvertBlendFactorToGLEnum(BlendFactor value);
         GLenum ConvertBlendEquationToGLEnum(BlendEquation value);
+        GLenum ConvertLogicOperationToGLEnum(LogicOperation value);
         GLenum ConvertDepthTestFuncToGLEnum(DepthTestFunc value);
+        GLenum ConvertStencilOperationToGLEnum(StencilOperation value);
         GLenum ConvertPixelStoreParamToGLEnum(PixelStoreParam value);
         GLenum ConvertCullFaceModeToGLEnum(CullFaceMode value);
+        GLenum ConvertFrontFaceModeToGLEnum(FrontFaceMode value);
+        GLenum ConvertProvokingVertexModeToGLEnum(ProvokingVertexMode value);
         GLenum ConvertCapabilityInputToGLEnum(CapabilityInput value);
     } // namespace MG_Util
 } // namespace MobileGL

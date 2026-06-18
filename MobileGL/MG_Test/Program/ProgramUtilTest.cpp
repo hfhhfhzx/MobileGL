@@ -8,6 +8,8 @@
 
 #include <gtest/gtest.h>
 
+#include <string>
+
 #include "Includes.h"
 #include "Init.h"
 #include <MG_Util/Converters/GLToStr/GLEnumConverter.h>
@@ -27,6 +29,109 @@ protected:
 
 TEST_F(ProgramUtilTest, Sanity) {
     ASSERT_TRUE(true);
+}
+
+TEST_F(ProgramUtilTest, PreprocessLegacyVertexShaderModernizesGlmarkStyleSource) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    String source = R"(#define HIGHP_OR_DEFAULT highp
+attribute vec3 position;
+varying vec2 uv;
+uniform HIGHP_OR_DEFAULT mat4 modelViewProjection;
+
+void main() {
+    uv = position.xy;
+    gl_Position = modelViewProjection * vec4(position, 1.0);
+})";
+
+    PreprocessShaderSource(ShaderStage::Vertex, source);
+
+    EXPECT_EQ(source.find("#version 460 core\n"), 0);
+    EXPECT_NE(source.find("in vec3 position;"), String::npos);
+    EXPECT_NE(source.find("out vec2 uv;"), String::npos);
+    EXPECT_EQ(source.find("attribute"), String::npos);
+    EXPECT_EQ(source.find("varying"), String::npos);
+    EXPECT_EQ(source.find("HIGHP_OR_DEFAULT"), String::npos);
+    EXPECT_EQ(source.find("#define"), String::npos);
+}
+
+TEST_F(ProgramUtilTest, PreprocessLegacyFragmentShaderModernizesGlmarkStyleSource) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    String source = R"(#define MEDIUMP_OR_DEFAULT mediump
+varying vec2 uv;
+uniform sampler2D texture0;
+
+void main() {
+    MEDIUMP_OR_DEFAULT vec4 color = texture2D(texture0, uv);
+    gl_FragColor = color;
+})";
+
+    PreprocessShaderSource(ShaderStage::Fragment, source);
+
+    EXPECT_EQ(source.find("#version 460 core\n"), 0);
+    EXPECT_NE(source.find("out vec4 mg_FragColor;\n"), String::npos);
+    EXPECT_NE(source.find("in vec2 uv;"), String::npos);
+    EXPECT_NE(source.find("texture(texture0, uv)"), String::npos);
+    EXPECT_NE(source.find("mg_FragColor = color;"), String::npos);
+    EXPECT_EQ(source.find("gl_FragColor"), String::npos);
+    EXPECT_EQ(source.find("texture2D"), String::npos);
+    EXPECT_EQ(source.find("MEDIUMP_OR_DEFAULT"), String::npos);
+    EXPECT_EQ(source.find("mediump"), String::npos);
+    EXPECT_EQ(source.find("#define"), String::npos);
+}
+
+TEST_F(ProgramUtilTest, PreprocessFragmentShaderInjectsDepthRangeShim) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    String source = R"(#version 460 core
+out float depth;
+
+void main() {
+    depth = gl_DepthRange.diff * 0.5 + gl_DepthRange.near;
+})";
+
+    PreprocessShaderSource(ShaderStage::Fragment, source);
+
+    EXPECT_NE(source.find("struct mg_DepthRangeParameters"), String::npos);
+    EXPECT_NE(source.find("#define gl_DepthRange mg_DepthRange"), String::npos);
+
+    ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+    auto res = ShaderCompiler::CompileShader(attrib);
+    if (!res) {
+        FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+    }
+}
+
+TEST_F(ProgramUtilTest, PreprocessFragmentShaderRenamesMin3Max3Helpers) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    String source = R"(#version 460 core
+out vec4 fragColor;
+
+float min3(float a, float b, float c) { return min(min(a, b), c); }
+float max3(float a, float b, float c) { return max(max(a, b), c); }
+
+void main() {
+    float dark = min3(0.1, 0.2, 0.3);
+    float bright = max3(max3(0.1, 0.2, 0.3), 0.4, 0.5);
+    fragColor = vec4(dark, bright, 0.0, 1.0);
+})";
+
+    PreprocessShaderSource(ShaderStage::Fragment, source);
+
+    EXPECT_NE(source.find("float mg_min3("), String::npos);
+    EXPECT_NE(source.find("float mg_max3("), String::npos);
+    EXPECT_NE(source.find("mg_min3(0.1, 0.2, 0.3)"), String::npos);
+    EXPECT_NE(source.find("mg_max3(mg_max3(0.1, 0.2, 0.3), 0.4, 0.5)"), String::npos);
+    EXPECT_EQ(source.find("float min3("), String::npos);
+    EXPECT_EQ(source.find("float max3("), String::npos);
+
+    ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+    auto res = ShaderCompiler::CompileShader(attrib);
+    if (!res) {
+        FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+    }
 }
 
 const char* vs = R"(#version 150
