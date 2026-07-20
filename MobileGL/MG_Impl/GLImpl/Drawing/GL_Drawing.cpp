@@ -9,6 +9,7 @@
 #include "GL_Drawing.h"
 #include <Config.h>
 #include <MG_State/GLState/Core.h>
+#include <MG_State/EGLState/Core.h>
 #include <MG_Backend/BackendObjects.h>
 
 namespace MobileGL::MG_Impl::GLImpl {
@@ -65,6 +66,15 @@ namespace MobileGL::MG_Impl::GLImpl {
             return false;
         }
 
+        const auto& vao = MG_State::pGLContext->GetBoundVertexArray();
+        if (vao && vao->GetExternalIndex() == 0 && !MG_State::IsRelaxedSemanticsActive()) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidOperation,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", functionName,
+                                             "Default vertex array object cannot be used for drawing in core profile."));
+            return false;
+        }
+
         return true;
     }
 
@@ -104,6 +114,13 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         MG_Backend::gBackendFunctionsTable.GL.DrawArrays(mode, first, count);
+    }
+
+    void MultiDrawArrays_Backend(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount) {
+#ifdef TRACY_ENABLE
+        ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
+#endif
+        MG_Backend::gBackendFunctionsTable.GL.MultiDrawArrays(mode, first, count, drawcount);
     }
 
     void DrawElementsBaseVertex_Backend(GLenum mode, GLsizei count, GLenum type, const void* indices,
@@ -392,6 +409,18 @@ namespace MobileGL::MG_Impl::GLImpl {
         if (!ValidateCurrentProgramForExecution(__func__)) return;
         if (!ValidatePrimitiveModeForBackend(__func__, mode)) return;
         DrawArrays_Backend(mode, first, count);
+    }
+
+    void MultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount) {
+        if (!ValidateCurrentProgramForExecution(__func__)) return;
+        if (!ValidatePrimitiveModeForBackend(__func__, mode)) return;
+        if (drawcount < 0) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__, "drawcount must be non-negative."));
+            return;
+        }
+        MultiDrawArrays_Backend(mode, first, count, drawcount);
     }
 
     void MultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const void* const* indices,

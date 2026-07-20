@@ -24,11 +24,88 @@ namespace MobileGL {
     };
 
     namespace MG_Backend {
+        enum class FormatCapability : Uint64 {
+            Creatable = 1ull << 0,
+
+            Sampled = 1ull << 1,
+            LinearFilter = 1ull << 2,
+            GenerateMipmap = 1ull << 3,
+            TextureGather = 1ull << 4,
+            TextureShadow = 1ull << 5,
+
+            FramebufferRenderable = 1ull << 6,
+            FramebufferLayered = 1ull << 7,
+            MultisampleTexture = 1ull << 8,
+            MultisampleRenderbuffer = 1ull << 9,
+
+            ColorAttachment = 1ull << 10,
+            DepthAttachment = 1ull << 11,
+            StencilAttachment = 1ull << 12,
+
+            TextureBuffer = 1ull << 13
+        };
+
+        using FormatCapabilityFlags = Flags<FormatCapability>;
+
+        inline constexpr Array<FormatCapability, 14> kReportedFormatCapabilities = {
+            FormatCapability::Creatable,
+            FormatCapability::Sampled,
+            FormatCapability::LinearFilter,
+            FormatCapability::GenerateMipmap,
+            FormatCapability::TextureGather,
+            FormatCapability::TextureShadow,
+            FormatCapability::FramebufferRenderable,
+            FormatCapability::FramebufferLayered,
+            FormatCapability::MultisampleTexture,
+            FormatCapability::MultisampleRenderbuffer,
+            FormatCapability::ColorAttachment,
+            FormatCapability::DepthAttachment,
+            FormatCapability::StencilAttachment,
+            FormatCapability::TextureBuffer,
+        };
+
+        inline constexpr SizeT kFormatCapabilityTextureTargetCount =
+            static_cast<SizeT>(TextureTarget::TextureTargetCount);
+        inline constexpr SizeT kFormatCapabilityRenderbufferTargetIndex = kFormatCapabilityTextureTargetCount;
+        inline constexpr SizeT kFormatCapabilityTargetCount = kFormatCapabilityTextureTargetCount + 1;
+        inline constexpr SizeT kFormatCapabilityFormatCount =
+            static_cast<SizeT>(TextureInternalFormat::TextureInternalFormatCount);
+
+        using FormatCapabilityTable =
+            Array<Array<FormatCapabilityFlags, kFormatCapabilityFormatCount>, kFormatCapabilityTargetCount>;
+        using FormatSampleCountTable =
+            Array<Array<Vector<Int>, kFormatCapabilityFormatCount>, kFormatCapabilityTargetCount>;
+
+        struct FormatCapabilityCache {
+            FormatCapabilityTable FullCaps{};
+            FormatCapabilityTable CaveatCaps{};
+            FormatSampleCountTable SampleCounts{};
+
+            void Clear();
+        };
+
+        Bool HasFormatCapability(FormatCapabilityFlags caps, FormatCapability capability);
+        SizeT GetFormatCapabilityTargetIndex(TextureTarget target);
+        SizeT GetRenderbufferFormatCapabilityTargetIndex();
+        const char* GetFormatCapabilityName(FormatCapability capability);
+        String GetFormatCapabilityTargetName(SizeT targetIndex);
+        void PrintFormatCapabilities(const FormatCapabilityCache& cache);
+
+        // Opaque backend fence-sync handle, created by GLFunctionsTable::FenceSync
+        // and released by GLFunctionsTable::DeleteSync.
+        using BackendSyncHandle = void*;
+
+        // Opaque backend timer-query handle, created by
+        // GLFunctionsTable::BeginTimeElapsedQuery / QueryCounterTimestamp and
+        // released by GLFunctionsTable::DeleteBackendQuery.
+        using BackendQueryHandle = void*;
+
         struct GLFunctionsTable {
             void (*DrawArrays)(GLenum mode, GLint first, GLsizei count);
             void (*DrawElements)(GLenum mode, GLsizei count, GLenum type, const void* indices);
             void (*DrawElementsBaseVertex)(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                            GLint basevertex);
+            void (*MultiDrawArrays)(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount);
             void (*MultiDrawElements)(GLenum mode, const GLsizei* count, GLenum type, const GLvoid* const* indices,
                                       GLsizei drawcount);
             void (*MultiDrawElementsBaseVertex)(GLenum mode, const GLsizei* count, GLenum type,
@@ -79,6 +156,11 @@ namespace MobileGL {
                                    GLsizei height, GLint border);
             void (*CopyTexSubImage2D)(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y,
                                       GLsizei width, GLsizei height);
+            void (*CopyImageSubData)(const SharedPtr<MG_State::GLState::ITextureObject>& srcTexture,
+                                     GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ,
+                                     const SharedPtr<MG_State::GLState::ITextureObject>& dstTexture,
+                                     GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ,
+                                     GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth);
             void (*GenerateMipmap)(GLenum target);
             void (*ReadPixels)(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type,
                                void* pixels);
@@ -104,14 +186,55 @@ namespace MobileGL {
             GLint (*GetProgramResourceLocation)(GLuint program, GLenum programInterface, const GLchar* name);
             GLint (*GetProgramResourceLocationIndex)(GLuint program, GLenum programInterface, const GLchar* name);
             void (*ShaderStorageBlockBinding)(GLuint program, GLuint storageBlockIndex, GLuint storageBlockBinding);
+            // GL fence sync objects. All entries are optional (may be null); the
+            // frontend then falls back to always-signaled sync semantics.
+            // FenceSync may itself return null when the backend cannot create a
+            // fence right now (e.g. the calling thread does not own the backend
+            // context); the frontend treats such a sync as always signaled.
+            BackendSyncHandle (*FenceSync)();
+            GLenum (*ClientWaitSync)(BackendSyncHandle sync, GLbitfield flags, GLuint64 timeout);
+            void (*WaitSync)(BackendSyncHandle sync, GLbitfield flags, GLuint64 timeout);
+            void (*DeleteSync)(BackendSyncHandle sync);
+            Bool (*GetSyncStatus)(BackendSyncHandle sync); // true = signaled
+            // GL timer-query objects (GL_ARB_timer_query). All entries are
+            // optional (may be null); the frontend then falls back to zero
+            // results and reports GL_QUERY_COUNTER_BITS == 0.
+            // BeginTimeElapsedQuery / QueryCounterTimestamp may themselves
+            // return null when the backend cannot create a query right now;
+            // the frontend treats such a query as immediately available with
+            // a zero result.
+            // Dynamic support check: true only when the live backend can
+            // actually time at the moment of the call (extension / entry
+            // points / timestamp valid bits are known then, not at table
+            // init). Gates the advertised GL_QUERY_COUNTER_BITS.
+            Bool (*IsTimerQuerySupported)();
+            BackendQueryHandle (*BeginTimeElapsedQuery)();            // starts a TIME_ELAPSED span
+            void (*EndTimeElapsedQuery)(BackendQueryHandle query);    // ends the span
+            BackendQueryHandle (*QueryCounterTimestamp)();            // glQueryCounter(GL_TIMESTAMP) one-shot
+            Bool (*IsQueryResultAvailable)(BackendQueryHandle query); // non-blocking
+            // Returns true when a final value was produced (*outNanoseconds
+            // written; the frontend may cache it and release the handle).
+            // Returns false when the result could not be obtained YET - e.g.
+            // a Vulkan wait that refuses to block on a not-yet-submitted
+            // frame serial - in which case the frontend must keep the handle
+            // and leave the query readable later.
+            Bool (*GetQueryResult64)(BackendQueryHandle query, Bool wait, Uint64* outNanoseconds);
+            void (*DeleteBackendQuery)(BackendQueryHandle query);
+            Int64 (*GetGpuTimestampNs)(); // glGetInteger64v(GL_TIMESTAMP); 0 if unsupported
         };
         struct GlobalBackendFunctionsTable {
             GLFunctionsTable GL;
             void (*Present)();
+            // Optional: applies the app-requested eglSwapInterval to the native
+            // presentation path (null = backend keeps its own pacing policy).
+            void (*SetSwapInterval)(Int interval);
         };
 
         struct DynamicBackendParameters {
             SizeT UniformBufferOffsetAlignment = 256;
+            // GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT. 1.0 means the backend cannot filter anisotropically,
+            // which is also why the extension is not advertised in that case.
+            Float MaxTextureMaxAnisotropy = 1.0f;
             Float AliasedLineWidthRangeMin = 1.0f;
             Float AliasedLineWidthRangeMax = 1.0f;
             Float SmoothLineWidthRangeMin = 1.0f;
@@ -170,7 +293,8 @@ namespace MobileGL {
         enum class WindowBackend {
             Android,
             X11,
-            // TODO: X11, Wayland, Windows, macOS, etc.
+            MetalLayer,
+            // TODO: Wayland, Windows, etc.
             WindowBackendCount,
             Unknown = -1
         };
@@ -178,6 +302,8 @@ namespace MobileGL {
         struct WindowHandle {
             WindowBackend Backend = WindowBackend::Unknown;
             void* Handle = nullptr;
+            Uint32 Width = 0;
+            Uint32 Height = 0;
         };
 
         class BackendObject {
@@ -189,10 +315,15 @@ namespace MobileGL {
             virtual Bool InitWindowSurface() = 0;
 
             virtual Bool InitializeEGLDisplay(EGLDisplay dpy, EGLint* major, EGLint* minor);
-            virtual Bool CreateEGLWindowSurface(const WindowHandle& handle);
-            virtual Bool CreateEGLPbufferSurface(EGLint width, EGLint height);
+            virtual Bool CreateEGLWindowSurface(EGLSurface surface, const WindowHandle& handle);
+            virtual Bool ResizeEGLWindowSurface(EGLSurface surface, Uint32 width, Uint32 height);
+            virtual Bool CreateEGLPbufferSurface(EGLSurface surface, EGLint width, EGLint height);
             virtual Bool MakeEGLCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx);
             virtual Bool SwapEGLBuffers(EGLDisplay dpy, EGLSurface draw);
+            // Forwards the app-requested eglSwapInterval to the backend's native
+            // presentation path (no-op for backends without a SetSwapInterval hook).
+            virtual void SetEGLSwapInterval(Int interval);
+            virtual void ReleaseEGLSurface(EGLSurface surface);
             virtual void ReleaseEGLResources();
 
             void SetWindowHandle(const WindowHandle& handle);
@@ -201,6 +332,7 @@ namespace MobileGL {
             virtual String GetBackendAPIVersionString() const = 0;
             virtual const GlobalBackendFunctionsTable& GetBackendFunctions() const = 0;
             virtual const DynamicBackendParameters& GetDynamicParameters() const = 0;
+            const FormatCapabilityCache& GetFormatCapabilities() const;
             virtual BackendType GetBackendType() const = 0;
 
         protected:
@@ -210,17 +342,46 @@ namespace MobileGL {
                 Pbuffer
             };
 
+            struct EGLCurrentState {
+                EGLDisplay Display = EGL_NO_DISPLAY;
+                EGLSurface DrawSurface = EGL_NO_SURFACE;
+                EGLSurface ReadSurface = EGL_NO_SURFACE;
+                EGLContext Context = EGL_NO_CONTEXT;
+            };
+
+            struct EGLSurfaceState {
+                SurfaceKind Kind = SurfaceKind::None;
+                Bool DestroyPending = false;
+                WindowHandle Window;
+                EGLint Width = 1;
+                EGLint Height = 1;
+            };
+
             void ResetEGLRuntimeState();
+            Bool RegisterEGLWindowSurface(EGLSurface surface, const WindowHandle& handle);
+            Bool RegisterEGLPbufferSurface(EGLSurface surface, EGLint width, EGLint height);
+            const EGLSurfaceState* GetRegisteredEGLSurface(EGLSurface surface) const;
+            Bool ActivateEGLSurface(EGLSurface surface);
             virtual Bool InitPbufferSurface(EGLint width, EGLint height);
+            virtual void OnEGLSurfaceReleased(EGLSurface surface);
+            FormatCapabilityCache& MutableFormatCapabilities();
 
             mutable std::recursive_mutex m_eglStateMutex;
+            FormatCapabilityCache m_formatCapabilities;
             WindowHandle m_windowHandle;
             EGLDisplay m_eglDisplay = EGL_NO_DISPLAY;
+            EGLSurface m_eglSurface = EGL_NO_SURFACE;
             Bool m_eglDisplayInitialized = false;
             Bool m_eglSurfaceInitialized = false;
             Bool m_backendCapabilitiesInitialized = false;
             SurfaceKind m_eglSurfaceKind = SurfaceKind::None;
-            UnorderedMap<std::thread::id, Bool> m_eglCurrentThreads;
+            UnorderedMap<std::thread::id, EGLCurrentState> m_eglCurrentThreads;
+            UnorderedMap<EGLSurface, EGLSurfaceState> m_eglSurfaces;
+
+        private:
+            Bool IsEGLSurfaceCurrent(EGLSurface surface) const;
+            void DestroyPendingEGLSurfaceIfUnused(EGLSurface surface);
+            void ReleaseEGLCurrentThread(const std::thread::id& threadKey);
         };
     } // namespace MG_Backend
 } // namespace MobileGL

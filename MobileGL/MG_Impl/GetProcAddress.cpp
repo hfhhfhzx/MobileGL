@@ -7,6 +7,15 @@
 // End of Source File Header
 
 #include "GetProcAddress.h"
+#if defined(__APPLE__) && !defined(MOBILEGL_IOS)
+#ifndef GL_SILENCE_DEPRECATION
+#define GL_SILENCE_DEPRECATION
+#endif
+#include <OpenGL/OpenGL.h>
+#endif
+
+extern "C" EGLDisplay eglGetPlatformDisplayEXT(EGLenum platform, void* native_display, const EGLint* attrib_list);
+
 #define GETPROC(name, var)                                                                                             \
     if (strcmp(#name, var) == 0) {                                                                                     \
         return (void*)name;                                                                                            \
@@ -56,9 +65,36 @@ namespace MobileGL::MG_Impl {
         GETPROC(eglCreateImage, name);
         GETPROC(eglDestroyImage, name);
         GETPROC(eglGetPlatformDisplay, name);
+        GETPROC(eglGetPlatformDisplayEXT, name);
         GETPROC(eglCreatePlatformWindowSurface, name);
         GETPROC(eglCreatePlatformPixmapSurface, name);
         GETPROC(eglWaitSync, name);
+
+#if defined(__APPLE__) && !defined(MOBILEGL_IOS)
+        GETPROC(CGLChoosePixelFormat, name);
+        GETPROC(CGLDestroyPixelFormat, name);
+        GETPROC(CGLDescribePixelFormat, name);
+        GETPROC(CGLReleasePixelFormat, name);
+        GETPROC(CGLRetainPixelFormat, name);
+        GETPROC(CGLGetPixelFormatRetainCount, name);
+        GETPROC(CGLCreateContext, name);
+        GETPROC(CGLDestroyContext, name);
+        GETPROC(CGLRetainContext, name);
+        GETPROC(CGLReleaseContext, name);
+        GETPROC(CGLGetContextRetainCount, name);
+        GETPROC(CGLGetPixelFormat, name);
+        GETPROC(CGLSetCurrentContext, name);
+        GETPROC(CGLGetCurrentContext, name);
+        GETPROC(CGLSetParameter, name);
+        GETPROC(CGLGetParameter, name);
+        GETPROC(CGLUpdateContext, name);
+        GETPROC(CGLClearDrawable, name);
+        GETPROC(CGLFlushDrawable, name);
+        GETPROC(CGLLockContext, name);
+        GETPROC(CGLUnlockContext, name);
+        GETPROC(CGLGetVersion, name);
+        GETPROC(CGLErrorString, name);
+#endif
 
         GETPROC(glCullFace, name);
         GETPROC(glFrontFace, name);

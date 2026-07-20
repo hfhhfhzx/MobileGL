@@ -8,6 +8,7 @@
 
 #include "GL_Program.h"
 #include "Config.h"
+#include <MG_Impl/GLImpl/VertexArray/Validators.h>
 #include <MG_State/GLState/Core.h>
 #include <MG_Util/Converters/GLToStr/GLEnumConverter.h>
 #include <MG_Util/Converters/GLToMG/ProgramEnumConverter.h>
@@ -72,6 +73,128 @@ namespace MobileGL::MG_Impl::GLImpl {
         return programObject;
     }
 
+    static const SharedPtr<MG_State::GLState::ProgramObject>& TryToGetLinkedProgramForInterfaceQuery(GLuint program,
+                                                                                                     const char* caller) {
+        static const SharedPtr<MG_State::GLState::ProgramObject> nullProgramObject = nullptr;
+        if (!MG_State::pGLContext->ValidateProgramName(program)) {
+            const ErrorCode error = MG_State::pGLContext->ValidateShaderName(program)
+                ? ErrorCode::InvalidOperation
+                : ErrorCode::InvalidValue;
+            MG_State::pGLContext->RecordError(
+                error,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", caller,
+                                             std::to_string(program) + " is not a linked program object."));
+            return nullProgramObject;
+        }
+
+        auto& programObject = MG_State::pGLContext->GetProgramObject(program);
+        if (!programObject || !programObject->GetLinkStatus()) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidOperation,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", caller,
+                                             std::to_string(program) + " is not a linked program object."));
+            return nullProgramObject;
+        }
+        return programObject;
+    }
+
+    static bool IsProgramInterfaceEnum(GLenum programInterface) {
+        switch (programInterface) {
+        case GL_UNIFORM:
+        case GL_UNIFORM_BLOCK:
+        case GL_PROGRAM_INPUT:
+        case GL_PROGRAM_OUTPUT:
+        case GL_BUFFER_VARIABLE:
+        case GL_SHADER_STORAGE_BLOCK:
+        case GL_ATOMIC_COUNTER_BUFFER:
+        case GL_TRANSFORM_FEEDBACK_VARYING:
+        case GL_VERTEX_SUBROUTINE:
+        case GL_TESS_CONTROL_SUBROUTINE:
+        case GL_TESS_EVALUATION_SUBROUTINE:
+        case GL_GEOMETRY_SUBROUTINE:
+        case GL_FRAGMENT_SUBROUTINE:
+        case GL_COMPUTE_SUBROUTINE:
+        case GL_VERTEX_SUBROUTINE_UNIFORM:
+        case GL_TESS_CONTROL_SUBROUTINE_UNIFORM:
+        case GL_TESS_EVALUATION_SUBROUTINE_UNIFORM:
+        case GL_GEOMETRY_SUBROUTINE_UNIFORM:
+        case GL_FRAGMENT_SUBROUTINE_UNIFORM:
+        case GL_COMPUTE_SUBROUTINE_UNIFORM:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    static bool IsSubroutineUniformInterface(GLenum programInterface) {
+        switch (programInterface) {
+        case GL_VERTEX_SUBROUTINE_UNIFORM:
+        case GL_TESS_CONTROL_SUBROUTINE_UNIFORM:
+        case GL_TESS_EVALUATION_SUBROUTINE_UNIFORM:
+        case GL_GEOMETRY_SUBROUTINE_UNIFORM:
+        case GL_FRAGMENT_SUBROUTINE_UNIFORM:
+        case GL_COMPUTE_SUBROUTINE_UNIFORM:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    static bool ValidateProgramInterfaceivQuery(GLenum programInterface, GLenum pname) {
+        bool valid = IsProgramInterfaceEnum(programInterface);
+        switch (pname) {
+        case GL_ACTIVE_RESOURCES:
+            break;
+        case GL_MAX_NAME_LENGTH:
+            valid = valid && programInterface != GL_ATOMIC_COUNTER_BUFFER;
+            break;
+        case GL_MAX_NUM_ACTIVE_VARIABLES:
+            valid = programInterface == GL_UNIFORM_BLOCK || programInterface == GL_ATOMIC_COUNTER_BUFFER ||
+                    programInterface == GL_SHADER_STORAGE_BLOCK;
+            break;
+        case GL_MAX_NUM_COMPATIBLE_SUBROUTINES:
+            valid = IsSubroutineUniformInterface(programInterface);
+            break;
+        default:
+            valid = false;
+            break;
+        }
+        if (!valid) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidOperation,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                             "Unsupported program interface query."));
+        }
+        return valid;
+    }
+
+    static bool ValidateNamedProgramResourceInterface(GLenum programInterface, const char* caller) {
+        if (!IsProgramInterfaceEnum(programInterface) || programInterface == GL_ATOMIC_COUNTER_BUFFER) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidEnum,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", caller,
+                                             "Unsupported named program resource interface."));
+            return false;
+        }
+        return true;
+    }
+
+    static Int GetKnownProgramResourceCount(const SharedPtr<MG_State::GLState::ProgramObject>& programObject,
+                                            GLenum programInterface) {
+        switch (programInterface) {
+        case GL_UNIFORM:
+            return programObject->GetUniformCount();
+        case GL_UNIFORM_BLOCK:
+            return programObject->GetActiveUniformBlocksCount();
+        case GL_PROGRAM_INPUT:
+            return programObject->GetActiveAttributesCount();
+        case GL_PROGRAM_OUTPUT:
+            return programObject->GetActiveFragmentOutputCount();
+        default:
+            return -1;
+        }
+    }
+
     void CopyStr(GLsizei bufSize, GLsizei* length, GLchar* dst, const char* src, GLsizei srcLength) {
         if (bufSize <= 0) {
             if (length) *length = 0;
@@ -94,6 +217,44 @@ namespace MobileGL::MG_Impl::GLImpl {
         return false;
     }
 
+    GLint GetOpaqueUniformUnitLimit(const glslang::TType* type) {
+        const auto& dynamicParameters = MG_Backend::pActiveBackendObject->GetDynamicParameters();
+        if (type && type->isImage()) return dynamicParameters.MaxImageUnits;
+        if (type && type->isTexture()) return dynamicParameters.MaxCombinedTextureImageUnits;
+        return 0;
+    }
+
+    bool ValidateOpaqueUniformUnit(const char* functionName, const glslang::TType* type, GLint unit) {
+        const GLint limit = GetOpaqueUniformUnitLimit(type);
+        if (unit < 0 || unit >= limit) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", functionName,
+                                             "Opaque uniform unit is out of range."));
+            return false;
+        }
+        return true;
+    }
+
+    bool ValidateShaderStorageBlockBinding(GLuint binding) {
+        SizeT maxBindingCount = MG_State::pGLContext->GetBufferBindingPointCount(BufferTarget::ShaderStorage);
+        if (MG_Backend::pActiveBackendObject) {
+            const Int backendCount =
+                MG_Backend::pActiveBackendObject->GetDynamicParameters().MaxShaderStorageBufferBindings;
+            maxBindingCount = std::min(maxBindingCount, static_cast<SizeT>(std::max(backendCount, 0)));
+        }
+
+        if (binding < maxBindingCount) {
+            return true;
+        }
+
+        MG_State::pGLContext->RecordError(
+            ErrorCode::InvalidValue,
+            MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                         "Shader storage block binding is out of range."));
+        return false;
+    }
+
     void AttachShader_State(GLuint program, GLuint shader) {
         auto& programObject = TryToGetProgramObject(program);
         if (!programObject) return;
@@ -110,7 +271,7 @@ namespace MobileGL::MG_Impl::GLImpl {
     }
 
     void BindAttribLocation_State(GLuint program, GLuint index, const GLchar* name) {
-        if (index >= MG_State::GLState::VertexArrayObject::MAX_VERTEX_ATTRIBS) {
+        if (index >= VertexArrayImpl::GetMaxVertexAttribs()) {
             MG_State::pGLContext->RecordError(
                 ErrorCode::InvalidValue,
                 MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
@@ -178,6 +339,9 @@ namespace MobileGL::MG_Impl::GLImpl {
                 MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__, "Shader is not attached to program."));
             return;
         }
+        // A shader flagged with glDeleteShader lives on while attached; this detach may
+        // have been its last GL-visible attachment.
+        MG_State::pGLContext->ReleaseShaderNameIfOrphaned(shader);
     }
 
     void GetActiveAttrib_State(GLuint program, GLuint index, GLsizei bufSize, GLsizei* length, GLint* size,
@@ -260,6 +424,101 @@ namespace MobileGL::MG_Impl::GLImpl {
 
             const Int uniformIndex = programObject->GetActiveUniformIndex(uniformName);
             uniformIndices[i] = uniformIndex >= 0 ? static_cast<GLuint>(uniformIndex) : GL_INVALID_INDEX;
+        }
+    }
+
+    void GetActiveUniformsiv_State(GLuint program, GLsizei uniformCount, const GLuint* uniformIndices, GLenum pname,
+                                   GLint* params) {
+        if (uniformCount < 0) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                             "uniformCount " + std::to_string(uniformCount) + " is less than 0."));
+            return;
+        }
+
+        // Program-name resolution with the correct two-error split: a live shader name is
+        // GL_INVALID_OPERATION, a never-generated name is GL_INVALID_VALUE. glGetActiveUniformsiv has
+        // no "not linked" error, so unlike TryToGetLinkedProgramForInterfaceQuery there is no
+        // link-status check here; an unlinked program simply has zero active uniforms (handled below).
+        if (!MG_State::pGLContext->ValidateProgramName(program)) {
+            const ErrorCode error = MG_State::pGLContext->ValidateShaderName(program) ? ErrorCode::InvalidOperation
+                                                                                      : ErrorCode::InvalidValue;
+            MG_State::pGLContext->RecordError(
+                error, MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                                    std::to_string(program) + " is not a program object."));
+            return;
+        }
+        auto& programObject = MG_State::pGLContext->GetProgramObject(program);
+        if (!programObject) return;
+
+        switch (pname) {
+        case GL_UNIFORM_TYPE:
+        case GL_UNIFORM_SIZE:
+        case GL_UNIFORM_NAME_LENGTH:
+        case GL_UNIFORM_BLOCK_INDEX:
+        case GL_UNIFORM_OFFSET:
+        case GL_UNIFORM_ARRAY_STRIDE:
+        case GL_UNIFORM_MATRIX_STRIDE:
+        case GL_UNIFORM_IS_ROW_MAJOR:
+            break;
+        default:
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidEnum,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                             "pname " + std::to_string(pname) + " is not an accepted value."));
+            return;
+        }
+
+        if (uniformCount == 0) return;
+        if (uniformIndices == nullptr || params == nullptr) return;
+
+        // Every index must be < the number of active uniforms, checked before any write so params is
+        // left untouched on error. GetUniformCount() is 0 for an unlinked program, which is also the
+        // spec-mandated GL_INVALID_VALUE path for querying an unlinked program (no separate error).
+        const Uint activeUniforms = programObject->GetUniformCount();
+        for (GLsizei i = 0; i < uniformCount; ++i) {
+            if (uniformIndices[i] >= activeUniforms) {
+                MG_State::pGLContext->RecordError(
+                    ErrorCode::InvalidValue,
+                    MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                                 "uniformIndices[" + std::to_string(i) +
+                                                     "] = " + std::to_string(uniformIndices[i]) +
+                                                     " is greater than or equal to the number of active uniforms."));
+                return;
+            }
+        }
+
+        for (GLsizei i = 0; i < uniformCount; ++i) {
+            const Uint idx = uniformIndices[i];
+            switch (pname) {
+            case GL_UNIFORM_TYPE:
+                params[i] = static_cast<GLint>(programObject->GetActiveUniformType(idx));
+                break;
+            case GL_UNIFORM_SIZE:
+                params[i] = programObject->GetActiveUniformArraySize(idx);
+                break;
+            case GL_UNIFORM_NAME_LENGTH:
+                params[i] = static_cast<GLint>(programObject->GetActiveUniformName(idx).length() + 1);
+                break;
+            case GL_UNIFORM_BLOCK_INDEX:
+                params[i] = programObject->GetActiveUniformBlockIndex(idx);
+                break;
+            case GL_UNIFORM_OFFSET:
+                params[i] = programObject->GetActiveUniformOffset(idx);
+                break;
+            case GL_UNIFORM_ARRAY_STRIDE:
+                params[i] = programObject->GetActiveUniformArrayStride(idx);
+                break;
+            case GL_UNIFORM_MATRIX_STRIDE:
+                params[i] = programObject->GetActiveUniformMatrixStride(idx);
+                break;
+            case GL_UNIFORM_IS_ROW_MAJOR:
+                params[i] = programObject->GetActiveUniformIsRowMajor(idx);
+                break;
+            default:
+                break;
+            }
         }
     }
 
@@ -347,12 +606,12 @@ namespace MobileGL::MG_Impl::GLImpl {
             MGLOG_D("%s: %s = %d", __func__, MG_Util::ConvertGLEnumToString(pname).c_str(), *params);
             break;
         case GL_COMPUTE_WORK_GROUP_SIZE: { // GL >= 4.3
-            if (!programObject->GetLinkStatus()) {
+            if (!programObject->GetLinkStatus() || programObject->GetShaderIndexByStage(ShaderStage::Compute) < 0) {
                 MG_State::pGLContext->RecordError(
                     ErrorCode::InvalidOperation,
                     MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
                                                  std::to_string(program) +
-                                                     " is not a program object that has been linked."));
+                                                     " is not a linked program object with a compute shader."));
                 return;
             }
             params[0] = static_cast<GLint>(programObject->GetComputeLocalSize(0));
@@ -479,6 +738,12 @@ namespace MobileGL::MG_Impl::GLImpl {
             auto size = programObject->GetUniformSizesInBytes(location);
             char* pUBO = (char*)programObject->MapUBO();
             auto* ttype = programObject->GetUniformTType(location);
+            if (pUBO == nullptr || offset == MG_State::GLState::ProgramObject::kInvalidUniformOffset ||
+                offset + size > programObject->GetUBOSize()) {
+                MGLOG_E("%s: uniform at program %u location %d has no backing storage; returning nothing", __func__,
+                        program, location);
+                return;
+            }
 
             if (!ttype->isMatrix() || ttype->getMatrixCols() != 3)
                 Memcpy(params, pUBO + offset, size);
@@ -528,6 +793,12 @@ namespace MobileGL::MG_Impl::GLImpl {
         auto size = programObject->GetUniformSizesInBytes(location);
         char* pUBO = static_cast<char*>(programObject->MapUBO());
         auto* ttype = programObject->GetUniformTType(location);
+        if (pUBO == nullptr || offset == MG_State::GLState::ProgramObject::kInvalidUniformOffset ||
+            offset + size > programObject->GetUBOSize()) {
+            MGLOG_E("%s: uniform at program %u location %d has no backing storage; returning nothing", __func__,
+                    program, location);
+            return;
+        }
 
         if constexpr (std::is_same_v<T, GLfloat>) {
             if (ttype->isMatrix() && ttype->getMatrixCols() == 3) {
@@ -589,6 +860,10 @@ namespace MobileGL::MG_Impl::GLImpl {
             const auto& rendererInfo = activeBackendObject->GetRendererInfo();
             allowVSOnlyPrograms = (Int)rendererInfo.StaticBackendCapability.AllowVSOnlyPrograms;
         }
+        const auto& activeBackendObject = MG_Backend::pActiveBackendObject;
+        if (activeBackendObject) {
+            programObject->SetMaxFragmentOutputColorNumber(activeBackendObject->GetDynamicParameters().MaxDrawBuffers);
+        }
         programObject->Link(!allowVSOnlyPrograms);
     }
 
@@ -624,6 +899,13 @@ namespace MobileGL::MG_Impl::GLImpl {
 
         auto& programObject = TryToGetProgramObject(program);
         if (!programObject) return;
+        if (!programObject->GetLinkStatus()) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidOperation,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                             "program " + std::to_string(program) + " is not linked."));
+            return;
+        }
         MG_State::pGLContext->UseProgram(program);
     }
 
@@ -633,22 +915,47 @@ namespace MobileGL::MG_Impl::GLImpl {
         if (!programObject.IsUniformOpaqueAtLocation(location)) {
             MGLOG_D("%s: program = %d, location = %d, maxLocation = %d", __func__, programObject.GetExternalIndex(),
                     location, programObject.GetMaxUniformLocation());
-            auto size = programObject.GetUniformSizesInBytes(location);
-            auto offset = programObject.GetUniformOffset(location);
-            MOBILEGL_ASSERT(size >= ItemCount * sizeof(T),
-                            "Uniform size mismatch, expected at least %zu bytes, got %zu bytes.", ItemCount * sizeof(T),
-                            size);
+            const SizeT size = programObject.GetUniformSizesInBytes(location);
+            const Uint offset = programObject.GetUniformOffset(location);
+            char* pUBO = static_cast<char*>(programObject.MapUBO());
+            const SizeT uboSize = programObject.GetUBOSize();
+            SizeT writeSize = ItemCount * sizeof(T);
+            if (size < writeSize) {
+                // Metadata bug: degrade to a clamped copy instead of killing the process.
+                MGLOG_E("%s: uniform size mismatch at program %u location %u: expected at least %zu bytes, got %zu "
+                        "bytes; clamping",
+                        __func__, programObject.GetExternalIndex(), location, ItemCount * sizeof(T), size);
+                writeSize = size;
+            }
+            if (pUBO == nullptr || offset == MG_State::GLState::ProgramObject::kInvalidUniformOffset ||
+                offset + byteOffsetInsideUniform + writeSize > uboSize) {
+                // Should not happen: linking gives every settable uniform backing
+                // storage. Log and drop the write instead of faulting.
+                MGLOG_E("%s: uniform at program %u location %u has no backing storage (ubo=%p offset=%u size=%zu "
+                        "uboSize=%zu); dropping write",
+                        __func__, programObject.GetExternalIndex(), location, static_cast<void*>(pUBO), offset,
+                        writeSize, uboSize);
+                return;
+            }
             MGLOG_D("%s: program = %d, location = %d, byteOffset = %d", __func__, programObject.GetExternalIndex(),
                     location, offset + byteOffsetInsideUniform);
-            Memcpy((char*)programObject.MapUBO() + offset + byteOffsetInsideUniform, value, ItemCount * sizeof(T));
+            Memcpy(pUBO + offset + byteOffsetInsideUniform, value, writeSize);
+            programObject.MarkUBOContentDirty();
         } else {
             auto* ttype = programObject.GetUniformTType(location);
-            if (ttype->isTexture() || ttype->isImage()) {
-                MGLOG_D("%s: program = %d, opaque uniform location = %d, name = '%s', unit = %d", __func__,
-                        programObject.GetExternalIndex(), location, programObject.GetUniformName(location).c_str(),
-                        static_cast<Int>(*value));
-                programObject.SetUniformSamplerOrImageUnitIndex(location, *value);
+            if (!ttype->isTexture() && !ttype->isImage()) return;
+            if constexpr (!std::is_same_v<std::remove_cv_t<T>, GLint> || ItemCount != 1) {
+                MG_State::pGLContext->RecordError(
+                    ErrorCode::InvalidOperation,
+                    MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                                 "Opaque uniforms can only be set with Uniform1i/Uniform1iv."));
+                return;
             }
+            if (!ValidateOpaqueUniformUnit(__func__, ttype, *value)) return;
+            MGLOG_D("%s: program = %d, opaque uniform location = %d, name = '%s', unit = %d", __func__,
+                    programObject.GetExternalIndex(), location, programObject.GetUniformName(location).c_str(),
+                    static_cast<Int>(*value));
+            programObject.SetUniformSamplerOrImageUnitIndex(location, *value);
         }
     }
 
@@ -665,6 +972,11 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
 
         for (GLint offset = 0; offset < count; offset++) {
+            if (offset > 0 && !programObject->UniformLocationsAliasSameUniform(location, location + offset)) {
+                // GL 3.3 §2.11.4: values for elements beyond the end of the uniform
+                // array are ignored. Never step onto a neighboring uniform's location.
+                break;
+            }
             if (!programObject->IsValidUniformLocation(location + offset)) {
                 RecordInvalidUniformLocationError(__func__, location + offset, "the current program object");
                 return;
@@ -689,6 +1001,10 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
 
         for (GLint offset = 0; offset < count; offset++) {
+            if (offset > 0 && !programObject->UniformLocationsAliasSameUniform(location, location + offset)) {
+                // Values for elements beyond the end of the uniform array are ignored.
+                break;
+            }
             if (!programObject->IsValidUniformLocation(location + offset)) {
                 RecordInvalidUniformLocationError(__func__, location + offset,
                                                   "program " + std::to_string(program));
@@ -817,6 +1133,10 @@ namespace MobileGL::MG_Impl::GLImpl {
 
         // For matrix uniforms, we handle each matrix individually
         for (GLint i = 0; i < count; i++) {
+            if (i > 0 && !programObject->UniformLocationsAliasSameUniform(location, location + i)) {
+                // Values for elements beyond the end of the uniform array are ignored.
+                break;
+            }
             if (!programObject->IsValidUniformLocation(location + i)) {
                 RecordInvalidUniformLocationError(__func__, location + i, "the current program object");
                 return;
@@ -849,6 +1169,10 @@ namespace MobileGL::MG_Impl::GLImpl {
         // For matrix uniforms, we handle each matrix individually
         // Handle padding in mat3 correctly!!
         for (GLint i = 0; i < count; i++) {
+            if (i > 0 && !programObject->UniformLocationsAliasSameUniform(location, location + i)) {
+                // Values for elements beyond the end of the uniform array are ignored.
+                break;
+            }
             if (!programObject->IsValidUniformLocation(location + i)) {
                 RecordInvalidUniformLocationError(__func__, location + i, "the current program object");
                 return;
@@ -884,6 +1208,10 @@ namespace MobileGL::MG_Impl::GLImpl {
 
         // For matrix uniforms, we handle each matrix individually
         for (GLint i = 0; i < count; i++) {
+            if (i > 0 && !programObject->UniformLocationsAliasSameUniform(location, location + i)) {
+                // Values for elements beyond the end of the uniform array are ignored.
+                break;
+            }
             if (!programObject->IsValidUniformLocation(location + i)) {
                 RecordInvalidUniformLocationError(__func__, location + i, "the current program object");
                 return;
@@ -898,6 +1226,34 @@ namespace MobileGL::MG_Impl::GLImpl {
                 Uniform_State<16>(*programObject, location + i, value + i * 16);
             }
         }
+    }
+
+    void UniformMatrixNonSquarefv_State(const char* caller, GLint location, GLsizei count) {
+        if (location == -1) return;
+
+        auto& programObject = MG_State::pGLContext->GetCurrentProgram();
+        if (programObject == nullptr) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidOperation,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", caller, "There is no current program object."));
+            return;
+        }
+
+        for (GLint i = 0; i < count; i++) {
+            if (!programObject->IsValidUniformLocation(location + i)) {
+                RecordInvalidUniformLocationError(caller, location + i, "the current program object");
+                return;
+            }
+            if (programObject->IsUniformOpaqueAtLocation(location + i)) {
+                MG_State::pGLContext->RecordError(
+                    ErrorCode::InvalidOperation,
+                    MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", caller,
+                                                 "Opaque uniforms cannot be set with matrix Uniform calls."));
+                return;
+            }
+        }
+
+        // TODO: Implement non-square matrix uniform uploads for non-opaque uniforms.
     }
 
     void ProgramUniformMatrix2fv_State(GLuint program, GLint location, GLsizei count, GLboolean transpose,
@@ -916,6 +1272,10 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
 
         for (GLint i = 0; i < count; i++) {
+            if (i > 0 && !programObject->UniformLocationsAliasSameUniform(location, location + i)) {
+                // Values for elements beyond the end of the uniform array are ignored.
+                break;
+            }
             if (!programObject->IsValidUniformLocation(location + i)) {
                 RecordInvalidUniformLocationError(__func__, location + i, "program " + std::to_string(program));
                 return;
@@ -946,6 +1306,10 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
 
         for (GLint i = 0; i < count; i++) {
+            if (i > 0 && !programObject->UniformLocationsAliasSameUniform(location, location + i)) {
+                // Values for elements beyond the end of the uniform array are ignored.
+                break;
+            }
             if (!programObject->IsValidUniformLocation(location + i)) {
                 RecordInvalidUniformLocationError(__func__, location + i, "program " + std::to_string(program));
                 return;
@@ -980,6 +1344,10 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
 
         for (GLint i = 0; i < count; i++) {
+            if (i > 0 && !programObject->UniformLocationsAliasSameUniform(location, location + i)) {
+                // Values for elements beyond the end of the uniform array are ignored.
+                break;
+            }
             if (!programObject->IsValidUniformLocation(location + i)) {
                 RecordInvalidUniformLocationError(__func__, location + i, "program " + std::to_string(program));
                 return;
@@ -992,6 +1360,37 @@ namespace MobileGL::MG_Impl::GLImpl {
                 Uniform_State<16>(*programObject, location + i, value + i * 16);
             }
         }
+    }
+
+    void ProgramUniformMatrixNonSquarefv_State(const char* caller, GLuint program, GLint location, GLsizei count) {
+        if (location == -1) return;
+
+        auto& programObject = TryToGetProgramObject(program);
+        if (!programObject) return;
+
+        if (!programObject->GetLinkStatus()) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidOperation,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", caller,
+                                             "program " + std::to_string(program) + " is not linked."));
+            return;
+        }
+
+        for (GLint i = 0; i < count; i++) {
+            if (!programObject->IsValidUniformLocation(location + i)) {
+                RecordInvalidUniformLocationError(caller, location + i, "program " + std::to_string(program));
+                return;
+            }
+            if (programObject->IsUniformOpaqueAtLocation(location + i)) {
+                MG_State::pGLContext->RecordError(
+                    ErrorCode::InvalidOperation,
+                    MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", caller,
+                                                 "Opaque uniforms cannot be set with matrix Uniform calls."));
+                return;
+            }
+        }
+
+        // TODO: Implement non-square matrix uniform uploads for non-opaque uniforms.
     }
 
     GLuint GetUniformBlockIndex_State(GLuint program, const GLchar* uniformBlockName) {
@@ -1007,6 +1406,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
 
         const auto& index = programObject->GetUniformBlockIndex(uniformBlockName);
+        MGLOG_D("GBI prog=%u name='%s' -> %d", program, uniformBlockName ? uniformBlockName : "(null)", (Int)index);
         return index;
     }
 
@@ -1030,6 +1430,7 @@ namespace MobileGL::MG_Impl::GLImpl {
                         std::to_string(program) + "."));
             return;
         }
+        MGLOG_D("UBB prog=%u idx=%u binding=%u", program, uniformBlockIndex, uniformBlockBinding);
         programObject->SetUniformBlockBinding(uniformBlockIndex, uniformBlockBinding);
     }
 
@@ -1101,9 +1502,13 @@ namespace MobileGL::MG_Impl::GLImpl {
             MGLOG_D("%s: GL_UNIFORM_BLOCK_REFERENCED_BY_COMPUTE_SHADER = %d", __func__, *params);
             break;
         case GL_UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES: {
+            // Member entries of an arrayed block are recorded against the first instance;
+            // every instance of the array reports that shared member set (matches
+            // GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS, which scans with the same owner index).
+            const Int ownerIndex = static_cast<Int>(programObject->GetUniformBlockMemberOwnerIndex(uniformBlockIndex));
             GLint uniformIndexCount = 0;
             for (Uint uniformIndex = 0; uniformIndex < programObject->GetUniformCount(); ++uniformIndex) {
-                if (programObject->GetActiveUniformBlockIndex(uniformIndex) != static_cast<Int>(uniformBlockIndex)) {
+                if (programObject->GetActiveUniformBlockIndex(uniformIndex) != ownerIndex) {
                     continue;
                 }
                 params[uniformIndexCount++] = static_cast<GLint>(uniformIndex);
@@ -1149,13 +1554,34 @@ namespace MobileGL::MG_Impl::GLImpl {
                 length ? *length : 0);
     }
 
-    void BindFragDataLocation_State(GLuint program, GLuint colorNumber, const char* name) {
+    void BindFragDataLocationIndexed_State(GLuint program, GLuint colorNumber, GLuint index, const char* name) {
         auto& programObject = TryToGetProgramObject(program);
-        if (programObject == nullptr) {
+        // TryToGetProgramObject already recorded the error for a bad handle (GL_INVALID_VALUE for an
+        // unknown name, GL_INVALID_OPERATION for a non-program object); do not record a second one.
+        if (!programObject) return;
+        if (name == nullptr) {
             MG_State::pGLContext->RecordError(
-                ErrorCode::InvalidOperation,
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__, "name cannot be null."));
+            return;
+        }
+        // index selects the single (0) or dual-source (1) color; it must be 0 or 1.
+        if (index > 1) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__, "index must be 0 or 1."));
+            return;
+        }
+        const auto& dynamicParameters = MG_Backend::pActiveBackendObject->GetDynamicParameters();
+        // colorNumber is bounded by GL_MAX_DRAW_BUFFERS for index 0, and by
+        // GL_MAX_DUAL_SOURCE_DRAW_BUFFERS (which MobileGL reports as 1) for index 1.
+        const GLuint colorNumberLimit =
+            (index == 0) ? static_cast<GLuint>(dynamicParameters.MaxDrawBuffers) : 1u;
+        if (colorNumber >= colorNumberLimit) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
                 MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
-                                             std::to_string(program) + " is not the name of a program object."));
+                                             "colorNumber exceeds the applicable draw-buffer limit."));
             return;
         }
         if (strncmp(name, "gl_", 3) == 0) {
@@ -1165,22 +1591,56 @@ namespace MobileGL::MG_Impl::GLImpl {
                                              "name " + std::string(name) + " starts with the reserved prefix `gl_`."));
             return;
         }
-        // TODO: Emit error "if `colorNumber` is greater than or equal to `GL_MAX_DRAW_BUFFERS`"
 
-        MGLOG_D("%s: loc %02d = \"%s\"", __func__, colorNumber, name);
+        MGLOG_D("%s: loc %02d index %u = \"%s\"", __func__, colorNumber, index, name);
         programObject->SetExplicitFragmentOutLocation(colorNumber, name);
+        programObject->SetExplicitFragmentOutIndex(index, name);
+    }
+
+    // glBindFragDataLocation is glBindFragDataLocationIndexed with color index 0.
+    void BindFragDataLocation_State(GLuint program, GLuint colorNumber, const char* name) {
+        BindFragDataLocationIndexed_State(program, colorNumber, 0, name);
     }
 
     GLint GetFragDataLocation_State(GLuint program, const char* name) {
         auto& programObject = TryToGetProgramObject(program);
-        if (programObject == nullptr) {
+        if (!programObject) return -1; // TryToGetProgramObject already recorded the error.
+        if (name == nullptr) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__, "name cannot be null."));
+            return -1;
+        }
+        if (!programObject->GetLinkStatus()) {
             MG_State::pGLContext->RecordError(
                 ErrorCode::InvalidOperation,
                 MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
-                                             std::to_string(program) + " is not the name of a program object."));
+                                             std::to_string(program) + " has not been linked successfully."));
             return -1;
         }
         return programObject->GetFragmentDataLocation(name);
+    }
+
+    GLint GetFragDataIndex_State(GLuint program, const char* name) {
+        auto& programObject = TryToGetProgramObject(program);
+        if (!programObject) return -1; // TryToGetProgramObject already recorded the error.
+        if (name == nullptr) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__, "name cannot be null."));
+            return -1;
+        }
+        if (!programObject->GetLinkStatus()) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidOperation,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                             std::to_string(program) + " has not been linked successfully."));
+            return -1;
+        }
+        // Returns the color index bound by glBindFragDataLocationIndexed (0 by default), or -1 if name
+        // is not an active user-defined output. Note: the index is tracked for reflection but is not
+        // yet plumbed into dual-source blend rendering, and shader-side layout(index=) is not reflected.
+        return programObject->GetFragmentDataIndex(name);
     }
 
     void ValidateProgram_State(GLuint program) {
@@ -1236,6 +1696,11 @@ namespace MobileGL::MG_Impl::GLImpl {
     void GetUniformIndices(GLuint program, GLsizei uniformCount, const GLchar* const* uniformNames,
                            GLuint* uniformIndices) {
         GetUniformIndices_State(program, uniformCount, uniformNames, uniformIndices);
+    }
+
+    void GetActiveUniformsiv(GLuint program, GLsizei uniformCount, const GLuint* uniformIndices, GLenum pname,
+                             GLint* params) {
+        GetActiveUniformsiv_State(program, uniformCount, uniformIndices, pname, params);
     }
 
     void GetAttachedShaders(GLuint program, GLsizei maxCount, GLsizei* count, GLuint* shaders) {
@@ -1417,6 +1882,30 @@ namespace MobileGL::MG_Impl::GLImpl {
         UniformMatrix4fv_State(location, count, transpose, value);
     }
 
+    void UniformMatrix2x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) {
+        UniformMatrixNonSquarefv_State(__func__, location, count);
+    }
+
+    void UniformMatrix3x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) {
+        UniformMatrixNonSquarefv_State(__func__, location, count);
+    }
+
+    void UniformMatrix2x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) {
+        UniformMatrixNonSquarefv_State(__func__, location, count);
+    }
+
+    void UniformMatrix4x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) {
+        UniformMatrixNonSquarefv_State(__func__, location, count);
+    }
+
+    void UniformMatrix3x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) {
+        UniformMatrixNonSquarefv_State(__func__, location, count);
+    }
+
+    void UniformMatrix4x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) {
+        UniformMatrixNonSquarefv_State(__func__, location, count);
+    }
+
     void ProgramUniform1f(GLuint program, GLint location, GLfloat v0) {
         ProgramUniform1fv(program, location, 1, &v0);
     }
@@ -1537,6 +2026,36 @@ namespace MobileGL::MG_Impl::GLImpl {
         ProgramUniformMatrix4fv_State(program, location, count, transpose, value);
     }
 
+    void ProgramUniformMatrix2x3fv(GLuint program, GLint location, GLsizei count, GLboolean transpose,
+                                   const GLfloat* value) {
+        ProgramUniformMatrixNonSquarefv_State(__func__, program, location, count);
+    }
+
+    void ProgramUniformMatrix3x2fv(GLuint program, GLint location, GLsizei count, GLboolean transpose,
+                                   const GLfloat* value) {
+        ProgramUniformMatrixNonSquarefv_State(__func__, program, location, count);
+    }
+
+    void ProgramUniformMatrix2x4fv(GLuint program, GLint location, GLsizei count, GLboolean transpose,
+                                   const GLfloat* value) {
+        ProgramUniformMatrixNonSquarefv_State(__func__, program, location, count);
+    }
+
+    void ProgramUniformMatrix4x2fv(GLuint program, GLint location, GLsizei count, GLboolean transpose,
+                                   const GLfloat* value) {
+        ProgramUniformMatrixNonSquarefv_State(__func__, program, location, count);
+    }
+
+    void ProgramUniformMatrix3x4fv(GLuint program, GLint location, GLsizei count, GLboolean transpose,
+                                   const GLfloat* value) {
+        ProgramUniformMatrixNonSquarefv_State(__func__, program, location, count);
+    }
+
+    void ProgramUniformMatrix4x3fv(GLuint program, GLint location, GLsizei count, GLboolean transpose,
+                                   const GLfloat* value) {
+        ProgramUniformMatrixNonSquarefv_State(__func__, program, location, count);
+    }
+
     GLuint GetUniformBlockIndex(GLuint program, const GLchar* uniformBlockName) {
         return GetUniformBlockIndex_State(program, uniformBlockName);
     }
@@ -1558,13 +2077,22 @@ namespace MobileGL::MG_Impl::GLImpl {
         BindFragDataLocation_State(program, colorNumber, name);
     }
 
+    void BindFragDataLocationIndexed(GLuint program, GLuint colorNumber, GLuint index, const char* name) {
+        BindFragDataLocationIndexed_State(program, colorNumber, index, name);
+    }
+
     GLint GetFragDataLocation(GLuint program, const char* name) {
         return GetFragDataLocation_State(program, name);
     }
 
+    GLint GetFragDataIndex(GLuint program, const char* name) {
+        return GetFragDataIndex_State(program, name);
+    }
+
     void GetProgramInterfaceiv(GLuint program, GLenum programInterface, GLenum pname, GLint* params) {
-        auto& programObject = TryToGetProgramObject(program);
-        if (!programObject || !programObject->GetLinkStatus()) return;
+        auto& programObject = TryToGetLinkedProgramForInterfaceQuery(program, __func__);
+        if (!programObject) return;
+        if (!ValidateProgramInterfaceivQuery(programInterface, pname)) return;
         auto getProgramInterfaceiv = MG_Backend::gBackendFunctionsTable.GL.GetProgramInterfaceiv;
         if (!getProgramInterfaceiv) {
             MG_State::pGLContext->RecordError(
@@ -1577,8 +2105,10 @@ namespace MobileGL::MG_Impl::GLImpl {
     }
 
     GLuint GetProgramResourceIndex(GLuint program, GLenum programInterface, const GLchar* name) {
-        auto& programObject = TryToGetProgramObject(program);
-        if (!programObject || !programObject->GetLinkStatus()) return GL_INVALID_INDEX;
+        auto& programObject = TryToGetLinkedProgramForInterfaceQuery(program, __func__);
+        if (!programObject) return GL_INVALID_INDEX;
+        if (!ValidateNamedProgramResourceInterface(programInterface, __func__)) return GL_INVALID_INDEX;
+        if (!name) return GL_INVALID_INDEX;
         auto getProgramResourceIndex = MG_Backend::gBackendFunctionsTable.GL.GetProgramResourceIndex;
         if (!getProgramResourceIndex) {
             MG_State::pGLContext->RecordError(
@@ -1587,13 +2117,28 @@ namespace MobileGL::MG_Impl::GLImpl {
                                              "Backend does not support program interface queries."));
             return GL_INVALID_INDEX;
         }
-        return getProgramResourceIndex(program, programInterface, name);
+        GLuint index = getProgramResourceIndex(program, programInterface, name);
+        const String resourceName = name;
+        if (index == GL_INVALID_INDEX && resourceName.length() > 3 &&
+            resourceName.compare(resourceName.length() - 3, 3, "[0]") == 0) {
+            index = getProgramResourceIndex(program, programInterface,
+                                            resourceName.substr(0, resourceName.length() - 3).c_str());
+        }
+        return index;
     }
 
     void GetProgramResourceName(GLuint program, GLenum programInterface, GLuint index, GLsizei bufSize, GLsizei* length,
                                 GLchar* name) {
-        auto& programObject = TryToGetProgramObject(program);
-        if (!programObject || !programObject->GetLinkStatus()) return;
+        auto& programObject = TryToGetLinkedProgramForInterfaceQuery(program, __func__);
+        if (!programObject) return;
+        if (!ValidateNamedProgramResourceInterface(programInterface, __func__)) return;
+        const Int resourceCount = GetKnownProgramResourceCount(programObject, programInterface);
+        if (resourceCount >= 0 && index >= static_cast<GLuint>(resourceCount)) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__, "index is out of range."));
+            return;
+        }
         if (bufSize < 0) {
             MG_State::pGLContext->RecordError(
                 ErrorCode::InvalidValue,
@@ -1613,8 +2158,8 @@ namespace MobileGL::MG_Impl::GLImpl {
 
     void GetProgramResourceiv(GLuint program, GLenum programInterface, GLuint index, GLsizei propCount,
                               const GLenum* props, GLsizei bufSize, GLsizei* length, GLint* params) {
-        auto& programObject = TryToGetProgramObject(program);
-        if (!programObject || !programObject->GetLinkStatus()) return;
+        auto& programObject = TryToGetLinkedProgramForInterfaceQuery(program, __func__);
+        if (!programObject) return;
         if (propCount < 0 || bufSize < 0) {
             MG_State::pGLContext->RecordError(
                 ErrorCode::InvalidValue, MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
@@ -1633,8 +2178,8 @@ namespace MobileGL::MG_Impl::GLImpl {
     }
 
     GLint GetProgramResourceLocation(GLuint program, GLenum programInterface, const GLchar* name) {
-        auto& programObject = TryToGetProgramObject(program);
-        if (!programObject || !programObject->GetLinkStatus()) return -1;
+        auto& programObject = TryToGetLinkedProgramForInterfaceQuery(program, __func__);
+        if (!programObject) return -1;
         auto getProgramResourceLocation = MG_Backend::gBackendFunctionsTable.GL.GetProgramResourceLocation;
         if (!getProgramResourceLocation) {
             MG_State::pGLContext->RecordError(
@@ -1647,8 +2192,8 @@ namespace MobileGL::MG_Impl::GLImpl {
     }
 
     GLint GetProgramResourceLocationIndex(GLuint program, GLenum programInterface, const GLchar* name) {
-        auto& programObject = TryToGetProgramObject(program);
-        if (!programObject || !programObject->GetLinkStatus()) return -1;
+        auto& programObject = TryToGetLinkedProgramForInterfaceQuery(program, __func__);
+        if (!programObject) return -1;
         auto getProgramResourceLocationIndex = MG_Backend::gBackendFunctionsTable.GL.GetProgramResourceLocationIndex;
         if (!getProgramResourceLocationIndex) return -1;
         return getProgramResourceLocationIndex(program, programInterface, name);
@@ -1657,6 +2202,7 @@ namespace MobileGL::MG_Impl::GLImpl {
     void ShaderStorageBlockBinding(GLuint program, GLuint storageBlockIndex, GLuint storageBlockBinding) {
         auto& programObject = TryToGetProgramObject(program);
         if (!programObject || !programObject->GetLinkStatus()) return;
+        if (!ValidateShaderStorageBlockBinding(storageBlockBinding)) return;
         auto shaderStorageBlockBinding = MG_Backend::gBackendFunctionsTable.GL.ShaderStorageBlockBinding;
         if (!shaderStorageBlockBinding) {
             MG_State::pGLContext->RecordError(

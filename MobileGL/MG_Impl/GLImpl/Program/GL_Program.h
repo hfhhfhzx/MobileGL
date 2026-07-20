@@ -26,6 +26,8 @@ namespace MobileGL::MG_Impl::GLImpl {
                               GLchar* uniformName);
     void GetUniformIndices(GLuint program, GLsizei uniformCount, const GLchar* const* uniformNames,
                            GLuint* uniformIndices);
+    void GetActiveUniformsiv(GLuint program, GLsizei uniformCount, const GLuint* uniformIndices, GLenum pname,
+                             GLint* params);
     void GetAttachedShaders(GLuint program, GLsizei maxCount, GLsizei* count, GLuint* shaders);
     GLint GetAttribLocation(GLuint program, const GLchar* name);
     void GetProgramiv(GLuint program, GLenum pname, GLint* params);
@@ -99,13 +101,33 @@ namespace MobileGL::MG_Impl::GLImpl {
                                  const GLfloat* value);
     void ProgramUniformMatrix4fv(GLuint program, GLint location, GLsizei count, GLboolean transpose,
                                  const GLfloat* value);
+    void UniformMatrix2x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+    void UniformMatrix3x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+    void UniformMatrix2x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+    void UniformMatrix4x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+    void UniformMatrix3x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+    void UniformMatrix4x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+    void ProgramUniformMatrix2x3fv(GLuint program, GLint location, GLsizei count, GLboolean transpose,
+                                   const GLfloat* value);
+    void ProgramUniformMatrix3x2fv(GLuint program, GLint location, GLsizei count, GLboolean transpose,
+                                   const GLfloat* value);
+    void ProgramUniformMatrix2x4fv(GLuint program, GLint location, GLsizei count, GLboolean transpose,
+                                   const GLfloat* value);
+    void ProgramUniformMatrix4x2fv(GLuint program, GLint location, GLsizei count, GLboolean transpose,
+                                   const GLfloat* value);
+    void ProgramUniformMatrix3x4fv(GLuint program, GLint location, GLsizei count, GLboolean transpose,
+                                   const GLfloat* value);
+    void ProgramUniformMatrix4x3fv(GLuint program, GLint location, GLsizei count, GLboolean transpose,
+                                   const GLfloat* value);
     GLuint GetUniformBlockIndex(GLuint program, const GLchar* uniformBlockName);
     void UniformBlockBinding(GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding);
     void GetActiveUniformBlockiv(GLuint program, GLuint uniformBlockIndex, GLenum pname, GLint* params);
     void GetActiveUniformBlockName(GLuint program, GLuint uniformBlockIndex, GLsizei bufSize, GLsizei* length,
                                    GLchar* uniformBlockName);
     void BindFragDataLocation(GLuint program, GLuint colorNumber, const char* name);
+    void BindFragDataLocationIndexed(GLuint program, GLuint colorNumber, GLuint index, const char* name);
     GLint GetFragDataLocation(GLuint program, const char* name);
+    GLint GetFragDataIndex(GLuint program, const char* name);
     void GetProgramInterfaceiv(GLuint program, GLenum programInterface, GLenum pname, GLint* params);
     GLuint GetProgramResourceIndex(GLuint program, GLenum programInterface, const GLchar* name);
     void GetProgramResourceName(GLuint program, GLenum programInterface, GLuint index, GLsizei bufSize,

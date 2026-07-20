@@ -103,6 +103,48 @@ If you want to try the project right now, you’ll need to build it yourself:
    
    Complete construction plan: Refer to [Workflow](../.github/workflows/build.yml)
 
+### Build For macOS
+
+On macOS, MobileGL can be built as a dylib that exposes the normal OpenGL/CGL/NSOpenGL entry points and routes them to the `DirectVulkan` backend. This is useful for running applications such as Minecraft through their stock GLFW/LWJGL OpenGL path while MobileGL is injected before context creation.
+
+Prerequisites:
+
+* macOS with Clang and Ninja.
+* Vulkan loader and MoltenVK installed. With Homebrew, the MoltenVK ICD is commonly located at `/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json`.
+
+Configure and build:
+
+```sh
+cmake -S . -B build-macos-magma \
+  -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DMOBILEGL_BACKEND_TYPE=DirectVulkan \
+  -DMOBILEGL_BUILD_TEST=OFF \
+  -DMOBILEGL_BUILD_BENCHMARK=OFF
+
+cmake --build build-macos-magma --target MobileGL -j8
+```
+
+The dylib will be generated at:
+
+```sh
+build-macos-magma/libMobileGL.dylib
+```
+
+To run Minecraft by MobileGL from a launcher like PrismLauncher, keep the stock LWJGL/GLFW natives and add a wrapper command to the instance settings:
+
+```sh
+env DYLD_INSERT_LIBRARIES=/absolute/path/to/MobileGL/build-macos-magma/libMobileGL.dylib MOBILEGL_BACKEND_TYPE=DirectVulkan VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
+```
+
+Also make sure the JVM arguments include:
+
+```sh
+-XstartOnFirstThread
+```
+
+`DYLD_INSERT_LIBRARIES` must be active before GLFW creates its OpenGL context. After startup, the Minecraft F3 screen should report MobileGL and the `Direct (Vulkan)` backend if the injection worked.
+
 ## Build Options
 
 | Option                       | Description                                           | Default |
@@ -127,6 +169,14 @@ MobileGL supports runtime configuration via environment variables.
 | Variable                | Description                                      | Allowed Values                       | Default        |
 |-------------------------|--------------------------------------------------|--------------------------------------|----------------|
 | `MOBILEGL_BACKEND_TYPE` | Select active backend implementation at startup. | `DirectGLES`, `DirectVulkan`         | `DirectGLES`   |
+| `MOBILEGL_DISABLE_TIMERQUERY` | Disable GPU timer-query exposure and use. | `0`, `1` | `0` |
+| `MOBILEGL_USE_ANGLE` | Load ANGLE EGL/GLES libraries. | `0`, `1` | `0` |
+| `MOBILEGL_DISABLE_SUBGROUP` | Disable Vulkan shader subgroup support. | `0`, `1` | `0` |
+| `MOBILEGL_MAGMA_R11G11B10F_FALLBACK` | Use Magma's R11G11B10F format fallback. | `0`, `1` | `0` |
+| `MOBILEGL_MAGMA_FRAMESINFLIGHT` | Set Magma frames in flight. | Integer `1`–`64` | `3` |
+| `MOBILEGL_AVOID_SAMPLER_MIPMAP_MIN_FILTER` | Avoid sampler mipmap minification filters. | `0`, `1` | `0` |
+| `MOBILEGL_COHERENT_AS_FLUSH` | Treat persistent `GL_MAP_FLUSH_EXPLICIT_BIT` maps as coherent (app-compat for engines like Flywheel that never flush them). | `0`, `1` | `0` |
+| `VK_ICD_FILENAMES`      | Select the Vulkan ICD used by the Vulkan loader. | Path to an ICD JSON file             | Loader default |
 
 ## Notice
 

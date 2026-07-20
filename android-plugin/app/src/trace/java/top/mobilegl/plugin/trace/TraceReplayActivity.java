@@ -97,6 +97,7 @@ public final class TraceReplayActivity extends Activity {
                 surface,
                 request.tracePath,
                 request.goldenPath,
+                request.alternateGoldenPath,
                 request.outputDir,
                 request.diffPath,
                 request.backend,
@@ -104,12 +105,16 @@ public final class TraceReplayActivity extends Activity {
                 request.targetCall,
                 request.width,
                 request.height,
-                request.tolerance,
+                request.ssimThreshold,
                 request.cropX,
                 request.cropY,
                 request.cropWidth,
                 request.cropHeight,
-                request.fuzzPercent
+                request.angleVariant,
+                request.useAngle,
+                request.usePbuffer,
+                request.avoidAngleLlvmpipeSamplerMipmapMinFilter,
+                request.coherentAsFlush
         );
         Log.i(TAG, result.toString());
         TraceReplayResult finalResult = result;
@@ -123,6 +128,7 @@ public final class TraceReplayActivity extends Activity {
             Surface surface,
             String tracePath,
             String goldenPath,
+            String alternateGoldenPath,
             String outputDir,
             String diffPath,
             String backend,
@@ -130,17 +136,22 @@ public final class TraceReplayActivity extends Activity {
             long targetCall,
             int width,
             int height,
-            int tolerance,
+            double ssimThreshold,
             int cropX,
             int cropY,
             int cropWidth,
             int cropHeight,
-            int fuzzPercent
+            String angleVariant,
+            boolean useAngle,
+            boolean usePbuffer,
+            boolean avoidAngleLlvmpipeSamplerMipmapMinFilter,
+            boolean coherentAsFlush
     );
 
     private static final class TraceReplayRequest {
         final String tracePath;
         final String goldenPath;
+        final String alternateGoldenPath;
         final String outputDir;
         final String diffPath;
         final String backend;
@@ -148,16 +159,21 @@ public final class TraceReplayActivity extends Activity {
         final long targetCall;
         final int width;
         final int height;
-        final int tolerance;
+        final double ssimThreshold;
         final int cropX;
         final int cropY;
         final int cropWidth;
         final int cropHeight;
-        final int fuzzPercent;
+        final String angleVariant;
+        final boolean useAngle;
+        final boolean usePbuffer;
+        final boolean avoidAngleLlvmpipeSamplerMipmapMinFilter;
+        final boolean coherentAsFlush;
 
         private TraceReplayRequest(
                 String tracePath,
                 String goldenPath,
+                String alternateGoldenPath,
                 String outputDir,
                 String diffPath,
                 String backend,
@@ -165,15 +181,20 @@ public final class TraceReplayActivity extends Activity {
                 long targetCall,
                 int width,
                 int height,
-                int tolerance,
+                double ssimThreshold,
                 int cropX,
                 int cropY,
                 int cropWidth,
                 int cropHeight,
-                int fuzzPercent
+                String angleVariant,
+                boolean useAngle,
+                boolean usePbuffer,
+                boolean avoidAngleLlvmpipeSamplerMipmapMinFilter,
+                boolean coherentAsFlush
         ) {
             this.tracePath = tracePath;
             this.goldenPath = goldenPath;
+            this.alternateGoldenPath = alternateGoldenPath;
             this.outputDir = outputDir;
             this.diffPath = diffPath;
             this.backend = backend;
@@ -181,12 +202,16 @@ public final class TraceReplayActivity extends Activity {
             this.targetCall = targetCall;
             this.width = width;
             this.height = height;
-            this.tolerance = tolerance;
+            this.ssimThreshold = ssimThreshold;
             this.cropX = cropX;
             this.cropY = cropY;
             this.cropWidth = cropWidth;
             this.cropHeight = cropHeight;
-            this.fuzzPercent = fuzzPercent;
+            this.angleVariant = angleVariant;
+            this.useAngle = useAngle;
+            this.usePbuffer = usePbuffer;
+            this.avoidAngleLlvmpipeSamplerMipmapMinFilter = avoidAngleLlvmpipeSamplerMipmapMinFilter;
+            this.coherentAsFlush = coherentAsFlush;
         }
 
         static TraceReplayRequest from(Intent intent, File filesDir, String defaultBackend) {
@@ -195,6 +220,7 @@ public final class TraceReplayActivity extends Activity {
             return new TraceReplayRequest(
                     readString(intent, "trace_path", ""),
                     readString(intent, "golden_path", ""),
+                    readString(intent, "alternate_golden_path", ""),
                     outputDir,
                     diffPath,
                     readString(intent, "backend", defaultBackend),
@@ -202,18 +228,34 @@ public final class TraceReplayActivity extends Activity {
                     intent.getLongExtra("target_call", -1L),
                     intent.getIntExtra("width", 0),
                     intent.getIntExtra("height", 0),
-                    intent.getIntExtra("tolerance", 0),
+                    readDouble(intent, "ssim_threshold", 0.99),
                     intent.getIntExtra("crop_x", 0),
                     intent.getIntExtra("crop_y", 0),
                     intent.getIntExtra("crop_width", 0),
                     intent.getIntExtra("crop_height", 0),
-                    intent.getIntExtra("fuzz_percent", 20)
+                    readString(intent, "angle_variant", ""),
+                    intent.getBooleanExtra("use_angle", false),
+                    intent.getBooleanExtra("use_pbuffer", false),
+                    intent.getBooleanExtra("avoid_angle_llvmpipe_sampler_mipmap_min_filter", false),
+                    intent.getBooleanExtra("coherent_as_flush", false)
             );
         }
 
         private static String readString(Intent intent, String key, String fallback) {
             String value = intent.getStringExtra(key);
             return value == null ? fallback : value;
+        }
+
+        private static double readDouble(Intent intent, String key, double fallback) {
+            String stringValue = intent.getStringExtra(key);
+            if (stringValue != null && !stringValue.isEmpty()) {
+                try {
+                    return Double.parseDouble(stringValue);
+                } catch (NumberFormatException ignored) {
+                    return fallback;
+                }
+            }
+            return intent.getDoubleExtra(key, fallback);
         }
     }
 

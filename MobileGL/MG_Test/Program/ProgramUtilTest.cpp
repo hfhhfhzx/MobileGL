@@ -15,8 +15,11 @@
 #include <MG_Util/Converters/GLToStr/GLEnumConverter.h>
 #include <MG_Util/ShaderTranspiler/ShaderCompiler.h>
 #include <MG_Util/ShaderTranspiler/ShaderSourceProcessor.h>
+#include <MG_Util/ShaderTranspiler/SpirvPasses/RenameSamplerFunctionParameterPass.h>
 #include <MG_Util/ShaderTranspiler/Types.h>
 #include <MG_Util/ShaderTranspiler/glslang/UniformTraverser.h>
+#include <spirv-tools/libspirv.hpp>
+#include <spirv-tools/optimizer.hpp>
 
 using namespace MobileGL;
 
@@ -29,6 +32,64 @@ protected:
 
 TEST_F(ProgramUtilTest, Sanity) {
     ASSERT_TRUE(true);
+}
+
+TEST_F(ProgramUtilTest, RenameSamplerFunctionParameterInSpirvPass) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    const String spirvText = R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %outColor
+               OpExecutionMode %main OriginUpperLeft
+               OpName %globalSampler "sampler"
+               OpName %paramSampler "sampler"
+               OpName %main "main"
+               OpDecorate %outColor Location 0
+       %void = OpTypeVoid
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+     %mainFn = OpTypeFunction %void
+    %paramFn = OpTypeFunction %void %float
+  %outV4Ptr = OpTypePointer Output %v4float
+ %privatePtr = OpTypePointer Private %float
+   %outColor = OpVariable %outV4Ptr Output
+%globalSampler = OpVariable %privatePtr Private
+     %helper = OpFunction %void None %paramFn
+%paramSampler = OpFunctionParameter %float
+ %helperBody = OpLabel
+               OpReturn
+               OpFunctionEnd
+       %main = OpFunction %void None %mainFn
+   %mainBody = OpLabel
+               OpReturn
+               OpFunctionEnd
+)";
+
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_1);
+    Vector<uint32_t> inputBinary;
+    ASSERT_TRUE(tools.Assemble(spirvText, &inputBinary));
+
+    spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_1);
+    spvtools::OptimizerOptions options;
+    options.set_run_validator(false);
+    optimizer.RegisterPass(RenameSamplerFunctionParameterPass::CreateRenameSamplerFunctionParameterPass());
+
+    Vector<uint32_t> outputBinary;
+    ASSERT_TRUE(optimizer.Run(inputBinary.data(), inputBinary.size(), &outputBinary, options));
+
+    String outputText;
+    ASSERT_TRUE(tools.Disassemble(outputBinary, &outputText));
+
+    EXPECT_NE(outputText.find("\"MGL_COMPAT_sampler\""), String::npos);
+
+    SizeT exactSamplerNameCount = 0;
+    SizeT searchOffset = 0;
+    while ((searchOffset = outputText.find("\"sampler\"", searchOffset)) != String::npos) {
+        ++exactSamplerNameCount;
+        searchOffset += std::strlen("\"sampler\"");
+    }
+    EXPECT_EQ(exactSamplerNameCount, 1u);
 }
 
 TEST_F(ProgramUtilTest, PreprocessLegacyVertexShaderModernizesGlmarkStyleSource) {
@@ -46,13 +107,19 @@ void main() {
 
     PreprocessShaderSource(ShaderStage::Vertex, source);
 
-    EXPECT_EQ(source.find("#version 460 core\n"), 0);
+    EXPECT_EQ(source.find("#version 330 core\n"), 0);
     EXPECT_NE(source.find("in vec3 position;"), String::npos);
     EXPECT_NE(source.find("out vec2 uv;"), String::npos);
     EXPECT_EQ(source.find("attribute"), String::npos);
     EXPECT_EQ(source.find("varying"), String::npos);
-    EXPECT_EQ(source.find("HIGHP_OR_DEFAULT"), String::npos);
-    EXPECT_EQ(source.find("#define"), String::npos);
+    // Precision-qualifier macros are left for glslang's own preprocessor to expand.
+    EXPECT_NE(source.find("#define HIGHP_OR_DEFAULT highp"), String::npos);
+
+    ShaderAttrib attrib{.shaderType = GL_VERTEX_SHADER, .sourceStr = source};
+    auto res = ShaderCompiler::CompileShader(attrib);
+    if (!res) {
+        FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+    }
 }
 
 TEST_F(ProgramUtilTest, PreprocessLegacyFragmentShaderModernizesGlmarkStyleSource) {
@@ -69,16 +136,341 @@ void main() {
 
     PreprocessShaderSource(ShaderStage::Fragment, source);
 
-    EXPECT_EQ(source.find("#version 460 core\n"), 0);
+    EXPECT_EQ(source.find("#version 330 core\n"), 0);
     EXPECT_NE(source.find("out vec4 mg_FragColor;\n"), String::npos);
     EXPECT_NE(source.find("in vec2 uv;"), String::npos);
     EXPECT_NE(source.find("texture(texture0, uv)"), String::npos);
     EXPECT_NE(source.find("mg_FragColor = color;"), String::npos);
     EXPECT_EQ(source.find("gl_FragColor"), String::npos);
     EXPECT_EQ(source.find("texture2D"), String::npos);
-    EXPECT_EQ(source.find("MEDIUMP_OR_DEFAULT"), String::npos);
-    EXPECT_EQ(source.find("mediump"), String::npos);
-    EXPECT_EQ(source.find("#define"), String::npos);
+    // Precision-qualifier macros are left for glslang's own preprocessor to expand.
+    EXPECT_NE(source.find("#define MEDIUMP_OR_DEFAULT mediump"), String::npos);
+
+    ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+    auto res = ShaderCompiler::CompileShader(attrib);
+    if (!res) {
+        FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+    }
+}
+
+TEST_F(ProgramUtilTest, PreprocessMinecraft112BlurShaderKeepsLegacySampleIdentifier) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    // assets/minecraft/shaders/program/blur.fsh from the unmodified Minecraft 1.12 client jar.
+    String source = R"(#version 120
+
+uniform sampler2D DiffuseSampler;
+
+varying vec2 texCoord;
+varying vec2 oneTexel;
+
+uniform vec2 InSize;
+
+uniform vec2 BlurDir;
+uniform float Radius;
+
+void main() {
+    vec4 blurred = vec4(0.0);
+    float totalStrength = 0.0;
+    float totalAlpha = 0.0;
+    float totalSamples = 0.0;
+    for(float r = -Radius; r <= Radius; r += 1.0) {
+        vec4 sample = texture2D(DiffuseSampler, texCoord + oneTexel * r * BlurDir);
+
+		// Accumulate average alpha
+        totalAlpha = totalAlpha + sample.a;
+        totalSamples = totalSamples + 1.0;
+
+		// Accumulate smoothed blur
+        float strength = 1.0 - abs(r / Radius);
+        totalStrength = totalStrength + strength;
+        blurred = blurred + sample;
+    }
+    gl_FragColor = vec4(blurred.rgb / (Radius * 2.0 + 1.0), totalAlpha);
+}
+)";
+
+    PreprocessShaderSource(ShaderStage::Fragment, source);
+
+    EXPECT_EQ(source.find("#version 330 core\n"), 0);
+    EXPECT_NE(source.find("vec4 sample = texture(DiffuseSampler"), String::npos);
+    EXPECT_NE(source.find("totalAlpha = totalAlpha + sample.a;"), String::npos);
+    EXPECT_NE(source.find("float totalSamples = 0.0;"), String::npos);
+    EXPECT_NE(source.find("totalSamples = totalSamples + 1.0;"), String::npos);
+    EXPECT_NE(source.find("blurred = blurred + sample;"), String::npos);
+
+    ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+    auto res = ShaderCompiler::CompileShader(attrib);
+    if (!res) {
+        FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+    }
+}
+
+TEST_F(ProgramUtilTest, PreprocessLegacySampleInterfaceIdentifiersKeepNames) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    String vertexSource = R"(#version 150
+attribute vec3 sample;
+
+void main() {
+    gl_Position = vec4(sample, 1.0);
+}
+)";
+    PreprocessShaderSource(ShaderStage::Vertex, vertexSource);
+
+    EXPECT_EQ(vertexSource.find("#version 330 core\n"), 0);
+    EXPECT_NE(vertexSource.find("in vec3 sample;"), String::npos);
+
+    ShaderAttrib vertexAttrib{.shaderType = GL_VERTEX_SHADER, .sourceStr = vertexSource};
+    auto vertexResult = ShaderCompiler::CompileShader(vertexAttrib);
+    if (!vertexResult) {
+        FAIL() << "errc: " << vertexResult.error().errc << "\nlog: " << vertexResult.error().log
+               << "\nsource:\n" << vertexSource;
+    }
+
+    String fragmentSource = R"(#version 150
+uniform sampler2D sample;
+varying vec2 texCoord;
+
+void main() {
+    gl_FragColor = texture2D(sample, texCoord);
+}
+)";
+    PreprocessShaderSource(ShaderStage::Fragment, fragmentSource);
+
+    EXPECT_EQ(fragmentSource.find("#version 330 core\n"), 0);
+    EXPECT_NE(fragmentSource.find("uniform sampler2D sample;"), String::npos);
+    EXPECT_NE(fragmentSource.find("texture(sample, texCoord)"), String::npos);
+
+    ShaderAttrib fragmentAttrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = fragmentSource};
+    auto fragmentResult = ShaderCompiler::CompileShader(fragmentAttrib);
+    if (!fragmentResult) {
+        FAIL() << "errc: " << fragmentResult.error().errc << "\nlog: " << fragmentResult.error().log
+               << "\nsource:\n" << fragmentSource;
+    }
+}
+
+TEST_F(ProgramUtilTest, PreprocessEsslVersionsRemainVulkanCompatible) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    const auto verifyVersion = [](const char* inputVersion, const char* expectedVersion) {
+        SCOPED_TRACE(inputVersion);
+        String source = inputVersion;
+        source += R"(
+precision mediump float;
+out vec4 fragColor;
+
+void main() {
+    fragColor = vec4(1.0);
+}
+)";
+        PreprocessShaderSource(ShaderStage::Fragment, source);
+
+        EXPECT_EQ(source.find(expectedVersion), 0);
+
+        ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+        auto res = ShaderCompiler::CompileShader(attrib);
+        if (!res) {
+            FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+        }
+    };
+
+    // Preserve the pre-existing desktop-core route: the current resource table cannot parse ESSL built-ins.
+    verifyVersion("#version 300 es", "#version 460 core\n");
+    verifyVersion("#version 310 es", "#version 460 core\n");
+}
+
+TEST_F(ProgramUtilTest, PreprocessModernDesktopVersionsRecognizesUtf8Bom) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    const auto verifyVersion = [](const char* inputVersion) {
+        SCOPED_TRACE(inputVersion);
+        String source = "\xef\xbb\xbf";
+        source += inputVersion;
+        source += R"(
+out vec4 fragColor;
+
+void main() {
+    fragColor = vec4(1.0);
+}
+)";
+        PreprocessShaderSource(ShaderStage::Fragment, source);
+
+        EXPECT_EQ(source.find("#version 460 core\n"), 0);
+        EXPECT_EQ(source.find("\xef\xbb\xbf"), String::npos);
+
+        ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+        auto res = ShaderCompiler::CompileShader(attrib);
+        if (!res) {
+            FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+        }
+    };
+
+    verifyVersion("#version 400 core");
+    verifyVersion("#version 460 core");
+}
+
+TEST_F(ProgramUtilTest, PreprocessUsesRealSpacedVersionDirectiveForInjectedOutput) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    String source = R"(// #version 460 core
+/* "#version 400 core" */
+#line 7 "#version 460 core"
+# version 120
+varying vec2 uv;
+
+void main() {
+    gl_FragColor = vec4(uv, 0.0, 1.0);
+}
+)";
+    PreprocessShaderSource(ShaderStage::Fragment, source);
+
+    const SizeT versionPos = source.find("#version 330 core\n");
+    const SizeT outputPos = source.find("out vec4 mg_FragColor;\n");
+    EXPECT_NE(versionPos, String::npos);
+    EXPECT_EQ(outputPos, versionPos + std::strlen("#version 330 core\n"));
+    EXPECT_NE(source.find("// #version 460 core"), String::npos);
+    EXPECT_EQ(source.find("#line"), String::npos);
+
+    ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+    auto res = ShaderCompiler::CompileShader(attrib);
+    if (!res) {
+        FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+    }
+}
+
+TEST_F(ProgramUtilTest, PreprocessModernSampleQualifierStaysAtVersion460) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    String source = R"(#version 400 core
+sample in vec4 interpolatedColor;
+out vec4 fragColor;
+
+void main() {
+    fragColor = interpolatedColor;
+}
+)";
+    PreprocessShaderSource(ShaderStage::Fragment, source);
+
+    EXPECT_EQ(source.find("#version 460 core\n"), 0);
+    EXPECT_NE(source.find("sample in vec4 interpolatedColor;"), String::npos);
+
+    ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+    auto res = ShaderCompiler::CompileShader(attrib);
+    if (!res) {
+        FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+    }
+}
+
+TEST_F(ProgramUtilTest, PreprocessGpuShader5SampleQualifierUsesVersion460) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    for (const char* extension : {"GL_ARB_gpu_shader5", "GL_NV_gpu_shader5"}) {
+        SCOPED_TRACE(extension);
+        String source = "#version 150\n#extension ";
+        source += extension;
+        source += R"( : enable
+sample in vec4 interpolatedColor;
+out vec4 fragColor;
+
+void main() {
+    fragColor = interpolatedColor;
+}
+)";
+        PreprocessShaderSource(ShaderStage::Fragment, source);
+
+        EXPECT_EQ(source.find("#version 460 core\n"), 0);
+        EXPECT_NE(source.find("sample in vec4 interpolatedColor;"), String::npos);
+
+        ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+        auto res = ShaderCompiler::CompileShader(attrib);
+        if (!res) {
+            FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+        }
+    }
+}
+
+TEST_F(ProgramUtilTest, PreprocessLegacyFragmentShaderModernizesFragData) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    String source = R"(#version 130
+void main() {
+    gl_FragData[0] = vec4(1.0);
+    gl_FragData[1].a = 0.5;
+})";
+
+    PreprocessShaderSource(ShaderStage::Fragment, source);
+
+    EXPECT_EQ(source.find("#version 330 core\n"), 0);
+    EXPECT_NE(source.find("layout(location = 0) out vec4 mg_FragData[8];\n"), String::npos);
+    EXPECT_NE(source.find("mg_FragData[0] = vec4(1.0);"), String::npos);
+    EXPECT_NE(source.find("mg_FragData[1].a = 0.5;"), String::npos);
+    EXPECT_EQ(source.find("gl_FragData"), String::npos);
+
+    ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+    auto res = ShaderCompiler::CompileShader(attrib);
+    if (!res) {
+        FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+    }
+}
+
+TEST_F(ProgramUtilTest, PreprocessKeepsDefaultPrecisionStatements) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    // Mirrors the GL CTS helper shaders (e.g. glcPixelStorageModesTests): the old qualifier strip
+    // turned "precision highp float;" into invalid "precision  float;". Precision qualifiers are
+    // legal (and ignored) in the normalized desktop core profile, so they now pass through untouched.
+    String source = R"(#version 330
+precision highp float;
+precision mediump int;
+out vec4 fragColor;
+uniform highp sampler2D tex;
+
+void main() {
+    highp vec2 uv = vec2(0.5);
+    fragColor = texture(tex, uv);
+})";
+
+    PreprocessShaderSource(ShaderStage::Fragment, source);
+
+    EXPECT_NE(source.find("precision highp float;"), String::npos);
+    EXPECT_NE(source.find("precision mediump int;"), String::npos);
+    EXPECT_NE(source.find("uniform highp sampler2D tex;"), String::npos);
+    EXPECT_NE(source.find("fragColor = texture(tex, uv);"), String::npos);
+
+    ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+    auto res = ShaderCompiler::CompileShader(attrib);
+    if (!res) {
+        FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+    }
+}
+
+TEST_F(ProgramUtilTest, PreprocessKeepsPrecisionInLegacyShaderForGlslang) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    // Legacy ES-style shader: precision statements and qualifier macros are left for glslang
+    // (its preprocessor expands the #define; the normalized 330 core parse ignores the qualifiers).
+    String source = R"(#define HIGHP_OR_DEFAULT highp
+precision HIGHP_OR_DEFAULT float;
+precision mediump int;
+varying vec2 uv;
+
+void main() {
+    mediump float shade = uv.x;
+    gl_FragColor = vec4(uv, shade, 1.0);
+})";
+
+    PreprocessShaderSource(ShaderStage::Fragment, source);
+
+    EXPECT_NE(source.find("precision HIGHP_OR_DEFAULT float;"), String::npos);
+    EXPECT_NE(source.find("precision mediump int;"), String::npos);
+    EXPECT_NE(source.find("in vec2 uv;"), String::npos);
+
+    ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+    auto res = ShaderCompiler::CompileShader(attrib);
+    if (!res) {
+        FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+    }
 }
 
 TEST_F(ProgramUtilTest, PreprocessFragmentShaderInjectsDepthRangeShim) {
@@ -162,6 +554,81 @@ TEST_F(ProgramUtilTest, CompileSimpleVertexShader) {
         ASSERT_NE(res.error().errc, 0);
         FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log;
     }
+}
+
+// Legacy desktop sources are normalized to "#version 330 core", which is stricter than the 460 they
+// used to be forced to. A shader declaring 330 while using 420-era syntax without the matching
+// #extension line is accepted by real drivers, so CompileShader retries it at 460 instead of failing.
+TEST_F(ProgramUtilTest, CompileShaderRetriesAt460WhenLegacyVersionRejects420Syntax) {
+    using namespace MG_Util::ShaderTranspiler;
+    String source = R"(#version 330
+layout(binding = 0) uniform sampler2D InSampler;
+in vec2 texCoord;
+out vec4 fragColor;
+void main() {
+    fragColor = texture(InSampler, texCoord);
+})";
+    PreprocessShaderSource(ShaderStage::Fragment, source);
+    // The normal path still emits 330 - the retry must not become the default.
+    ASSERT_EQ(source.find("#version 330 core"), 0u);
+
+    ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+    auto res = ShaderCompiler::CompileShader(attrib);
+    if (!res) {
+        FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log;
+    }
+
+    // Same source compiled for the OpenGL environment must take the retry too.
+    ShaderAttrib glAttrib{
+        .shaderType = GL_FRAGMENT_SHADER, .sourceStr = source, .flags = ShaderCompileBits::CompileForOpenGL};
+    auto glRes = ShaderCompiler::CompileShader(glAttrib);
+    if (!glRes) {
+        FAIL() << "errc: " << glRes.error().errc << "\nlog: " << glRes.error().log;
+    }
+}
+
+TEST_F(ProgramUtilTest, CompileShaderStillFailsWithOriginalDiagnosticsWhenRetryCannotHelp) {
+    using namespace MG_Util::ShaderTranspiler;
+    String source = R"(#version 330
+in vec2 texCoord;
+out vec4 fragColor;
+void main() {
+    fragColor = thisFunctionDoesNotExist(texCoord);
+})";
+    PreprocessShaderSource(ShaderStage::Fragment, source);
+
+    ShaderAttrib attrib{.shaderType = GL_FRAGMENT_SHADER, .sourceStr = source};
+    auto res = ShaderCompiler::CompileShader(attrib);
+    ASSERT_FALSE(res);
+    EXPECT_EQ(res.error().errc, -2);
+    EXPECT_NE(res.error().log.find("thisFunctionDoesNotExist"), String::npos) << res.error().log;
+}
+
+TEST_F(ProgramUtilTest, RetargetLegacyVersionDirectiveOnlyTouchesNormalizedDesktopCore) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    String normalized = "#version 330 core\nvoid main() {}\n";
+    EXPECT_TRUE(RetargetLegacyVersionDirectiveTo460(normalized));
+    EXPECT_EQ(normalized.find("#version 460 core"), 0u);
+
+    // Already modern: nothing to retarget.
+    String modern = "#version 460 core\nvoid main() {}\n";
+    EXPECT_FALSE(RetargetLegacyVersionDirectiveTo460(modern));
+    EXPECT_EQ(modern.find("#version 460 core"), 0u);
+
+    // ES and compatibility sources keep what they declared.
+    String es = "#version 300 es\nvoid main() {}\n";
+    EXPECT_FALSE(RetargetLegacyVersionDirectiveTo460(es));
+    EXPECT_EQ(es.find("#version 300 es"), 0u);
+
+    String compat = "#version 330 compatibility\nvoid main() {}\n";
+    EXPECT_FALSE(RetargetLegacyVersionDirectiveTo460(compat));
+    EXPECT_EQ(compat.find("#version 330 compatibility"), 0u);
+
+    // A commented-out directive is not the real one.
+    String commented = "// #version 330 core\nvoid main() {}\n";
+    EXPECT_FALSE(RetargetLegacyVersionDirectiveTo460(commented));
+    EXPECT_EQ(commented.find("#version 460"), String::npos);
 }
 
 const char* fs = R"(#version 150
@@ -722,4 +1189,197 @@ TEST_F(ProgramUtilTest, CompileAndLinkBlitProgram) {
             std::cout << "src: " << src.value() << std::endl;
         }
     }
+}
+
+const char* photon_shared_vec3_cs = R"(#version 460 core
+layout(local_size_x = 16, local_size_y = 16) in;
+
+shared vec3 shared_memory[256][9];
+
+layout(location = 0) uniform int u_row;
+layout(location = 1) uniform int u_col;
+layout(location = 2) uniform vec3 u_value;
+
+layout(std430, binding = 0) writeonly buffer OutputBuffer {
+    vec4 out_data[];
+};
+
+vec3 evaluate_row(vec3 row_values[9], uint col) {
+    return row_values[col] + row_values[0];
+}
+
+void main() {
+    uint row = gl_LocalInvocationIndex;
+    uint col = u_col;
+
+    shared_memory[row][col] = u_value;
+    shared_memory[row][col] += vec3(1.0);
+
+    vec3 loaded = shared_memory[row][col];
+    float x = shared_memory[row][col].x;
+
+    vec3 rowCopy[9] = shared_memory[0];
+
+    memoryBarrierShared();
+    barrier();
+
+    out_data[gl_GlobalInvocationID.x] = vec4(loaded + rowCopy[col] + evaluate_row(shared_memory[0], col) + vec3(x), 1.0);
+}
+)";
+
+TEST_F(ProgramUtilTest, DecomposeWorkgroupVec3InSpirvPass) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    String csSource = photon_shared_vec3_cs;
+    PreprocessShaderSource(ShaderStage::Compute, csSource);
+
+    ShaderAttrib csAttrib{.shaderType = GL_COMPUTE_SHADER, .sourceStr = csSource};
+    auto csRes = ShaderCompiler::CompileShader(csAttrib);
+    if (!csRes) {
+        ASSERT_NE(csRes.error().errc, 0);
+        FAIL() << "errc: " << csRes.error().errc << "\nlog: " << csRes.error().log;
+    }
+
+    ProgramAttrib programAttrib{.shaders = {csRes.value()}};
+    auto programRes = ShaderCompiler::LinkProgram(programAttrib);
+    if (!programRes) {
+        ASSERT_NE(programRes.error().errc, 0);
+        FAIL() << "errc: " << programRes.error().errc << "\nlog: " << programRes.error().log;
+    }
+
+    ProgramBinaryAttrib binaryAttrib{
+        .shaderTypes = {GL_COMPUTE_SHADER},
+        .program = *programRes.value(),
+    };
+    auto binRes = ShaderCompiler::GetSpirvBinaryFromProgram(binaryAttrib);
+    ASSERT_TRUE(binRes.has_value());
+    ASSERT_FALSE(binRes->empty());
+
+    Vector<uint32_t> optimized;
+    ASSERT_TRUE(ShaderCompiler::SanitizeAndOptimizeBinary(binRes->at(0), optimized))
+        << "SanitizeAndOptimizeBinary failed - the DecomposeWorkgroupVec3Pass may have "
+           "encountered an unsupported pattern";
+
+    spvtools::Optimizer parseOnlyOptimizer(SPV_ENV_VULKAN_1_1);
+    Vector<uint32_t> parsedBinary;
+    ASSERT_TRUE(parseOnlyOptimizer.Run(optimized.data(), optimized.size(), &parsedBinary))
+        << "DecomposeWorkgroupVec3Pass emitted SPIR-V with invalid physical layout";
+
+    SpvcSession session(optimized, SessionUsageBit::Transpile);
+    auto sourceRes = ShaderCompiler::DecompileShader(session);
+    ASSERT_TRUE(sourceRes.has_value()) << "errc: " << sourceRes.error().errc
+                                       << "\nlog: " << sourceRes.error().log;
+
+    const String& source = sourceRes.value();
+    // The decomposed output must not contain a `shared vec3` declaration.
+    EXPECT_EQ(source.find("shared vec3"), std::string::npos)
+        << "DecomposeWorkgroupVec3Pass did not eliminate `shared vec3`:\n"
+        << source;
+
+    // It should now use a scalar array form (shared float ...).
+    EXPECT_NE(source.find("shared float"), std::string::npos)
+        << "Expected `shared float` in decomposed output:\n"
+        << source;
+
+    EXPECT_EQ(source.find("= shared_memory[0]"), std::string::npos)
+        << "Decomposed output kept an invalid whole-row shared-memory load:\n"
+        << source;
+}
+
+TEST_F(ProgramUtilTest, DecomposeWorkgroupVec3IgnoresNonWorkgroupVec3) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    String csSource = R"(#version 460 core
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) writeonly buffer OutputBuffer {
+    vec4 out_data[];
+};
+
+void main() {
+    vec3 local = vec3(1.0, 2.0, 3.0);
+    out_data[gl_GlobalInvocationID.x] = vec4(local, 1.0);
+}
+)";
+    PreprocessShaderSource(ShaderStage::Compute, csSource);
+
+    ShaderAttrib csAttrib{.shaderType = GL_COMPUTE_SHADER, .sourceStr = csSource};
+    auto csRes = ShaderCompiler::CompileShader(csAttrib);
+    if (!csRes) {
+        ASSERT_NE(csRes.error().errc, 0);
+        FAIL() << "errc: " << csRes.error().errc << "\nlog: " << csRes.error().log;
+    }
+
+    ProgramAttrib programAttrib{.shaders = {csRes.value()}};
+    auto programRes = ShaderCompiler::LinkProgram(programAttrib);
+    if (!programRes) {
+        ASSERT_NE(programRes.error().errc, 0);
+        FAIL() << "errc: " << programRes.error().errc << "\nlog: " << programRes.error().log;
+    }
+
+    ProgramBinaryAttrib binaryAttrib{
+        .shaderTypes = {GL_COMPUTE_SHADER},
+        .program = *programRes.value(),
+    };
+    auto binRes = ShaderCompiler::GetSpirvBinaryFromProgram(binaryAttrib);
+    ASSERT_TRUE(binRes.has_value());
+    ASSERT_FALSE(binRes->empty());
+
+    Vector<uint32_t> optimized;
+    ASSERT_TRUE(ShaderCompiler::SanitizeAndOptimizeBinary(binRes->at(0), optimized));
+}
+
+
+TEST_F(ProgramUtilTest, PreprocessCoercesBlockPackingQualifiersToStd140) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    // glslang rejects `packed`/`shared` outright when generating SPIR-V, and MobileGL's
+    // UBO layout is always std140 anyway; the preprocessor rewrites the qualifiers so the
+    // validation compile, reflection, and generated SPIR-V all agree on std140 (GL CTS
+    // KHR-GL33.shaders.uniform_block.*.packed/shared).
+    String source = R"(#version 330
+layout(packed) uniform PackedBlock { vec4 pv; };
+layout(shared, row_major) uniform SharedBlock { mat4 sm; };
+layout ( shared ) uniform SpacedBlock { float sx; };
+layout(std140) uniform KeptBlock { float kx; };
+// A non-layout use of the identifier stays untouched (compute storage qualifier).
+void main() {
+    gl_Position = pv + vec4(sm[0][0]) + vec4(sx) + vec4(kx);
+})";
+
+    PreprocessShaderSource(ShaderStage::Vertex, source);
+
+    EXPECT_EQ(source.find("packed"), String::npos);
+    EXPECT_EQ(source.find("layout(shared"), String::npos);
+    EXPECT_NE(source.find("layout(std140) uniform PackedBlock"), String::npos);
+    EXPECT_NE(source.find("layout(std140, row_major) uniform SharedBlock"), String::npos);
+    EXPECT_NE(source.find("layout ( std140 ) uniform SpacedBlock"), String::npos);
+    EXPECT_NE(source.find("layout(std140) uniform KeptBlock"), String::npos);
+
+    ShaderAttrib attrib{.shaderType = GL_VERTEX_SHADER,
+                        .sourceStr = source,
+                        .flags = ShaderCompileBits::CompileForOpenGL};
+    auto res = ShaderCompiler::CompileShader(attrib);
+    if (!res) {
+        FAIL() << "errc: " << res.error().errc << "\nlog: " << res.error().log << "\nsource:\n" << source;
+    }
+}
+
+TEST_F(ProgramUtilTest, PreprocessLeavesComputeSharedStorageQualifierAlone) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    // `shared` is only a packing qualifier inside layout(...); the compute-shader storage
+    // qualifier of the same spelling must survive.
+    String source = R"(#version 430
+layout(local_size_x = 8) in;
+shared float sharedScratch[8];
+layout(shared) uniform Blk { float bx; };
+void main() {
+    sharedScratch[gl_LocalInvocationIndex] = bx;
+})";
+
+    PreprocessShaderSource(ShaderStage::Compute, source);
+
+    EXPECT_NE(source.find("shared float sharedScratch[8];"), String::npos);
+    EXPECT_NE(source.find("layout(std140) uniform Blk"), String::npos);
 }

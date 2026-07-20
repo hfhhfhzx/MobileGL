@@ -58,9 +58,17 @@ namespace MobileGL {
 
         TextureInputFormat ConvertGLEnumToTextureInputFormat(GLenum format) {
             switch (format) {
+            // Legacy carve-out: GL_ALPHA stays mapped to Red so alpha-texture uploads keep landing in
+            // the R channel of the R8-backed storage (TexImage*_State pairs this with a 0,0,0,R
+            // swizzle). Readback of GL_ALPHA is corrected at the backend, which maps the raw enum to
+            // source channel 3 (DirectGLES GetReadbackChannelMapping).
             case GL_ALPHA:
             case GL_RED:
                 return TextureInputFormat::Red;
+            case GL_GREEN:
+                return TextureInputFormat::Green;
+            case GL_BLUE:
+                return TextureInputFormat::Blue;
             case GL_RG:
                 return TextureInputFormat::RG;
             case GL_RGB:
@@ -73,6 +81,12 @@ namespace MobileGL {
                 return TextureInputFormat::BGRA;
             case GL_RED_INTEGER:
                 return TextureInputFormat::RInteger;
+            case GL_GREEN_INTEGER:
+                return TextureInputFormat::GreenInteger;
+            case GL_BLUE_INTEGER:
+                return TextureInputFormat::BlueInteger;
+            case GL_ALPHA_INTEGER:
+                return TextureInputFormat::AlphaInteger;
             case GL_RG_INTEGER:
                 return TextureInputFormat::RGInteger;
             case GL_RGB_INTEGER:
@@ -117,6 +131,9 @@ namespace MobileGL {
             case GL_RGB4:
                 return TextureInternalFormat::RGB4;
             case GL_RGB5:
+            // GL_RGB565 (GL 4.1 / ARB_ES2_compatibility, used directly by the GL CTS) is the
+            // ES-facing rendition of the legacy RGB5 resolution.
+            case GL_RGB565:
                 return TextureInternalFormat::RGB5;
             case GL_RGB8:
                 return TextureInternalFormat::RGB8;
@@ -294,6 +311,8 @@ namespace MobileGL {
                 return TexturePixelDataType::UnsignedInt8888;
             case GL_UNSIGNED_INT_8_8_8_8_REV:
                 return TexturePixelDataType::UnsignedInt8888Rev;
+            case GL_UNSIGNED_INT_10_10_10_2:
+                return TexturePixelDataType::UnsignedInt1010102;
             case GL_UNSIGNED_INT_10F_11F_11F_REV:
                 return TexturePixelDataType::UnsignedInt101111Rev;
             case GL_UNSIGNED_INT_2_10_10_10_REV:

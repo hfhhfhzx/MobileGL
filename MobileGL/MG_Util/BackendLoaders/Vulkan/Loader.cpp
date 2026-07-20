@@ -8,8 +8,7 @@
 
 #include "Loader.h"
 
-#include <cstdlib>
-#include <cstring>
+#include <Config.h>
 
 namespace MobileGL::MG_Util::BackendLoader {
     namespace {
@@ -61,11 +60,7 @@ namespace MobileGL::MG_Util::BackendLoader {
         }
 
         Bool IsShaderSubgroupForcedDisabled() {
-            const char* value = std::getenv("MOBILEGL_DISABLE_SUBGROUP");
-            if (!value) {
-                return false;
-            }
-            return std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0;
+            return MG_Config::Features.DisableSubgroup;
         }
     } // namespace
 
@@ -129,6 +124,7 @@ namespace MobileGL::MG_Util::BackendLoader {
         caps.UniformBufferOffsetAlignment = static_cast<int>(p.limits.minUniformBufferOffsetAlignment);
         caps.AliasedLineWidthRangeMin = p.limits.lineWidthRange[0];
         caps.AliasedLineWidthRangeMax = p.limits.lineWidthRange[1];
+        caps.MaxSamplerAnisotropy = p.limits.maxSamplerAnisotropy;
         caps.SmoothLineWidthRangeMin = p.limits.lineWidthRange[0];
         caps.SmoothLineWidthRangeMax = p.limits.lineWidthRange[1];
         caps.SmoothLineWidthGranularity = p.limits.lineWidthGranularity;
@@ -213,6 +209,7 @@ namespace MobileGL::MG_Util::BackendLoader {
         caps.UniformBufferOffsetAlignment = static_cast<int>(properties.limits.minUniformBufferOffsetAlignment);
         caps.AliasedLineWidthRangeMin = properties.limits.lineWidthRange[0];
         caps.AliasedLineWidthRangeMax = properties.limits.lineWidthRange[1];
+        caps.MaxSamplerAnisotropy = properties.limits.maxSamplerAnisotropy;
         caps.SmoothLineWidthRangeMin = properties.limits.lineWidthRange[0];
         caps.SmoothLineWidthRangeMax = properties.limits.lineWidthRange[1];
         caps.SmoothLineWidthGranularity = properties.limits.lineWidthGranularity;

@@ -11,12 +11,18 @@
 
 namespace MobileGL::MG_Backend::DirectVulkan {
     struct VulkanRendererConfig {
-        Uint32 MaxFramesInFlight = 2;
+        // Fallback CPU pipeline depth used when the MOBILEGL_MAGMA_FRAMESINFLIGHT env var is
+        // unset/invalid. A deeper pipeline lets the CPU run further ahead of the GPU, hiding
+        // per-frame GPU-completion latency. Whatever value is chosen (env or this fallback) is
+        // only a request: VulkanRenderer::Initialize clamps it down to the surface's maxImageCount
+        // (and never below 2), since not every driver allows that many swapchain images.
+        Uint32 MaxFramesInFlight = 3;
         String AppName = "MobileGL-VulkanRenderer";
         MobileGL::Version Version = MG_Config::CoreVersion;
         Uint64 CacheVersion = MG_Config::CacheVersion;
         Uint32 SurfaceWidth = 1;
         Uint32 SurfaceHeight = 1;
+        Bool DisablePipelineCache = false;
 #if MOBILEGL_LOG_ACTIVE_LEVEL <= MOBILEGL_LOG_LEVEL_DEBUG
         Bool EnableValidationLayers = true;
 #else

@@ -21,6 +21,11 @@ class ITextureObject;
 namespace MobileGL::MG_Backend::DirectVulkan {
 class VkTextureManager {
 public:
+    // Monotonic epoch bumped whenever a texture VkImage is (re)created. The render-pass
+    // manager keys its per-draw fast path on this so an attachment's image recreation
+    // invalidates the cached render pass (dirty-flag tracking; portable to Vulkan 1.1).
+    Uint64 GetTextureImageEpoch() const { return m_textureImageEpoch; }
+
     struct TextureIdentity {
         MG_State::GLState::ITextureObject* texture = nullptr;
         Uint64 lifetimeId = 0;
@@ -92,6 +97,13 @@ public:
         VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D;
         VkSampleCountFlagBits sampleCount = VK_SAMPLE_COUNT_1_BIT;
         Uint16 syncedTextureParamsVersion = 0;
+        // Snapshot of ITextureObject::GetContentVersion() at the last successful sync;
+        // lets SyncTexture skip the whole re-check/re-upload when content is unchanged.
+        Uint64 syncedContentVersion = 0;
+        // Snapshot of the defined mip-level count at the last sync. Folded into the early-out key
+        // as defense-in-depth: any path that grows the level set (which resizes the sampled view)
+        // busts the skip even if it failed to bump the content version.
+        Uint32 syncedMipLevelCount = 0;
 
         TextureResource() = default;
         TextureResource(const TextureResource&) = delete;
@@ -115,6 +127,8 @@ public:
             std::swap(this->viewType, that.viewType);
             std::swap(this->sampleCount, that.sampleCount);
             std::swap(this->syncedTextureParamsVersion, that.syncedTextureParamsVersion);
+            std::swap(this->syncedContentVersion, that.syncedContentVersion);
+            std::swap(this->syncedMipLevelCount, that.syncedMipLevelCount);
         }
 
         void Reset() {
@@ -161,6 +175,8 @@ public:
             viewType = VK_IMAGE_VIEW_TYPE_2D;
             sampleCount = VK_SAMPLE_COUNT_1_BIT;
             syncedTextureParamsVersion = 0;
+            syncedContentVersion = 0;
+            syncedMipLevelCount = 0;
         }
 
         ~TextureResource() {
@@ -200,7 +216,33 @@ public:
                                Uint32 layerCount = 1);
 
     SizeT CollectGarbage();
+
+    // Per-draw sync memo. Within a single SetupDraw the same sampled texture is
+    // resolved ~3x (SetupDraw's layout-probe loop, its post-transition loop, and
+    // again inside ResolveSamplerDescriptor). No GL texture mutation can happen
+    // mid-SetupDraw, and layout is tracked on the TextureResource independently of
+    // SyncTexture, so after the first successful sync of a texture in a draw the
+    // heavy SyncTexture work (mip-completeness/resource/view resync + dirty scan)
+    // is pure redundancy. BeginDrawSyncScope opens a window in which repeat
+    // SyncTextureAndGetDescriptor calls short-circuit to the already-synced
+    // resource; EndDrawSyncScope closes it. Use the RAII DrawSyncScope guard.
+    void BeginDrawSyncScope();
+    void EndDrawSyncScope();
+
+    // RAII guard that opens/closes a per-draw sync memo window (see above).
+    class DrawSyncScope {
+    public:
+        explicit DrawSyncScope(VkTextureManager& manager) : m_manager(manager) { m_manager.BeginDrawSyncScope(); }
+        ~DrawSyncScope() { m_manager.EndDrawSyncScope(); }
+        DrawSyncScope(const DrawSyncScope&) = delete;
+        DrawSyncScope& operator=(const DrawSyncScope&) = delete;
+    private:
+        VkTextureManager& m_manager;
+    };
+
 private:
+    // Bumped in SyncTextureResource right after vmaCreateImage(texture). See GetTextureImageEpoch().
+    Uint64 m_textureImageEpoch = 1;
 
     Bool SyncTexture(MG_State::GLState::ITextureObject &texture,
                      TextureResource &outResource);
@@ -242,6 +284,18 @@ private:
     Uint32 m_currentFrameIndex = 0;
 
     Uint8 m_gcCounter = 0;
+    // Active only between BeginDrawSyncScope/EndDrawSyncScope; identities of
+    // textures already fully synced in the current draw (small N -> flat scan).
+    Bool m_drawSyncScopeActive = false;
+    // Per-draw sync memo: the identity plus the resolved resource pointer. The pointer is stable
+    // across rehash in the node-based m_textureResources and stays valid for the draw (a texture
+    // synced this draw is alive and is not erased mid-draw), so a repeat sync of the same texture
+    // returns the resource without re-hashing the identity into m_textureResources.
+    struct DrawSyncedTexture {
+        TextureIdentity identity;
+        TextureResource* resource = nullptr;
+    };
+    Vector<DrawSyncedTexture> m_drawSyncedThisDraw;
     std::unordered_map<TextureIdentity, WeakPtr<MG_State::GLState::ITextureObject>, TextureIdentityHash> m_aliveObjects;
     std::unordered_map<TextureIdentity, TextureResource, TextureIdentityHash> m_textureResources;
     Vector<Vector<TextureResource>> m_deferredReleases;

@@ -31,8 +31,19 @@ static const char* string_VkColorSpaceKHR(VkColorSpaceKHR) {
     return "VkColorSpaceKHR(unknown)";
 }
 
-static const char* string_VkPresentModeKHR(VkPresentModeKHR) {
-    return "VkPresentModeKHR(unknown)";
+static const char* string_VkPresentModeKHR(VkPresentModeKHR presentMode) {
+    switch (presentMode) {
+    case VK_PRESENT_MODE_IMMEDIATE_KHR:
+        return "VK_PRESENT_MODE_IMMEDIATE_KHR";
+    case VK_PRESENT_MODE_MAILBOX_KHR:
+        return "VK_PRESENT_MODE_MAILBOX_KHR";
+    case VK_PRESENT_MODE_FIFO_KHR:
+        return "VK_PRESENT_MODE_FIFO_KHR";
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+        return "VK_PRESENT_MODE_FIFO_RELAXED_KHR";
+    default:
+        return "VkPresentModeKHR(unknown)";
+    }
 }
 
 static const char* string_VkSurfaceTransformFlagBitsKHR(VkSurfaceTransformFlagBitsKHR) {
@@ -184,6 +195,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                                        swapchainCaps.minImageExtent.height,
                                                        swapchainCaps.maxImageExtent.height);
         }
+        const VkExtent2D defaultFramebufferExtent = createInfo.imageExtent;
         if (swapchainCaps.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
             swapchainCaps.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) {
             std::swap(createInfo.imageExtent.width, createInfo.imageExtent.height);
@@ -254,10 +266,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
         // Properly initialize Default FBO here
         auto& defaultFBOInfo = MG_Impl::GLImpl::FramebufferImpl::pDefaultFramebufferInfo;
-        const Int extentWidth = static_cast<Int>(createInfo.imageExtent.width);
-        const Int extentHeight = static_cast<Int>(createInfo.imageExtent.height);
+        const Int extentWidth = static_cast<Int>(defaultFramebufferExtent.width);
+        const Int extentHeight = static_cast<Int>(defaultFramebufferExtent.height);
         const SizeT defaultAttachmentByteSize =
-            static_cast<SizeT>(createInfo.imageExtent.width) * static_cast<SizeT>(createInfo.imageExtent.height) * 4;
+            static_cast<SizeT>(defaultFramebufferExtent.width) *
+            static_cast<SizeT>(defaultFramebufferExtent.height) * 4;
 
         auto* colorTex = static_cast<MG_State::GLState::TextureObject2D*>(defaultFBOInfo->colorAttachment.get());
         colorTex->AllocateStorage(
@@ -282,6 +295,30 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         auto* depthTex = static_cast<MG_State::GLState::TextureObject2D*>(defaultFBOInfo->depthAttachment.get());
         depthTex->SetInternalFormat(depthFormat);
         depthTex->AllocateStorage(TextureUploadTarget::Texture2D, 0, {
+            {extentWidth, extentHeight, 1},
+            defaultAttachmentByteSize}); // TODO: 4 is format size
+
+        // The default FBO's stencil attachment must track the swapchain extent:
+        // FramebufferObject::CheckCompleteness requires every valid attachment
+        // to share the same dimensions, and Init.cpp leaves a 512x512 placeholder.
+        // Without this the retrace-layer glReadPixels snapshot fails with
+        // GL_INVALID_FRAMEBUFFER_OPERATION on DirectVulkan.
+        TextureInternalFormat stencilFormat = TextureInternalFormat::Depth24Stencil8;
+        switch (m_depthStencilFormat) {
+            case VK_FORMAT_D32_SFLOAT_S8_UINT:
+                stencilFormat = TextureInternalFormat::Depth32FStencil8;
+                break;
+            case VK_FORMAT_D24_UNORM_S8_UINT:
+                stencilFormat = TextureInternalFormat::Depth24Stencil8;
+                break;
+            default:
+                // No stencil plane; mirror the depth format for consistency.
+                stencilFormat = depthFormat;
+                break;
+        }
+        auto* stencilTex = static_cast<MG_State::GLState::TextureObject2D*>(defaultFBOInfo->stencilAttachment.get());
+        stencilTex->SetInternalFormat(stencilFormat);
+        stencilTex->AllocateStorage(TextureUploadTarget::Texture2D, 0, {
             {extentWidth, extentHeight, 1},
             defaultAttachmentByteSize}); // TODO: 4 is format size
 

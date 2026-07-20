@@ -13,6 +13,9 @@ namespace MobileGL::MG_State::GLState {
         for (SizeT i = 0; i < m_bindingSlots.size(); ++i) {
             m_bindingSlots[i] = BindingSlot<BufferObject>(GlobalBufferTargets[i]);
         }
+        for (SizeT i = 0; i < m_touchedBindPointCount.size(); ++i) {
+            m_touchedBindPointCount[i] = 0;
+        }
     }
 
     const SharedPtr<BufferObject>& BufferState::GetBufferObject(Uint index) {
@@ -64,7 +67,9 @@ namespace MobileGL::MG_State::GLState {
                         }
                     }
                 }
-                m_bufferObjects.erase(it);
+                // Key-based erase skips FastSTL's successor-iterator scan, which is
+                // pure overhead here and dominates delete-heavy frames.
+                m_bufferObjects.erase(index);
             }
             m_indexGenerator.Delete(index);
         }

@@ -7,10 +7,12 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <thread>
 
 namespace {
 
@@ -87,6 +89,28 @@ void *Lookup(const char *name) {
     return dlsym(RTLD_DEFAULT, name);
 }
 
+void HoldAfterTargetPresent(const char *callNo) {
+    const char *holdMsText = std::getenv("MOBILEGL_TRACE_HOLD_MS");
+    if (holdMsText == nullptr || holdMsText[0] == '\0') {
+        return;
+    }
+    const int holdMs = std::atoi(holdMsText);
+    if (holdMs <= 0) {
+        return;
+    }
+    const char *holdDone = std::getenv("MOBILEGL_TRACE_HOLD_DONE");
+    if (holdDone != nullptr && std::strcmp(holdDone, "1") == 0) {
+        return;
+    }
+    const char *holdCall = std::getenv("MOBILEGL_TRACE_HOLD_CALL");
+    if (holdCall != nullptr && holdCall[0] != '\0' && std::strcmp(holdCall, callNo) != 0) {
+        return;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
+    setenv("MOBILEGL_TRACE_HOLD_DONE", "1", 1);
+}
+
 template <typename T>
 bool Load(T &slot, const char *name) {
     slot = reinterpret_cast<T>(Lookup(name));
@@ -159,22 +183,9 @@ public:
     void swapBuffers() override {
         if (surface != EGL_NO_SURFACE) {
             char callNo[32];
-            const char *overrideCallNo = getenv("MOBILEGL_TRACE_CURRENT_CALL_OVERRIDE");
-            if (overrideCallNo != nullptr && overrideCallNo[0] != '\0') {
-                snprintf(callNo, sizeof(callNo), "%s", overrideCallNo);
-            } else {
-                snprintf(callNo, sizeof(callNo), "%u", retrace::callNo);
-            }
-            const char *targetCall = getenv("MOBILEGL_PRESENT_DUMP_CALL");
-            const char *presentStats = getenv("MOBILEGL_PRESENT_STATS");
-            if (targetCall != nullptr && targetCall[0] != '\0' &&
-                presentStats != nullptr && presentStats[0] != '\0' && strcmp(presentStats, "0") != 0) {
-                std::cerr << "MOBILEGL_TRACE_SWAP call=" << callNo
-                          << " target=" << targetCall << "\n";
-            }
-            setenv("MOBILEGL_PRESENT_CURRENT_CALL", callNo, 1);
+            snprintf(callNo, sizeof(callNo), "%u", retrace::callNo);
             gEgl.swapBuffers(gDisplay, surface);
-            unsetenv("MOBILEGL_PRESENT_CURRENT_CALL");
+            HoldAfterTargetPresent(callNo);
         }
     }
 
@@ -240,7 +251,8 @@ public:
             attribs[index++] = EGL_CONTEXT_MINOR_VERSION_KHR;
             attribs[index++] = profile.major >= 3 ? profile.minor : 3;
             attribs[index++] = EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR;
-            attribs[index++] = EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR;
+            attribs[index++] = profile.core ? EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR
+                                            : EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR;
         }
         attribs[index++] = EGL_NONE;
 

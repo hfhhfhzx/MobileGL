@@ -8,14 +8,109 @@
 
 #include "PipelineFactory.h"
 
+
 namespace MobileGL::MG_Backend::DirectVulkan {
+    static const char* PrimitiveTopologyToString(VkPrimitiveTopology topology) {
+        switch (topology) {
+        ENUM_STR_CASE(VK_PRIMITIVE_TOPOLOGY_POINT_LIST)
+        ENUM_STR_CASE(VK_PRIMITIVE_TOPOLOGY_LINE_LIST)
+        ENUM_STR_CASE(VK_PRIMITIVE_TOPOLOGY_LINE_STRIP)
+        ENUM_STR_CASE(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+        ENUM_STR_CASE(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
+        ENUM_STR_CASE(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN)
+        ENUM_STR_CASE(VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY)
+        ENUM_STR_CASE(VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY)
+        ENUM_STR_CASE(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY)
+        ENUM_STR_CASE(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY)
+        ENUM_STR_CASE(VK_PRIMITIVE_TOPOLOGY_PATCH_LIST)
+        default:
+            return "VK_PRIMITIVE_TOPOLOGY_UNKNOWN";
+        }
+    }
+
+    static const char* SampleCountToString(VkSampleCountFlagBits sampleCount) {
+        switch (sampleCount) {
+        ENUM_STR_CASE(VK_SAMPLE_COUNT_1_BIT)
+        ENUM_STR_CASE(VK_SAMPLE_COUNT_2_BIT)
+        ENUM_STR_CASE(VK_SAMPLE_COUNT_4_BIT)
+        ENUM_STR_CASE(VK_SAMPLE_COUNT_8_BIT)
+        ENUM_STR_CASE(VK_SAMPLE_COUNT_16_BIT)
+        ENUM_STR_CASE(VK_SAMPLE_COUNT_32_BIT)
+        ENUM_STR_CASE(VK_SAMPLE_COUNT_64_BIT)
+        default:
+            return "VK_SAMPLE_COUNT_UNKNOWN";
+        }
+    }
+
+    static const char* CullModeToString(VkCullModeFlags cullMode) {
+        switch (cullMode) {
+        case VK_CULL_MODE_NONE:
+            return "VK_CULL_MODE_NONE";
+        case VK_CULL_MODE_FRONT_BIT:
+            return "VK_CULL_MODE_FRONT_BIT";
+        case VK_CULL_MODE_BACK_BIT:
+            return "VK_CULL_MODE_BACK_BIT";
+        case VK_CULL_MODE_FRONT_AND_BACK:
+            return "VK_CULL_MODE_FRONT_AND_BACK";
+        default:
+            return "VK_CULL_MODE_UNKNOWN";
+        }
+    }
+
+    static const char* CompareOpToString(VkCompareOp compareOp) {
+        switch (compareOp) {
+        ENUM_STR_CASE(VK_COMPARE_OP_NEVER)
+        ENUM_STR_CASE(VK_COMPARE_OP_LESS)
+        ENUM_STR_CASE(VK_COMPARE_OP_EQUAL)
+        ENUM_STR_CASE(VK_COMPARE_OP_LESS_OR_EQUAL)
+        ENUM_STR_CASE(VK_COMPARE_OP_GREATER)
+        ENUM_STR_CASE(VK_COMPARE_OP_NOT_EQUAL)
+        ENUM_STR_CASE(VK_COMPARE_OP_GREATER_OR_EQUAL)
+        ENUM_STR_CASE(VK_COMPARE_OP_ALWAYS)
+        default:
+            return "VK_COMPARE_OP_UNKNOWN";
+        }
+    }
+
+    static const char* LogicOpToString(VkLogicOp logicOp) {
+        switch (logicOp) {
+        ENUM_STR_CASE(VK_LOGIC_OP_CLEAR)
+        ENUM_STR_CASE(VK_LOGIC_OP_AND)
+        ENUM_STR_CASE(VK_LOGIC_OP_AND_REVERSE)
+        ENUM_STR_CASE(VK_LOGIC_OP_COPY)
+        ENUM_STR_CASE(VK_LOGIC_OP_AND_INVERTED)
+        ENUM_STR_CASE(VK_LOGIC_OP_NO_OP)
+        ENUM_STR_CASE(VK_LOGIC_OP_XOR)
+        ENUM_STR_CASE(VK_LOGIC_OP_OR)
+        ENUM_STR_CASE(VK_LOGIC_OP_NOR)
+        ENUM_STR_CASE(VK_LOGIC_OP_EQUIVALENT)
+        ENUM_STR_CASE(VK_LOGIC_OP_INVERT)
+        ENUM_STR_CASE(VK_LOGIC_OP_OR_REVERSE)
+        ENUM_STR_CASE(VK_LOGIC_OP_COPY_INVERTED)
+        ENUM_STR_CASE(VK_LOGIC_OP_OR_INVERTED)
+        ENUM_STR_CASE(VK_LOGIC_OP_NAND)
+        ENUM_STR_CASE(VK_LOGIC_OP_SET)
+        default:
+            return "VK_LOGIC_OP_UNKNOWN";
+        }
+    }
+
     PipelineFactory::PipelineFactory(VkDevice device, const VulkanRendererConfig& config):
         m_device(device), m_config(config) {
         MOBILEGL_ASSERT(m_device != VK_NULL_HANDLE, "PipelineFactory: device is null");
 
+        if (m_config.DisablePipelineCache) {
+            MGLOG_I("DirectVulkan: pipeline cache disabled");
+            return;
+        }
+
         VkPipelineCacheCreateInfo pipelineCacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         VK_VERIFY(vkCreatePipelineCache(m_device, &pipelineCacheInfo, nullptr, &m_pipelineCache),
                   "vkCreatePipelineCache");
+    }
+
+    void PipelineFactory::SetSuppressBlendedDepthWrite(Bool enabled) {
+        s_suppressBlendedDepthWrite = enabled;
     }
 
     PipelineFactory::~PipelineFactory() {
@@ -36,6 +131,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         XXHASH_VERIFY(XXH64_update(m_hashState, &payload.rasterizationSamples, sizeof(payload.rasterizationSamples)));
         XXHASH_VERIFY(XXH64_update(m_hashState, &payload.subpass, sizeof(payload.subpass)));
         XXHASH_VERIFY(XXH64_update(m_hashState, &payload.topology, sizeof(payload.topology)));
+        XXHASH_VERIFY(
+            XXH64_update(m_hashState, &payload.primitiveRestartEnable, sizeof(payload.primitiveRestartEnable)));
+        XXHASH_VERIFY(XXH64_update(m_hashState, &payload.polygonMode, sizeof(payload.polygonMode)));
         XXHASH_VERIFY(XXH64_update(m_hashState, &payload.cullMode, sizeof(payload.cullMode)));
         XXHASH_VERIFY(XXH64_update(m_hashState, &payload.frontFace, sizeof(payload.frontFace)));
         XXHASH_VERIFY(XXH64_update(m_hashState, &payload.depthTestEnable, sizeof(payload.depthTestEnable)));
@@ -121,13 +219,14 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         ia.topology = payload.topology;
+        ia.primitiveRestartEnable = payload.primitiveRestartEnable ? VK_TRUE : VK_FALSE;
 
         VkPipelineViewportStateCreateInfo vpci{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         vpci.viewportCount = 1;
         vpci.scissorCount = 1;
 
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-        raster.polygonMode = VK_POLYGON_MODE_FILL;
+        raster.polygonMode = payload.polygonMode;
         raster.cullMode = payload.cullMode;
         raster.frontFace = payload.frontFace;
         raster.depthBiasEnable = payload.depthBiasEnable ? VK_TRUE : VK_FALSE;
@@ -164,6 +263,18 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         for (Uint32 i = 0; i < payload.colorAttachmentCount; ++i) {
             colorAttachments[i] = payload.colorBlendAttachments[i];
         }
+        // Suppress depth writes on blended pipelines when the active driver cannot keep
+        // vertex positions invariant across the pipelines of a multi-pass depth-equality
+        // chain (see SetSuppressBlendedDepthWrite). Blended draws that write depth are rare
+        // and the equality-dependent prepass pattern is exactly the case that breaks.
+        if (s_suppressBlendedDepthWrite && depthStencil.depthWriteEnable == VK_TRUE) {
+            for (Uint32 i = 0; i < payload.colorAttachmentCount; ++i) {
+                if (colorAttachments[i].blendEnable == VK_TRUE) {
+                    depthStencil.depthWriteEnable = VK_FALSE;
+                    break;
+                }
+            }
+        }
         VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         blend.logicOpEnable = payload.logicOpEnable ? VK_TRUE : VK_FALSE;
         blend.logicOp = payload.logicOp;
@@ -186,8 +297,52 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         gpi.subpass = payload.subpass;
 
         VkPipeline pipeline = VK_NULL_HANDLE;
-        VK_VERIFY(vkCreateGraphicsPipelines(m_device, m_pipelineCache, 1, &gpi, nullptr, &pipeline),
-                  "vkCreateGraphicsPipelines");
+        const VkResult result = vkCreateGraphicsPipelines(m_device, m_pipelineCache, 1, &gpi, nullptr, &pipeline);
+        if (result != VK_SUCCESS) {
+            MGLOG_F("PipelineFactory::CreatePipeline failed: result=%s (%d) programHash=0x%llx vertexInputHash=0x%llx stageCount=%u topology=%s(%d) colorAttachmentCount=%u samples=%s(%d) subpass=%u",
+                    VkResultToString(result),
+                    result,
+                    static_cast<unsigned long long>(payload.programHash),
+                    static_cast<unsigned long long>(payload.vertexInputHash),
+                    gpi.stageCount,
+                    PrimitiveTopologyToString(payload.topology),
+                    payload.topology,
+                    payload.colorAttachmentCount,
+                    SampleCountToString(payload.rasterizationSamples),
+                    payload.rasterizationSamples,
+                    payload.subpass);
+            MGLOG_F("PipelineFactory::CreatePipeline state: cullMode=%s(0x%x) frontFace=%d depthTest=%d depthWrite=%d depthCompare=%s(%d) depthBias=%d rasterizerDiscard=%d stencilTest=%d logicOpEnable=%d logicOp=%s(%d)",
+                    CullModeToString(payload.cullMode),
+                    static_cast<Uint32>(payload.cullMode),
+                    payload.frontFace,
+                    payload.depthTestEnable ? 1 : 0,
+                    payload.depthWriteEnable ? 1 : 0,
+                    CompareOpToString(payload.depthCompareOp),
+                    payload.depthCompareOp,
+                    payload.depthBiasEnable ? 1 : 0,
+                    payload.rasterizerDiscardEnable ? 1 : 0,
+                    payload.stencilTestEnable ? 1 : 0,
+                    payload.logicOpEnable ? 1 : 0,
+                    LogicOpToString(payload.logicOp),
+                    payload.logicOp);
+            MGLOG_F("PipelineFactory::CreatePipeline vertex input: bindingCount=%u attributeCount=%u",
+                    payload.vertexInputState->vertexBindingDescriptionCount,
+                    payload.vertexInputState->vertexAttributeDescriptionCount);
+            for (Uint32 i = 0; i < payload.colorAttachmentCount; ++i) {
+                const auto& attachment = payload.colorBlendAttachments[i];
+                MGLOG_F("PipelineFactory::CreatePipeline colorAttachment[%u]: blend=%d colorWriteMask=0x%x srcColor=%d dstColor=%d colorOp=%d srcAlpha=%d dstAlpha=%d alphaOp=%d",
+                        i,
+                        attachment.blendEnable == VK_TRUE ? 1 : 0,
+                        static_cast<Uint32>(attachment.colorWriteMask),
+                        attachment.srcColorBlendFactor,
+                        attachment.dstColorBlendFactor,
+                        attachment.colorBlendOp,
+                        attachment.srcAlphaBlendFactor,
+                        attachment.dstAlphaBlendFactor,
+                        attachment.alphaBlendOp);
+            }
+        }
+        VK_VERIFY(result, "vkCreateGraphicsPipelines");
         return pipeline;
     }
 } // namespace MobileGL::MG_Backend::DirectVulkan

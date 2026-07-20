@@ -7,6 +7,7 @@
 // End of Source File Header
 
 #include "TextureObject.h"
+#include "MG_State/GLState/Core.h"
 #include "MG_Util/Types.h"
 #include <MG_Util/Metrics/TextureMetrics.h>
 
@@ -52,6 +53,20 @@ namespace MobileGL {
             void TextureObjectBase::SetInternalFormat(TextureInternalFormat format) {
                 if (format == m_internalFormat) return;
 
+                // A default texture (name 0) changes IsUndefinedDefaultTexture on the
+                // Unknown<->defined transition, which changes per-draw sampled-set membership
+                // without any bind happening; bump the bind generation so cached sampled sets
+                // re-resolve instead of replaying the stale membership. The identity check
+                // excludes the other externalIndex-0 objects (proxy textures, default-FBO
+                // attachments) whose definedness never feeds sampled-set membership, so e.g.
+                // proxy probes cannot churn the cache.
+                if (m_externalIndex == 0 && pGLContext &&
+                    (m_internalFormat == TextureInternalFormat::Unknown) !=
+                        (format == TextureInternalFormat::Unknown) &&
+                    pGLContext->GetDefaultTextureObject(GetTarget()).get() == this) {
+                    pGLContext->BumpTextureBindGeneration();
+                }
+
                 m_internalFormat = format;
                 ++m_textureParamsVersion;
             }
@@ -68,6 +83,40 @@ namespace MobileGL {
                 if (color == m_borderColor) return;
 
                 m_borderColor = color;
+                m_borderColorI = IntVec4(static_cast<Int32>(color.x()), static_cast<Int32>(color.y()),
+                                         static_cast<Int32>(color.z()), static_cast<Int32>(color.w()));
+                m_borderColorUI = UintVec4(static_cast<Uint32>(color.x()), static_cast<Uint32>(color.y()),
+                                           static_cast<Uint32>(color.z()), static_cast<Uint32>(color.w()));
+                ++m_textureParamsVersion;
+            }
+
+            const IntVec4& TextureObjectBase::GetBorderColorI() const {
+                return m_borderColorI;
+            }
+
+            void TextureObjectBase::SetBorderColorI(const IntVec4& color) {
+                if (color == m_borderColorI) return;
+
+                m_borderColorI = color;
+                m_borderColorUI = UintVec4(static_cast<Uint32>(color.x()), static_cast<Uint32>(color.y()),
+                                           static_cast<Uint32>(color.z()), static_cast<Uint32>(color.w()));
+                m_borderColor = FloatVec4(static_cast<Float>(color.x()), static_cast<Float>(color.y()),
+                                          static_cast<Float>(color.z()), static_cast<Float>(color.w()));
+                ++m_textureParamsVersion;
+            }
+
+            const UintVec4& TextureObjectBase::GetBorderColorUI() const {
+                return m_borderColorUI;
+            }
+
+            void TextureObjectBase::SetBorderColorUI(const UintVec4& color) {
+                if (color == m_borderColorUI) return;
+
+                m_borderColorUI = color;
+                m_borderColorI = IntVec4(static_cast<Int32>(color.x()), static_cast<Int32>(color.y()),
+                                         static_cast<Int32>(color.z()), static_cast<Int32>(color.w()));
+                m_borderColor = FloatVec4(static_cast<Float>(color.x()), static_cast<Float>(color.y()),
+                                          static_cast<Float>(color.z()), static_cast<Float>(color.w()));
                 ++m_textureParamsVersion;
             }
 
@@ -128,21 +177,57 @@ namespace MobileGL {
             }
 
             void TextureObjectBase::SetBaseLevel(Uint baseLevel) {
+                if (IsImmutable() && m_immutableLevels > 0) {
+                    baseLevel = std::min(baseLevel, m_immutableLevels - 1);
+                }
                 if (baseLevel == m_levelRange.x()) return;
 
                 m_levelRange.x() = baseLevel;
+                if (IsImmutable() && m_levelRange.y() < m_levelRange.x()) {
+                    m_levelRange.y() = m_levelRange.x();
+                }
                 ++m_textureParamsVersion;
             }
 
             void TextureObjectBase::SetMaxLevel(Uint maxLevel) {
+                if (IsImmutable() && m_immutableLevels > 0) {
+                    maxLevel = std::min(std::max(maxLevel, m_levelRange.x()), m_immutableLevels - 1);
+                }
                 if (maxLevel == m_levelRange.y()) return;
 
                 m_levelRange.y() = maxLevel;
                 ++m_textureParamsVersion;
             }
 
+            Bool TextureObjectBase::IsImmutable() const {
+                return m_immutableLevels > 0;
+            }
+
+            Uint TextureObjectBase::GetImmutableLevels() const {
+                return m_immutableLevels;
+            }
+
+            void TextureObjectBase::SetImmutableLevels(Uint levels) {
+                if (m_immutableLevels == levels) return;
+
+                m_immutableLevels = levels;
+                if (m_immutableLevels > 0) {
+                    m_levelRange.x() = std::min(m_levelRange.x(), m_immutableLevels - 1);
+                    m_levelRange.y() = std::min(std::max(m_levelRange.y(), m_levelRange.x()), m_immutableLevels - 1);
+                }
+                ++m_textureParamsVersion;
+            }
+
             Uint16 TextureObjectBase::GetTextureParamsVersion() const {
                 return m_textureParamsVersion;
+            }
+
+            Uint64 TextureObjectBase::GetContentVersion() const {
+                return m_contentVersion;
+            }
+
+            void TextureObjectBase::BumpContentVersion() {
+                ++m_contentVersion;
             }
 
             Int TextureObjectBase::GetSamples() const {
@@ -151,6 +236,7 @@ namespace MobileGL {
 
             void TextureObjectBase::SetSamples(Int samples) {
                 m_samples = samples;
+                ++m_textureParamsVersion;
             }
 
             Bool TextureObjectBase::HasFixedSampleLocations() const {
@@ -159,6 +245,7 @@ namespace MobileGL {
 
             void TextureObjectBase::SetFixedSampleLocations(Bool fixedSampleLocations) {
                 m_fixedSampleLocations = fixedSampleLocations;
+                ++m_textureParamsVersion;
             }
 
             Uint64 TextureObjectBase::GetLifetimeId() const {
@@ -195,6 +282,9 @@ namespace MobileGL {
 
             void TextureObjectWithOneMipmap::MarkStorageDirty(TextureUploadTarget uploadTarget, Uint mipmapLevel,
                                                               Bool dirty) {
+                if (dirty) {
+                    ++m_contentVersion;
+                }
                 m_textureStorage.MarkDirty(GetIndexOfTextureUploadTarget(uploadTarget), mipmapLevel, dirty);
             }
 

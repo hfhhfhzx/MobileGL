@@ -26,7 +26,12 @@ namespace MobileGL {
                 }
             } // namespace
 
-            RenderState::RenderState() {}
+            RenderState::RenderState() {
+                // The color writemask defaults to all-true for every draw buffer.
+                for (auto& mask : m_parameters.ColorMasks) {
+                    mask = BoolVec4(true, true, true, true);
+                }
+            }
 
             Uint RenderState::GetVersion() const {
                 return m_version;
@@ -57,6 +62,85 @@ namespace MobileGL {
 
             Float RenderState::GetLineWidth() const {
                 return m_parameters.LineWidth;
+            }
+
+            void RenderState::SetHint(GLenum target, GLenum mode) {
+                GLenum* slot = nullptr;
+                switch (target) {
+                case GL_LINE_SMOOTH_HINT: slot = &m_parameters.LineSmoothHint; break;
+                case GL_POLYGON_SMOOTH_HINT: slot = &m_parameters.PolygonSmoothHint; break;
+                case GL_TEXTURE_COMPRESSION_HINT: slot = &m_parameters.TextureCompressionHint; break;
+                case GL_FRAGMENT_SHADER_DERIVATIVE_HINT: slot = &m_parameters.FragmentShaderDerivativeHint; break;
+                default: return;
+                }
+                if (*slot == mode) return;
+                *slot = mode;
+                ++m_version;
+            }
+
+            GLenum RenderState::GetHint(GLenum target) const {
+                switch (target) {
+                case GL_LINE_SMOOTH_HINT: return m_parameters.LineSmoothHint;
+                case GL_POLYGON_SMOOTH_HINT: return m_parameters.PolygonSmoothHint;
+                case GL_TEXTURE_COMPRESSION_HINT: return m_parameters.TextureCompressionHint;
+                case GL_FRAGMENT_SHADER_DERIVATIVE_HINT: return m_parameters.FragmentShaderDerivativeHint;
+                default: return GL_DONT_CARE;
+                }
+            }
+
+            void RenderState::SetPointFadeThresholdSize(Float size) {
+                if (m_parameters.PointFadeThresholdSize == size) return;
+                m_parameters.PointFadeThresholdSize = size;
+                ++m_version;
+            }
+
+            Float RenderState::GetPointFadeThresholdSize() const {
+                return m_parameters.PointFadeThresholdSize;
+            }
+
+            void RenderState::SetPointSpriteCoordOrigin(GLenum origin) {
+                if (m_parameters.PointSpriteCoordOrigin == origin) return;
+                m_parameters.PointSpriteCoordOrigin = origin;
+                ++m_version;
+            }
+
+            GLenum RenderState::GetPointSpriteCoordOrigin() const {
+                return m_parameters.PointSpriteCoordOrigin;
+            }
+
+            void RenderState::SetClampReadColor(GLenum clamp) {
+                if (m_parameters.ClampReadColor == clamp) return;
+                m_parameters.ClampReadColor = clamp;
+                ++m_version;
+            }
+
+            GLenum RenderState::GetClampReadColor() const {
+                return m_parameters.ClampReadColor;
+            }
+
+            void RenderState::SetPolygonMode(GLenum front, GLenum back) {
+                if (m_parameters.PolygonModeFront == front && m_parameters.PolygonModeBack == back) return;
+                m_parameters.PolygonModeFront = front;
+                m_parameters.PolygonModeBack = back;
+                ++m_version;
+            }
+
+            GLenum RenderState::GetPolygonModeFront() const {
+                return m_parameters.PolygonModeFront;
+            }
+
+            GLenum RenderState::GetPolygonModeBack() const {
+                return m_parameters.PolygonModeBack;
+            }
+
+            void RenderState::SetPrimitiveRestartIndex(Uint32 index) {
+                if (m_parameters.PrimitiveRestartIndex == index) return;
+                m_parameters.PrimitiveRestartIndex = index;
+                ++m_version;
+            }
+
+            Uint32 RenderState::GetPrimitiveRestartIndex() const {
+                return m_parameters.PrimitiveRestartIndex;
             }
 
             void RenderState::SetPointSize(Float size) {
@@ -368,14 +452,30 @@ namespace MobileGL {
 
             // -------------------- Color Mask --------------------
             void RenderState::SetColorMask(BoolVec4 mask) {
-                if (m_parameters.ColorMask == mask) return;
-
-                m_parameters.ColorMask = mask;
-                ++m_version;
+                // glColorMask broadcasts the same mask to every draw buffer.
+                Bool changed = false;
+                for (auto& slot : m_parameters.ColorMasks) {
+                    if (!(slot == mask)) {
+                        slot = mask;
+                        changed = true;
+                    }
+                }
+                if (changed) ++m_version;
             }
 
             BoolVec4 RenderState::GetColorMask() const {
-                return m_parameters.ColorMask;
+                // Non-indexed query reports draw buffer 0.
+                return m_parameters.ColorMasks[0];
+            }
+
+            void RenderState::SetColorMaskIndexed(Uint index, BoolVec4 mask) {
+                if (m_parameters.ColorMasks[index] == mask) return;
+                m_parameters.ColorMasks[index] = mask;
+                ++m_version;
+            }
+
+            BoolVec4 RenderState::GetColorMaskIndexed(Uint index) const {
+                return m_parameters.ColorMasks[index];
             }
 
             // -------------------- Clear State --------------------

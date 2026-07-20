@@ -6,8 +6,11 @@ option(MOBILEGL_BUILD_TEST        "Build MobileGL tests"                        
 option(MOBILEGL_BUILD_BENCHMARK   "Build MobileGL benchmarks"                        ON )
 option(MOBILEGL_FORCE_RELEASE_OPT "Enable Release optimization flags in Debug build" ON )
 option(MOBILEGL_ENABLE_TRACY      "Enable tracy for profiling"                       OFF)
-option(MOBILEGL_BUILD_TRACE_REPLAY "Build Linux apitrace replay runner"              OFF)
+option(MOBILEGL_BUILD_TRACE_REPLAY "Build desktop apitrace replay runner"            OFF)
+option(MOBILEGL_TRACE_ANGLE_VARIANTS "Enable signed trace-APK ANGLE variant loading" OFF)
+option(MOBILEGL_IOS               "Build MobileGL for iOS instead of macOS when APPLE is set" OFF)
 set(MOBILEGL_LOG_ACTIVE_LEVEL "MOBILEGL_LOG_LEVEL_INFO" CACHE STRING "MobileGL active log level macro")
+set(MOBILEGL_VULKAN_LIBRARY "" CACHE FILEPATH "Vulkan loader/MoltenVK library to link for iOS builds")
 
 if (ANDROID)
     set(MOBILEGL_BUILD_TEST       OFF CACHE BOOL "Build MobileGL tests"      FORCE)
@@ -183,9 +186,16 @@ set(SOURCE_FILES
     MobileGL/MG_Util/ShaderTranspiler/glslang/TMglGlslIoResolver.cpp
     MobileGL/MG_Util/ShaderTranspiler/SpirvPasses/FlattenInterfaceStructPass.cpp
     MobileGL/MG_Util/ShaderTranspiler/SpirvPasses/EliminateFloatEqualsZeroPass.cpp
+    MobileGL/MG_Util/ShaderTranspiler/SpirvPasses/RenameSamplerFunctionParameterPass.cpp
+    MobileGL/MG_Util/ShaderTranspiler/SpirvPasses/DecomposeWorkgroupVec3Pass.cpp
+    MobileGL/MG_Util/ShaderTranspiler/SpirvPasses/LowerDrawParametersPass.cpp
+    MobileGL/MG_Util/ShaderTranspiler/SpirvPasses/RebaseInstanceIndexPass.cpp
+    MobileGL/MG_Util/ShaderTranspiler/SpirvPasses/StripUboMemberRelaxedPrecisionPass.cpp
 
     MobileGL/MG_Util/BackendLoaders/OpenGL/Loader.cpp
     MobileGL/MG_Util/BackendLoaders/Vulkan/Loader.cpp
+
+    MobileGL/MG_Util/SelfTest/DriverPost.cpp
 
     MobileGL/MG_Util/Texture/PixelStoreProcessor.cpp
     MobileGL/MG_Util/Texture/TextureFormatProcessor.cpp
@@ -214,6 +224,7 @@ set(SOURCE_FILES
     MobileGL/MG_Impl/GLImpl/Exporting/Definitions.cpp
     MobileGL/MG_Impl/GLImpl/Getter/GL_Getter.cpp
     MobileGL/MG_Impl/GLImpl/Sync/GL_Sync.cpp
+    MobileGL/MG_Impl/GLImpl/Query/GL_Query.cpp
 
     MobileGL/MG_Impl/Init.cpp
     MobileGL/MG_Impl/GetProcAddress.cpp
@@ -241,6 +252,7 @@ set(SOURCE_FILES
     MobileGL/MG_Backend/DirectVulkan/Renderer/VertexInputStateFactory.cpp
     MobileGL/MG_Backend/DirectVulkan/Renderer/VkBufferObject.cpp
     MobileGL/MG_Backend/DirectVulkan/Renderer/VkTextureManager.cpp
+    MobileGL/MG_Backend/DirectVulkan/Renderer/VkTimerQueryManager.cpp
     MobileGL/MG_Backend/DirectVulkan/Renderer/VkSamplerManager.cpp
     MobileGL/MG_Backend/DirectVulkan/Renderer/VkClearManager.cpp
     MobileGL/MG_Backend/DirectVulkan/Renderer/VkRenderPassManager.cpp
@@ -272,6 +284,21 @@ set(SOURCE_FILES
     MobileGL/MG_State/GLState/RenderbufferState/RenderbufferObject.cpp
     MobileGL/MG_State/GLState/RenderbufferState/RenderbufferState.cpp
 )
+
+if (APPLE AND NOT MOBILEGL_IOS)
+    list(APPEND SOURCE_FILES
+        MobileGL/MG_Impl/CGLImpl/CGLImpl.cpp
+        MobileGL/MG_Impl/CGLImpl/Exporting/Definitions.cpp
+        MobileGL/MG_Impl/DyldInterpose/DyldInterpose.cpp
+        MobileGL/MG_Impl/NSOpenGLImpl/NSOpenGLImpl.cpp
+    )
+endif()
+
+if (ANDROID)
+    list(APPEND SOURCE_FILES
+        MobileGL/MG_Util/SelfTest/DriverPostJni.cpp
+    )
+endif()
 
 set(MOBILEGL_LINK_LIBRARIES
         glslang::glslang
@@ -332,7 +359,20 @@ target_compile_definitions(${CMAKE_PROJECT_NAME}
         PUBLIC
         ${MOBILEGL_COMPILE_DEF}
         MOBILEGL_LOG_ACTIVE_LEVEL=${MOBILEGL_LOG_ACTIVE_LEVEL}
+        $<$<BOOL:${MOBILEGL_TRACE_ANGLE_VARIANTS}>:MOBILEGL_TRACE_ANGLE_VARIANTS=1>
 )
+
+if(UNIX AND NOT APPLE AND NOT ANDROID)
+    foreach(MOBILEGL_LOADER_ALIAS
+            libEGL.so libEGL.so.1)
+        add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E create_symlink
+                    "$<TARGET_FILE_NAME:${CMAKE_PROJECT_NAME}>"
+                    "$<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>/${MOBILEGL_LOADER_ALIAS}"
+            COMMENT "Creating ${MOBILEGL_LOADER_ALIAS} alias for Linux GL/EGL loaders"
+        )
+    endforeach()
+endif()
 
 if(NOT ANDROID)
     add_library(${CMAKE_PROJECT_NAME}_s STATIC 
@@ -384,7 +424,48 @@ if (ANDROID)
     )
 endif()
 
-if (NOT ANDROID)
+if (APPLE AND NOT MOBILEGL_IOS)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
+        "-framework Cocoa"
+        "-framework QuartzCore"
+        "-framework Foundation"
+        "-framework OpenGL"
+        objc)
+    if(TARGET ${CMAKE_PROJECT_NAME}_s)
+        target_link_libraries(${CMAKE_PROJECT_NAME}_s PUBLIC
+            "-framework Cocoa"
+            "-framework QuartzCore"
+            "-framework Foundation"
+            "-framework OpenGL"
+            objc)
+    endif()
+endif()
+
+if (APPLE AND MOBILEGL_IOS)
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PUBLIC MOBILEGL_IOS=1 _LIBCPP_DISABLE_AVAILABILITY)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
+        "-framework CoreGraphics"
+        "-framework Foundation"
+        "-framework QuartzCore"
+        objc)
+    if (MOBILEGL_VULKAN_LIBRARY)
+        target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC "${MOBILEGL_VULKAN_LIBRARY}")
+    endif()
+
+    if(TARGET ${CMAKE_PROJECT_NAME}_s)
+        target_compile_definitions(${CMAKE_PROJECT_NAME}_s PUBLIC MOBILEGL_IOS=1 _LIBCPP_DISABLE_AVAILABILITY)
+        target_link_libraries(${CMAKE_PROJECT_NAME}_s PUBLIC
+            "-framework CoreGraphics"
+            "-framework Foundation"
+            "-framework QuartzCore"
+            objc)
+        if (MOBILEGL_VULKAN_LIBRARY)
+            target_link_libraries(${CMAKE_PROJECT_NAME}_s PUBLIC "${MOBILEGL_VULKAN_LIBRARY}")
+        endif()
+    endif()
+endif()
+
+if (NOT ANDROID AND NOT MOBILEGL_IOS)
     find_package(Vulkan)
     if (Vulkan_FOUND)
         target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC Vulkan::Vulkan Vulkan::Headers)
@@ -392,6 +473,17 @@ if (NOT ANDROID)
         target_include_directories(${CMAKE_PROJECT_NAME} PUBLIC ${Vulkan_INCLUDE_DIR})
         target_include_directories(${CMAKE_PROJECT_NAME}_s PUBLIC ${Vulkan_INCLUDE_DIR})
     endif ()
+endif ()
+
+if (NOT ANDROID)
+    # Enable testing in the top-level scope so a CTestTestfile.cmake is emitted
+    # at the build-tree root. This lets `ctest` be invoked from the top-level
+    # build directory (IDE "run all tests", CI) and discover every test in the
+    # subdirectories below, instead of having to descend into each
+    # MG_Test/MG_Benchmark subdirectory. Tests are tagged with CTest labels
+    # (unit / benchmark / integration), so e.g. `ctest -L unit` selects just
+    # the unit suite.
+    enable_testing()
 
     if (MOBILEGL_BUILD_TEST)
         add_subdirectory(MobileGL/MG_Test)
@@ -402,7 +494,6 @@ if (NOT ANDROID)
     endif()
 
     if (MOBILEGL_BUILD_TRACE_REPLAY)
-        enable_testing()
         add_subdirectory(tools/trace_replay)
     endif()
 endif()

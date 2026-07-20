@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace mobilegl_trace {
 
@@ -17,10 +18,12 @@ enum StatusCode {
 struct Request {
     std::string tracePath;
     std::string goldenPath;
+    std::vector<std::string> alternateGoldenPaths;
     std::string outputDir;
     std::string diffPath;
     std::string backend;
     std::string mobileGlLibrary = "libMobileGL.so";
+    std::string angleVariant;
     int targetFrame = -1;
     long long targetCall = -1;
     int width = 0;
@@ -29,8 +32,12 @@ struct Request {
     int cropY = 0;
     int cropWidth = 0;
     int cropHeight = 0;
-    int tolerance = 0;
-    int fuzzPercent = 20;
+    double ssimThreshold = 0.99;
+    bool useAngle = false;
+    bool usePbuffer = true;
+    bool avoidAngleLlvmpipeSamplerMipmapMinFilter = false;
+    bool coherentAsFlush = false;
+    int holdMs = 0;
 };
 
 struct Result {
@@ -40,6 +47,8 @@ struct Result {
     std::string resultPath;
     std::string actualPath;
     std::string diffPath;
+    std::string matchedGoldenPath;
+    double ssim = -1.0;
     long long mismatchPixels = -1;
 };
 

@@ -12,13 +12,19 @@
 #include "MG_Util/Converters/MGToStr/TextureEnumConverter.h"
 #include "MG_Util/Converters/MGToVk/TextureEnumConverter.h"
 
+#include <Config.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 
 namespace MobileGL::MG_Backend::DirectVulkan {
-    static constexpr VkPipelineStageFlags kGraphicsSampledReadStages = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+    // Compute shaders may legally sample framebuffer-attached textures (the GL feedback-loop rule
+    // only covers rendering commands; e.g. Flywheel's Hi-Z depth pyramid downsample samples the
+    // depth attachment of the bound draw framebuffer), so sampled-read barriers must cover the
+    // compute stage in addition to the graphics stages.
+    static constexpr VkPipelineStageFlags kSampledReadStages =
+        VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 
     static Uint32 ComputeFullMipLevelCount(const IntVec3& baseTexelSize) {
         Int maxDimension = std::max<Int>(baseTexelSize.x(),
@@ -45,6 +51,10 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         Uint32 depth = 1;
         Uint32 arrayLayers = 1;
     };
+
+    static Bool IsR11G11B10FFallbackEnabled() {
+        return MG_Config::Features.MagmaR11G11B10FFallback;
+    }
 
     static Bool IsMultisampleTextureUploadTarget(TextureUploadTarget target) {
         return target == TextureUploadTarget::Texture2DMultisample ||
@@ -137,7 +147,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL:
         case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL:
         case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-            outSrcStageMask = kGraphicsSampledReadStages;
+            outSrcStageMask = kSampledReadStages;
             outSrcAccessMask = VK_ACCESS_SHADER_READ_BIT;
             return;
         case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
@@ -185,7 +195,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL:
         case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL:
         case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-            outDstStageMask = kGraphicsSampledReadStages;
+            outDstStageMask = kSampledReadStages;
             outDstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             return;
         case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
@@ -320,6 +330,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             return {VK_FORMAT_R16G16B16A16_SNORM, true, 2, {0xFF, 0x7F, 0x00, 0x00}};
         case TextureInternalFormat::RGB16F:
             return {VK_FORMAT_R16G16B16A16_SFLOAT, true, 2, {0x00, 0x3C, 0x00, 0x00}};
+        case TextureInternalFormat::R11FG11FB10F:
+            if (IsR11G11B10FFallbackEnabled()) {
+                return {VK_FORMAT_R16G16B16A16_SFLOAT, true, 2, {0x00, 0x3C, 0x00, 0x00}};
+            }
+            return {MG_Util::ConvertTextureInternalFormatToVkEnum(format), false, 0, {0, 0, 0, 0}};
         case TextureInternalFormat::RGB32F:
             return {VK_FORMAT_R32G32B32A32_SFLOAT, true, 4, {0x00, 0x00, 0x80, 0x3F}};
         case TextureInternalFormat::RGB8I:
@@ -368,106 +383,6 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return true;
     }
 
-    static Bool ShouldDumpTextureUploadStats() {
-        static const Bool enabled = [] {
-            const char* value = std::getenv("MOBILEGL_TEXTURE_UPLOAD_STATS");
-            return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-        }();
-        return enabled;
-    }
-
-    static void DumpTextureSyncStats(Int textureId, TextureInternalFormat format, TextureUploadTarget uploadTarget,
-                                     Uint32 mipLevelCount, const IntVec3& texelSize, SizeT byteSize,
-                                     Bool hasDirtyMipLevel) {
-        if (!ShouldDumpTextureUploadStats()) {
-            return;
-        }
-
-        std::fprintf(stderr,
-                     "MOBILEGL_TEXTURE_SYNC_STATS texture=%d format=%s target=%s mips=%u size=%dx%dx%d "
-                     "bytes=%zu dirty=%d\n",
-                     textureId,
-                     MG_Util::ConvertTextureInternalFormatToString(format).c_str(),
-                     MG_Util::ConvertTextureUploadTargetToString(uploadTarget).c_str(),
-                     mipLevelCount,
-                     texelSize.x(),
-                     texelSize.y(),
-                     texelSize.z(),
-                     byteSize,
-                     hasDirtyMipLevel ? 1 : 0);
-    }
-
-    static void DumpTextureUploadStats(Int textureId, TextureUploadTarget target, Uint32 level,
-                                       const IntVec3& texelSize, const void* data, SizeT byteSize, Uint32 channels) {
-        if (channels == 0 && texelSize.x() > 0 && texelSize.y() > 0) {
-            const SizeT depth = static_cast<SizeT>(std::max(texelSize.z(), 1));
-            const SizeT pixelCount = static_cast<SizeT>(texelSize.x()) * static_cast<SizeT>(texelSize.y()) * depth;
-            if (pixelCount > 0 && byteSize % pixelCount == 0) {
-                channels = static_cast<Uint32>(std::min<SizeT>(byteSize / pixelCount, 4));
-            }
-        }
-        if (!ShouldDumpTextureUploadStats() || data == nullptr || byteSize == 0 || channels == 0) {
-            return;
-        }
-
-        const auto* bytes = static_cast<const Uint8*>(data);
-        Uint8 minValue = 255;
-        Uint8 maxValue = 0;
-        SizeT nonZero = 0;
-        Uint64 sum = 0;
-        Uint64 neighborDiff = 0;
-        SizeT neighborCount = 0;
-
-        for (SizeT i = 0; i < byteSize; ++i) {
-            minValue = std::min(minValue, bytes[i]);
-            maxValue = std::max(maxValue, bytes[i]);
-            nonZero += bytes[i] != 0 ? 1 : 0;
-            sum += bytes[i];
-        }
-
-        const SizeT width = static_cast<SizeT>(std::max(texelSize.x(), 0));
-        const SizeT height = static_cast<SizeT>(std::max(texelSize.y(), 0));
-        const SizeT pixelStride = channels;
-        if (width > 1 && height > 0 && byteSize >= width * height * pixelStride) {
-            for (SizeT y = 0; y < height; ++y) {
-                const SizeT row = y * width * pixelStride;
-                for (SizeT x = 1; x < width; ++x) {
-                    const SizeT prev = row + (x - 1) * pixelStride;
-                    const SizeT cur = row + x * pixelStride;
-                    for (SizeT c = 0; c < std::min<SizeT>(channels, 3); ++c) {
-                        neighborDiff += static_cast<Uint64>(
-                            std::abs(static_cast<Int>(bytes[cur + c]) - static_cast<Int>(bytes[prev + c])));
-                        ++neighborCount;
-                    }
-                }
-            }
-        }
-
-        const double avg = byteSize > 0 ? static_cast<double>(sum) / static_cast<double>(byteSize) : 0.0;
-        const double avgNeighborDiff =
-            neighborCount > 0 ? static_cast<double>(neighborDiff) / static_cast<double>(neighborCount) : 0.0;
-        std::fprintf(stderr,
-                     "MOBILEGL_TEXTURE_UPLOAD_STATS texture=%d target=%s level=%u size=%dx%dx%d bytes=%zu "
-                     "channels=%u min=%u max=%u avg=%.2f nonzero=%zu neighborDiff=%.2f first=%u,%u,%u,%u\n",
-                     textureId,
-                     MG_Util::ConvertTextureUploadTargetToString(target).c_str(),
-                     level,
-                     texelSize.x(),
-                     texelSize.y(),
-                     texelSize.z(),
-                     byteSize,
-                     channels,
-                     static_cast<Uint>(minValue),
-                     static_cast<Uint>(maxValue),
-                     avg,
-                     nonZero,
-                     avgNeighborDiff,
-                     byteSize > 0 ? static_cast<Uint>(bytes[0]) : 0u,
-                     byteSize > 1 ? static_cast<Uint>(bytes[1]) : 0u,
-                     byteSize > 2 ? static_cast<Uint>(bytes[2]) : 0u,
-                     byteSize > 3 ? static_cast<Uint>(bytes[3]) : 0u);
-    }
-
     static VkComponentSwizzle ToVkComponentSwizzle(TextureSwizzleParam swizzle) {
         switch (swizzle) {
         case TextureSwizzleParam::Red:
@@ -512,6 +427,22 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                            TextureUploadTarget uploadTarget, const IntVec3& texelSize,
                                            TextureShapeInfo& outShape) {
         switch (uploadTarget) {
+        case TextureUploadTarget::Texture1D:
+        case TextureUploadTarget::ProxyTexture1D:
+            outShape = {};
+            outShape.imageType = VK_IMAGE_TYPE_1D;
+            outShape.viewType = VK_IMAGE_VIEW_TYPE_1D;
+            return true;
+        case TextureUploadTarget::Texture1DArray:
+        case TextureUploadTarget::ProxyTexture1DArray:
+            MOBILEGL_ASSERT(texelSize.z() > 0,
+                            "TryResolveTextureShapeInfo: invalid 1D array depth=%d for textureId=%d",
+                            texelSize.z(), texture.GetExternalIndex());
+            outShape.imageType = VK_IMAGE_TYPE_1D;
+            outShape.viewType = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+            outShape.depth = 1;
+            outShape.arrayLayers = static_cast<Uint32>(texelSize.z());
+            return true;
         case TextureUploadTarget::Texture2D:
         case TextureUploadTarget::ProxyTexture2D:
         case TextureUploadTarget::TextureRectangle:
@@ -521,6 +452,16 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         case TextureUploadTarget::Texture2DMultisample:
         case TextureUploadTarget::ProxyTexture2DMultisample:
             outShape = {};
+            return true;
+        case TextureUploadTarget::Texture2DArray:
+        case TextureUploadTarget::ProxyTexture2DArray:
+            MOBILEGL_ASSERT(texelSize.z() > 0,
+                            "TryResolveTextureShapeInfo: invalid 2D array depth=%d for textureId=%d",
+                            texelSize.z(), texture.GetExternalIndex());
+            outShape.imageType = VK_IMAGE_TYPE_2D;
+            outShape.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+            outShape.depth = 1;
+            outShape.arrayLayers = static_cast<Uint32>(texelSize.z());
             return true;
         case TextureUploadTarget::Texture2DMultisampleArray:
         case TextureUploadTarget::ProxyTexture2DMultisampleArray:
@@ -631,7 +572,6 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
 
         Vector<TextureIdentity> staleAliases;
-        staleAliases.reserve(m_aliveObjects.size());
         for (auto it = m_aliveObjects.begin(); it != m_aliveObjects.end(); ++it) {
             if (it->first.texture != texture) {
                 continue;
@@ -647,19 +587,54 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
     }
 
+    void VkTextureManager::BeginDrawSyncScope() {
+        m_drawSyncedThisDraw.clear();
+        m_drawSyncScopeActive = true;
+    }
+
+    void VkTextureManager::EndDrawSyncScope() {
+        m_drawSyncScopeActive = false;
+        m_drawSyncedThisDraw.clear();
+    }
+
     VkTextureManager::TextureResource* VkTextureManager::SyncTextureAndGetDescriptor(MG_State::GLState::ITextureObject& texture) {
         MOBILEGL_ASSERT(m_device != VK_NULL_HANDLE, "SyncTextureAndGetDescriptor: m_device == VK_NULL_HANDLE");
 
         const TextureIdentity identity = MakeTextureIdentity(&texture);
+
+        // Per-draw memo fast path (see BeginDrawSyncScope): a texture already fully
+        // synced earlier in this draw cannot have changed since (no GL mutation runs
+        // mid-SetupDraw), so skip the heavy SyncTexture work and hand back the
+        // already-synced resource. Layout lives on the resource and is updated by the
+        // transition path, so the short-circuited resource still reflects the truth.
+        const Bool memoActive = m_drawSyncScopeActive;
+        if (memoActive) {
+            for (const DrawSyncedTexture& synced : m_drawSyncedThisDraw) {
+                if (synced.identity == identity) {
+                    if (synced.resource != nullptr && synced.resource->image != VK_NULL_HANDLE) {
+                        return synced.resource;
+                    }
+                    break;  // resource unexpectedly gone -> fall through to a full sync
+                }
+            }
+        }
+
         auto aliveIt = m_aliveObjects.find(identity);
         if (aliveIt != m_aliveObjects.end() && aliveIt->second.expired()) {
             EraseTrackedTexture(aliveIt->first);
+            aliveIt = m_aliveObjects.end();
         }
 
-        const auto& liveTexture = MG_State::pGLContext->GetTextureObject(texture.GetExternalIndex());
-        if (liveTexture && liveTexture.get() == &texture) {
-            m_aliveObjects[identity] = WeakPtr<MG_State::GLState::ITextureObject>(liveTexture);
-            PruneStaleTextureAliases(&texture);
+        // Only (re)register and prune when this (texture, lifetime) pair is new: stale
+        // aliases can only come into existence through an address reuse, which by
+        // construction introduces a new identity. Doing this unconditionally made every
+        // sampled-texture sync scan the entire alive-texture map per draw.
+        if (aliveIt == m_aliveObjects.end()) {
+            const auto& liveTexture = MG_State::pGLContext->GetTextureObject(texture.GetExternalIndex());
+            if (liveTexture && liveTexture.get() == &texture) {
+                m_aliveObjects[identity] = WeakPtr<MG_State::GLState::ITextureObject>(liveTexture);
+                PruneStaleTextureAliases(&texture);
+            }
         }
 
         auto it = m_textureResources.find(identity);
@@ -672,6 +647,19 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         if (!SyncTexture(texture, it->second)) {
             MGLOG_D("%s: Syncing texture %d failed", __func__, texture.GetExternalIndex());
             return nullptr;
+        }
+
+        if (memoActive) {
+            Bool recorded = false;
+            for (const DrawSyncedTexture& synced : m_drawSyncedThisDraw) {
+                if (synced.identity == identity) {
+                    recorded = true;
+                    break;
+                }
+            }
+            if (!recorded) {
+                m_drawSyncedThisDraw.push_back({identity, &(it->second)});
+            }
         }
 
         return &(it->second);
@@ -886,7 +874,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
 
         const Bool ok = TransitionImageLayout(commandBuffer, resource->image, resource->layout, targetLayout, srcStageMask,
-                                              kGraphicsSampledReadStages, srcAccessMask,
+                                              kSampledReadStages, srcAccessMask,
                                               VK_ACCESS_SHADER_READ_BIT, resource->aspect, 0, resource->mipLevels,
                                               resource->arrayLayers);
         MOBILEGL_ASSERT(ok, "TransitionTextureForSampling: transition failed for textureId=%d", texture.GetExternalIndex());
@@ -980,6 +968,22 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
     Bool VkTextureManager::SyncTexture(MG_State::GLState::ITextureObject &texture,
                                        TextureResource &outResource) {
+        // Cross-draw fast path: if the resource is already built and neither the texture's
+        // pixel content (bumped in MarkStorageDirty) nor its params changed since the last
+        // sync, there is nothing to re-check or re-upload - skip CheckMipmapCompleteness,
+        // SyncTextureResource, SyncTextureViews and the per-level dirty scan. Layout is
+        // maintained separately by the transition path, so the resource still reflects truth.
+        const Uint64 syncingContentVersion = texture.GetContentVersion();
+        const auto* syncingMipTexture = MG_State::GLState::AsMipmapTexture(&texture);
+        const Uint32 syncingMipLevelCount =
+            syncingMipTexture != nullptr ? syncingMipTexture->GetMipmapLevelCount() : 0u;
+        if (outResource.image != VK_NULL_HANDLE &&
+            outResource.syncedContentVersion == syncingContentVersion &&
+            outResource.syncedTextureParamsVersion == texture.GetTextureParamsVersion() &&
+            outResource.syncedMipLevelCount == syncingMipLevelCount) {
+            return true;
+        }
+
         TextureUploadTarget uploadTarget = TextureUploadTarget::Unknown;
         IntVec3 texelSize{0, 0, 0};
         SizeT byteSize = 0;
@@ -989,7 +993,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             return false;
         }
 
-        auto* mipTexture = dynamic_cast<MG_State::GLState::TextureObjectMipmap*>(&texture);
+        auto* mipTexture = MG_State::GLState::AsMipmapTexture(&texture);
         if (!mipTexture) {
             MGLOG_D("%s: not TextureObjectMipmap", __func__);
             return false;
@@ -1023,9 +1027,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 break;
             }
         }
-        DumpTextureSyncStats(texture.GetExternalIndex(), texture.GetFormat(), uploadTarget, mipLevelCount,
-                             texelSize, byteSize, hasDirtyMipLevel);
         if (!hasDirtyMipLevel) {
+            outResource.syncedContentVersion = syncingContentVersion;
+            outResource.syncedMipLevelCount = syncingMipLevelCount;
             return true;
         }
 
@@ -1033,6 +1037,8 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             MGLOG_D("%s: UploadDirtyMipLevels failed", __func__);
             return false;
         }
+        outResource.syncedContentVersion = syncingContentVersion;
+        outResource.syncedMipLevelCount = syncingMipLevelCount;
         return true;
     }
 
@@ -1167,6 +1173,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         allocationInfo.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         VK_VERIFY(vmaCreateImage(m_allocator, &imageInfo, &allocationInfo, &resource.image, &resource.allocation, nullptr),
                   "vmaCreateImage(texture)");
+        ++m_textureImageEpoch; // a new attachment image invalidates cached render passes
 
         resource.layout = VK_IMAGE_LAYOUT_UNDEFINED;
         resource.extent = {static_cast<Uint32>(texelSize.x()), static_cast<Uint32>(texelSize.y())};
@@ -1409,15 +1416,24 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 if (!uploadItems.back().expandedData.empty()) {
                     uploadItems.back().source = uploadItems.back().expandedData.data();
                 }
-                DumpTextureUploadStats(mipmapTexture.GetExternalIndex(), uploadItems.back().target,
-                                       uploadItems.back().level, uploadItems.back().texelSize,
-                                       uploadItems.back().source, uploadItems.back().uploadByteSize,
-                                       formatInfo.expandRgbToRgba ? 4u : 0u);
                 stagingSize += static_cast<VkDeviceSize>(uploadItems.back().uploadByteSize);
             }
         }
 
         if (uploadItems.empty()) {
+            return true;
+        }
+
+        // Combined depth-stencil images need per-aspect de-interleaved copies (VkBufferImageCopy
+        // aspectMask must have exactly one bit set). Until that is implemented, skip the upload
+        // instead of recording an invalid command buffer that kills the process.
+        const VkImageAspectFlags uploadAspectMask = GetAspectMaskForFormat(outResource.format);
+        if ((uploadAspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) && (uploadAspectMask & VK_IMAGE_ASPECT_STENCIL_BIT)) {
+            MGLOG_E("UploadDirtyMipLevels: skipping unimplemented depth-stencil data upload for textureId=%d",
+                    mipmapTexture.GetExternalIndex());
+            for (const auto& item : uploadItems) {
+                mipmapTexture.MarkStorageDirty(item.target, item.level, false);
+            }
             return true;
         }
 
@@ -1493,7 +1509,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                    uploadLayout,
                                    finalLayout,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                   kGraphicsSampledReadStages,
+                                   kSampledReadStages,
                                    VK_ACCESS_TRANSFER_WRITE_BIT,
                                    VK_ACCESS_SHADER_READ_BIT,
                                    aspectMask, 0, outResource.mipLevels, outResource.arrayLayers);
@@ -1535,7 +1551,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                                    IntVec3& outTexelSize,
                                                    SizeT& outByteSize,
                                                    Uint32& outMipLevelCount) {
-        const auto* mipTexture = dynamic_cast<const MG_State::GLState::TextureObjectMipmap*>(&texture);
+        const auto* mipTexture = MG_State::GLState::AsMipmapTexture(&texture);
         if (!mipTexture) {
             MGLOG_D("%s: not TextureObjectMipmap", __func__);
             return false;
@@ -1595,7 +1611,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         MOBILEGL_ASSERT(mipLevels > 0, "ResolveViewMipRange: mipLevels must be > 0");
 
         Uint32 definedMipLevels = mipLevels;
-        if (const auto* mipTexture = dynamic_cast<const MG_State::GLState::TextureObjectMipmap*>(&texture)) {
+        if (const auto* mipTexture = MG_State::GLState::AsMipmapTexture(&texture)) {
             const auto& targets = texture.GetUploadTargets();
             for (const auto target : targets) {
                 const Uint32 uploadMipLevels = GetUploadMipLevelCount(*mipTexture, target);

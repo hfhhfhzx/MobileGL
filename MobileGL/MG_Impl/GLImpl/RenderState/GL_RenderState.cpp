@@ -7,6 +7,7 @@
 // End of Source File Header
 
 #include "GL_RenderState.h"
+#include <cmath>
 #include <MG_State/GLState/Core.h>
 #include <MG_Util/Converters/GLToStr/GLEnumConverter.h>
 #include <MG_Util/Converters/GLToMG/RenderStateEnumConverter.h>
@@ -192,7 +193,28 @@ namespace MobileGL::MG_Impl::GLImpl {
     }
 
     void PolygonMode_State(GLenum face, GLenum mode) {
-        // TODO: implement
+        // GL 3.3 core: separate front/back polygon modes were removed in 3.1, so the only legal
+        // face is GL_FRONT_AND_BACK. GL_FRONT / GL_BACK must be rejected (some desktop drivers
+        // leniently accept them, but that is non-conformant). Both errors are GL_INVALID_ENUM and
+        // leave state untouched.
+        if (face != GL_FRONT_AND_BACK) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidEnum,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                             "glPolygonMode face must be GL_FRONT_AND_BACK in the core profile; got " +
+                                                 MG_Util::ConvertGLEnumToString(face) + "."));
+            return;
+        }
+        if (mode != GL_POINT && mode != GL_LINE && mode != GL_FILL) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidEnum,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                             "glPolygonMode mode must be GL_POINT, GL_LINE, or GL_FILL; got " +
+                                                 MG_Util::ConvertGLEnumToString(mode) + "."));
+            return;
+        }
+        // Core sets both faces together; keep two slots so GL_POLYGON_MODE round-trips its two values.
+        MG_State::pGLContext->SetPolygonMode(mode, mode);
     }
 
     void PointSize_State(GLfloat size) {
@@ -207,12 +229,67 @@ namespace MobileGL::MG_Impl::GLImpl {
         MG_State::pGLContext->SetPointSize(static_cast<Float>(size));
     }
 
-    void PointParameterf_State(GLenum pname, GLfloat param) {
-        // TODO: implement
+    // Single funnel for all four glPointParameter forms. The two GL 3.3 core pnames both carry one
+    // component, so the *v forms pass params[0], and the integer forms widen to float. The
+    // GL_POINT_SPRITE_COORD_ORIGIN value is an enum passed as a float (36001.0/36002.0 are exact).
+    void PointParameter_State(GLenum pname, GLfloat value) {
+        switch (pname) {
+        case GL_POINT_FADE_THRESHOLD_SIZE:
+            if (value < 0.0f) {
+                MG_State::pGLContext->RecordError(
+                    ErrorCode::InvalidValue,
+                    MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                                 "GL_POINT_FADE_THRESHOLD_SIZE must be non-negative."));
+                return;
+            }
+            MG_State::pGLContext->SetPointFadeThresholdSize(value);
+            return;
+        case GL_POINT_SPRITE_COORD_ORIGIN: {
+            const GLenum origin = static_cast<GLenum>(std::lround(value));
+            if (origin != GL_LOWER_LEFT && origin != GL_UPPER_LEFT) {
+                MG_State::pGLContext->RecordError(
+                    ErrorCode::InvalidEnum,
+                    MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                                 "GL_POINT_SPRITE_COORD_ORIGIN must be GL_LOWER_LEFT or "
+                                                 "GL_UPPER_LEFT."));
+                return;
+            }
+            MG_State::pGLContext->SetPointSpriteCoordOrigin(origin);
+            return;
+        }
+        default:
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidEnum,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                             "Unsupported point parameter pname: " + std::to_string(pname)));
+            return;
+        }
     }
 
+    void PointParameterf_State(GLenum pname, GLfloat param) { PointParameter_State(pname, param); }
+
     void PointParameteri_State(GLenum pname, GLint param) {
-        // TODO: implement
+        PointParameter_State(pname, static_cast<GLfloat>(param));
+    }
+
+    void PointParameterfv_State(GLenum pname, const GLfloat* params) {
+        if (!params) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__, "params pointer cannot be null."));
+            return;
+        }
+        PointParameter_State(pname, params[0]);
+    }
+
+    void PointParameteriv_State(GLenum pname, const GLint* params) {
+        if (!params) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__, "params pointer cannot be null."));
+            return;
+        }
+        PointParameter_State(pname, static_cast<GLfloat>(params[0]));
     }
 
     void PixelStorei_State(GLenum pname, GLint param) {
@@ -284,6 +361,25 @@ namespace MobileGL::MG_Impl::GLImpl {
             return;
         }
 
+        if (target == GL_COLOR_WRITEMASK) {
+            // Indexed per-draw-buffer color writemask writes 4 booleans (R,G,B,A) for draw buffer
+            // `index`. The non-indexed glGetBooleanv(GL_COLOR_WRITEMASK) reports draw buffer 0.
+            if (index >= MG_State::GLState::FramebufferObject::MAX_DRAW_BUFFERS) {
+                MG_State::pGLContext->RecordError(
+                    ErrorCode::InvalidValue,
+                    MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "GetBooleani_v_State",
+                                                 "Color writemask draw buffer index " + std::to_string(index) +
+                                                     " is out of range."));
+                return;
+            }
+            const BoolVec4 mask = MG_State::pGLContext->GetColorMaskIndexed(index);
+            data[0] = mask.x() ? GL_TRUE : GL_FALSE;
+            data[1] = mask.y() ? GL_TRUE : GL_FALSE;
+            data[2] = mask.z() ? GL_TRUE : GL_FALSE;
+            data[3] = mask.w() ? GL_TRUE : GL_FALSE;
+            return;
+        }
+
         *data = IsEnabledi_State(target, index);
     }
 
@@ -302,7 +398,27 @@ namespace MobileGL::MG_Impl::GLImpl {
     }
 
     void Hint_State(GLenum target, GLenum mode) {
-        // TODO: implement
+        switch (target) {
+        case GL_LINE_SMOOTH_HINT:
+        case GL_POLYGON_SMOOTH_HINT:
+        case GL_TEXTURE_COMPRESSION_HINT:
+        case GL_FRAGMENT_SHADER_DERIVATIVE_HINT:
+            break;
+        default:
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidEnum,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                             "Unsupported hint target: " + std::to_string(target)));
+            return;
+        }
+        if (mode != GL_FASTEST && mode != GL_NICEST && mode != GL_DONT_CARE) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidEnum,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                             "Hint mode must be GL_FASTEST, GL_NICEST or GL_DONT_CARE."));
+            return;
+        }
+        MG_State::pGLContext->SetHint(target, mode);
     }
 
     void FrontFace_State(GLenum mode) {
@@ -336,6 +452,16 @@ namespace MobileGL::MG_Impl::GLImpl {
     }
 
     void Enable_State(GLenum cap) {
+        switch (cap) {
+        case GL_TEXTURE_1D:
+        case GL_TEXTURE_2D:
+        case GL_TEXTURE_3D:
+        case GL_TEXTURE_CUBE_MAP:
+            return;
+        default:
+            break;
+        }
+
         CapabilityInput capInput = MG_Util::ConvertGLEnumToCapabilityInput(cap);
         if (capInput == CapabilityInput::Unknown) {
             MG_State::pGLContext->RecordError(
@@ -350,6 +476,16 @@ namespace MobileGL::MG_Impl::GLImpl {
     }
 
     void Disable_State(GLenum cap) {
+        switch (cap) {
+        case GL_TEXTURE_1D:
+        case GL_TEXTURE_2D:
+        case GL_TEXTURE_3D:
+        case GL_TEXTURE_CUBE_MAP:
+            return;
+        default:
+            break;
+        }
+
         CapabilityInput capInput = MG_Util::ConvertGLEnumToCapabilityInput(cap);
         if (capInput == CapabilityInput::Unknown) {
             MG_State::pGLContext->RecordError(
@@ -402,12 +538,59 @@ namespace MobileGL::MG_Impl::GLImpl {
     }
 
     void ColorMask_State(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {
+        // glColorMask broadcasts to every draw buffer. GLboolean coercion: any nonzero value enables
+        // the component; only exactly GL_FALSE disables it.
         MG_State::pGLContext->SetColorMask(
-            BoolVec4(red == GL_TRUE, green == GL_TRUE, blue == GL_TRUE, alpha == GL_TRUE));
+            BoolVec4(red != GL_FALSE, green != GL_FALSE, blue != GL_FALSE, alpha != GL_FALSE));
+    }
+
+    void ColorMaski_State(GLuint buf, GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {
+        // Indexed color writemask for the single draw buffer `buf`. buf is a GLuint index, never an
+        // enum, so the only error is GL_INVALID_VALUE when it is out of range (mirrors the indexed
+        // blend entry points, which bound against MAX_DRAW_BUFFERS).
+        if (buf >= MG_State::GLState::FramebufferObject::MAX_DRAW_BUFFERS) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>(
+                    "MG_Impl/GLImpl", __func__,
+                    "glColorMaski buffer index " + std::to_string(buf) + " is out of range. Max supported is " +
+                        std::to_string(MG_State::GLState::FramebufferObject::MAX_DRAW_BUFFERS - 1) + "."));
+            return;
+        }
+        MG_State::pGLContext->SetColorMaskIndexed(
+            buf, BoolVec4(red != GL_FALSE, green != GL_FALSE, blue != GL_FALSE, alpha != GL_FALSE));
+    }
+
+    void PrimitiveRestartIndex_State(GLuint index) {
+        // glPrimitiveRestartIndex accepts any GLuint and generates no error.
+        MG_State::pGLContext->SetPrimitiveRestartIndex(index);
     }
 
     void ClampColor_State(GLenum target, GLenum clamp) {
-        // TODO: implement
+        // GL 3.3 core: the only legal target is GL_CLAMP_READ_COLOR. The compatibility-only
+        // GL_CLAMP_VERTEX_COLOR / GL_CLAMP_FRAGMENT_COLOR were removed from the core profile and
+        // must be rejected.
+        if (target != GL_CLAMP_READ_COLOR) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidEnum,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                             "glClampColor target must be GL_CLAMP_READ_COLOR in the core profile; "
+                                             "got " +
+                                                 MG_Util::ConvertGLEnumToString(target) + "."));
+            return;
+        }
+        // clamp must be one of GL_TRUE, GL_FALSE, or GL_FIXED_ONLY. NOTE: the Khronos man page's
+        // Errors section wrongly omits GL_FIXED_ONLY, but the spec lists it as legal AND it is the
+        // default value, so it must be accepted here.
+        if (clamp != GL_TRUE && clamp != GL_FALSE && clamp != GL_FIXED_ONLY) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidEnum,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                             "glClampColor clamp must be GL_TRUE, GL_FALSE, or GL_FIXED_ONLY; got " +
+                                                 MG_Util::ConvertGLEnumToString(clamp) + "."));
+            return;
+        }
+        MG_State::pGLContext->SetClampReadColor(clamp);
     }
 
     void BlendFuncSeparate_State(GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha, GLenum dfactorAlpha) {
@@ -466,7 +649,9 @@ namespace MobileGL::MG_Impl::GLImpl {
     }
 
     void ClearDepth_State(GLclampd depth) {
-        MG_State::pGLContext->SetClearDepth(static_cast<Float>(depth));
+        // GL 3.3 §4.2.3: the clear depth is clamped to [0,1] at specification time (Vulkan clear
+        // values additionally require it: VUID-VkClearDepthStencilValue-depth-00022).
+        MG_State::pGLContext->SetClearDepth(ClampUnitFloat(static_cast<Float>(depth)));
     }
 
     void ClearColor_State(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {
@@ -652,8 +837,34 @@ namespace MobileGL::MG_Impl::GLImpl {
         PointParameteri_State(pname, param);
     }
 
+    void PointParameterfv(GLenum pname, const GLfloat* params) {
+        PointParameterfv_State(pname, params);
+    }
+
+    void PointParameteriv(GLenum pname, const GLint* params) {
+        PointParameteriv_State(pname, params);
+    }
+
     void PixelStorei(GLenum pname, GLint param) {
         PixelStorei_State(pname, param);
+    }
+
+    void PixelStoref(GLenum pname, GLfloat param) {
+        // Boolean pixel-store pnames convert by a zero-test (0.4 -> TRUE); integer pnames round to
+        // nearest. Branch before converting so a fractional value cannot round a true flag to false.
+        GLint intParam;
+        switch (pname) {
+        case GL_PACK_SWAP_BYTES:
+        case GL_UNPACK_SWAP_BYTES:
+        case GL_PACK_LSB_FIRST:
+        case GL_UNPACK_LSB_FIRST:
+            intParam = (param != 0.0f) ? 1 : 0;
+            break;
+        default:
+            intParam = static_cast<GLint>(std::lround(param));
+            break;
+        }
+        PixelStorei_State(pname, intParam);
     }
 
     void LogicOp(GLenum opcode) {
@@ -712,8 +923,16 @@ namespace MobileGL::MG_Impl::GLImpl {
         ColorMask_State(red, green, blue, alpha);
     }
 
+    void ColorMaski(GLuint index, GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {
+        ColorMaski_State(index, red, green, blue, alpha);
+    }
+
     void ClampColor(GLenum target, GLenum clamp) {
         ClampColor_State(target, clamp);
+    }
+
+    void PrimitiveRestartIndex(GLuint index) {
+        PrimitiveRestartIndex_State(index);
     }
 
     void BlendFuncSeparate(GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha, GLenum dfactorAlpha) {

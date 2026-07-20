@@ -109,6 +109,10 @@ namespace MobileGL {
         Float32,
         Float64,
         Fixed32,
+        // Packed vertex types (GL_ARB_vertex_type_2_10_10_10_rev): four components (10/10/10/2 bits)
+        // in one 32-bit word. Only valid as a vertex array format with size 4 or GL_BGRA.
+        Int2101010Rev,
+        Uint2101010Rev,
         Unknown = -1
     };
 
@@ -179,12 +183,21 @@ namespace MobileGL {
 
         Range1D GetRange() const { return m_range; }
 
-        void SetRange(const Range1D& range) { m_range = range; }
+        Bool HasExplicitRange() const { return m_hasExplicitRange; }
 
-        void ClearRange() { m_range = Range1D(); }
+        void SetRange(const Range1D& range, Bool hasExplicitRange = true) {
+            m_range = range;
+            m_hasExplicitRange = hasExplicitRange;
+        }
+
+        void ClearRange() {
+            m_range = Range1D();
+            m_hasExplicitRange = false;
+        }
 
     private:
         Range1D m_range;
+        Bool m_hasExplicitRange = false;
     };
 
     struct ComponentSizes {
@@ -326,6 +339,8 @@ namespace MobileGL {
         Bool operator!=(const Flags b) const { return !(*this == b); }
 
         operator Bool() const { return Any(); }
+
+        typename Underlying::type GetRaw() const { return flags; }
 
     private:
         Bool Any() const { return static_cast<typename Underlying::type>(flags) != 0; }

@@ -27,6 +27,10 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             Vector<SizeT> bindingBaseOffsets;
             Vector<Uint32> bindingAttributeLocations;
             Vector<Bool> bindingUsesClientMemory;
+            // Locations whose array is ENABLED but whose GL format has no VkFormat mapping. They are
+            // absent from `attributes`, so without this mask the draw path cannot tell them apart from
+            // a genuinely disabled array and would silently feed the shader the current attribute value.
+            Uint32 unsupportedAttribMask = 0;
             VkPipelineVertexInputStateCreateInfo state{
                 VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
             };
@@ -38,13 +42,20 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         VertexInputStateFactory(const VertexInputStateFactory&) = delete;
 
         HashType ComputeHash(const MG_State::GLState::VertexArrayObject& vao) const;
+        // Memoized ComputeHash: reuses the VAO's cached hash while its config version
+        // is unchanged. Use this on per-draw paths.
+        HashType GetOrComputeHash(const MG_State::GLState::VertexArrayObject& vao) const;
         const BackendVertexInputState& GetOrCreateVertexInputState(
             const MG_State::GLState::VertexArrayObject& vao, HashType hash);
         const BackendVertexInputState& GetOrCreateVertexInputState(const MG_State::GLState::VertexArrayObject& vao);
         static SizeT GetComponentSize(DataType type);
+        // Tightly-packed byte size of one vertex element for this attribute: componentSize * size for
+        // normal types, and 4 (one packed word) for the 2_10_10_10 types and GL_BGRA. Returns 0 for
+        // an unknown/unsupported type.
+        static SizeT GetAttributeByteSize(DataType type, Int size, Bool isBgra);
 
     private:
-        static VkFormat ToVkVertexFormat(DataType type, Int size, Bool normalized, Bool isInteger);
+        static VkFormat ToVkVertexFormat(DataType type, Int size, Bool normalized, Bool isInteger, Bool isBgra = false);
 
         const VulkanRendererConfig& m_config;
         UnorderedMap<HashType, BackendVertexInputState> m_cache;

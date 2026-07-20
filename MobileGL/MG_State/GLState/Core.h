@@ -31,6 +31,20 @@ namespace MobileGL {
                 Array<Uint32, 4> uintValue{0u, 0u, 0u, 1u};
             };
 
+            // Which of the three views above a shader input of a given GLSL type consumes.
+            enum class VertexAttribBaseType { Unsupported, Float, Int, Uint };
+
+            struct VertexAttribTypeInfo {
+                VertexAttribBaseType baseType = VertexAttribBaseType::Unsupported;
+                Uint componentCount = 0;
+            };
+
+            // Maps a shader vertex-input type (GL_FLOAT_VEC3, GL_INT_VEC2, ...) onto the current-value
+            // view that feeds it. Shared by every backend so that "a disabled array reads the current
+            // value" resolves identically regardless of which backend is active; each backend only
+            // translates the result into its own API call.
+            VertexAttribTypeInfo ClassifyVertexAttribType(GLenum glType);
+
             class GLContext {
             public:
                 GLContext() = default;
@@ -52,6 +66,12 @@ namespace MobileGL {
                 BindingSlotRange1D<BufferObject>& GetBufferBindingPoint(BufferTarget target, Uint index);
                 constexpr SizeT GetBufferBindingPointCount(BufferTarget target) const {
                     return m_bufferState.GetBindingPointCount(target);
+                }
+                void TouchBufferBindingPoint(BufferTarget target, Uint index) {
+                    m_bufferState.TouchBindPoint(target, index);
+                }
+                SizeT GetTouchedBufferBindingPointCount(BufferTarget target) const {
+                    return m_bufferState.GetTouchedBindPointCount(target);
                 }
                 const SharedPtr<BufferObject>& CreateBufferObject(Uint index);
                 void MarkBufferObjectForDeletion(Uint index);
@@ -75,11 +95,20 @@ namespace MobileGL {
                 // Texture
                 void GenTextureNames(Uint number, Vector<Uint>& textures);
                 const SharedPtr<ITextureObject>& GetTextureObject(Uint index);
+                // Per-target default texture object (name 0); see TextureState::GetDefaultTextureObject.
+                const SharedPtr<ITextureObject>& GetDefaultTextureObject(TextureTarget target) const;
                 const SharedPtr<ITextureObject>& CreateTextureObject(Uint index, TextureTarget target);
                 void MarkTextureObjectForDeletion(Uint index);
                 TextureUnit& GetTextureUnitObject(Int unit);
                 ImageTextureBinding& GetImageTextureBinding(Int unit);
                 const ImageTextureBinding& GetImageTextureBinding(Int unit) const;
+                void NoteTextureUnitTouched(Int unit) { m_textureState.NoteUnitTouched(unit); }
+                Int GetMaxTouchedTextureUnit() const { return m_textureState.GetMaxTouchedUnit(); }
+                // Monotonic counter bumped whenever a texture bind/unbind/delete changes which
+                // texture is bound at a unit; lets a backend skip re-resolving an unchanged
+                // per-draw sampled-texture set.
+                Uint64 GetTextureBindGeneration() const { return m_textureState.GetTextureBindGeneration(); }
+                void BumpTextureBindGeneration() { m_textureState.BumpTextureBindGeneration(); }
                 Bool ValidateTextureName(Uint index) const;
                 Bool ValidateTextureObject(Uint index) const;
                 Int GetActiveTextureUnit() const;
@@ -90,6 +119,9 @@ namespace MobileGL {
                 Uint CreateShader(ShaderStage stage);
                 void MarkProgramForDeletion(Uint index);
                 void MarkShaderForDeletion(Uint index);
+                // Frees a deletion-flagged shader's name once it lost its last GL-visible
+                // attachment (call after glDetachShader).
+                void ReleaseShaderNameIfOrphaned(Uint index);
                 Bool ValidateProgramName(Uint index) const;
                 Bool ValidateShaderName(Uint index) const;
                 const SharedPtr<ProgramObject>& GetProgramObject(Uint index);
@@ -109,6 +141,19 @@ namespace MobileGL {
                 void SetPolygonOffset(Float factor, Float units);
                 Float GetPolygonOffsetFactor() const;
                 Float GetPolygonOffsetUnits() const;
+                void SetHint(GLenum target, GLenum mode);
+                GLenum GetHint(GLenum target) const;
+                void SetPointFadeThresholdSize(Float size);
+                Float GetPointFadeThresholdSize() const;
+                void SetPointSpriteCoordOrigin(GLenum origin);
+                GLenum GetPointSpriteCoordOrigin() const;
+                void SetClampReadColor(GLenum clamp);
+                GLenum GetClampReadColor() const;
+                void SetPolygonMode(GLenum front, GLenum back);
+                GLenum GetPolygonModeFront() const;
+                GLenum GetPolygonModeBack() const;
+                void SetPrimitiveRestartIndex(Uint32 index);
+                Uint32 GetPrimitiveRestartIndex() const;
                 void SetCapability(CapabilityInput cap, Bool enabled);
                 Bool IsCapabilityEnabled(CapabilityInput cap) const;
                 void SetCapabilityIndexed(CapabilityInput cap, Uint index, Bool enabled);
@@ -137,6 +182,8 @@ namespace MobileGL {
                 const StencilFaceState& GetStencilState(StencilFace face) const;
                 void SetColorMask(BoolVec4 mask);
                 BoolVec4 GetColorMask() const;
+                void SetColorMaskIndexed(Uint index, BoolVec4 mask);
+                BoolVec4 GetColorMaskIndexed(Uint index) const;
                 void SetClearColor(FloatVec4 color);
                 const FloatVec4& GetClearColor() const;
                 void SetClearDepth(Float depth);
@@ -206,5 +253,12 @@ namespace MobileGL {
         } // namespace GLState
 
         extern UniquePtr<GLState::GLContext> pGLContext;
+
+        // True when relaxed GL semantics apply. Strict core rules are enforced only when the
+        // current EGL context explicitly requested a core profile (core bit in
+        // EGL_CONTEXT_OPENGL_PROFILE_MASK, or a >=3.1 version request without the compatibility
+        // bit) and MOBILEGL_RELAXED_SEMANTICS is off; no current context, legacy version
+        // requests, and the compatibility bit all relax.
+        Bool IsRelaxedSemanticsActive();
     } // namespace MG_State
 } // namespace MobileGL

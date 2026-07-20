@@ -67,6 +67,18 @@ namespace MobileGL {
                 return GL_RGBA_INTEGER;
             case TextureInputFormat::BGRAInteger:
                 return GL_BGRA_INTEGER;
+            case TextureInputFormat::Green:
+                return GL_GREEN;
+            case TextureInputFormat::Blue:
+                return GL_BLUE;
+            case TextureInputFormat::Alpha:
+                return GL_ALPHA;
+            case TextureInputFormat::GreenInteger:
+                return GL_GREEN_INTEGER;
+            case TextureInputFormat::BlueInteger:
+                return GL_BLUE_INTEGER;
+            case TextureInputFormat::AlphaInteger:
+                return GL_ALPHA_INTEGER;
             case TextureInputFormat::StencilIndex:
                 return GL_STENCIL_INDEX;
             case TextureInputFormat::DepthComponent:
@@ -101,7 +113,10 @@ namespace MobileGL {
             case TextureInternalFormat::RGB4:
                 return GL_RGB4;
             case TextureInternalFormat::RGB5:
-                return GL_RGB5;
+                // Emit the ES-compatible GL_RGB565 rendition: desktop GL_RGB5 is not a legal
+                // sized internalformat on OpenGL ES backends, GL_RGB565 is (and GL 4.1+
+                // accepts it too via ARB_ES2_compatibility).
+                return GL_RGB565;
             case TextureInternalFormat::RGB8:
                 return GL_RGB8;
             case TextureInternalFormat::RGB8Snorm:

@@ -8,9 +8,18 @@
 
 #include "Config.h"
 
+#include <cerrno>
+#include <cstdlib>
+
 #ifndef _WIN32
 extern char** environ;
 #endif
+
+namespace MobileGL::MG_Config {
+    // Zero/default-initialized at static-init time (all fields have constexpr-friendly
+    // defaults), so it is safe to read even if MG_ConfigLoader::Init has not run yet.
+    FeaturesTable Features;
+} // namespace MobileGL::MG_Config
 
 namespace MobileGL::MG_ConfigLoader {
     static UniquePtr<UnorderedMap<String, String>> acceptedEnvVariablesMap;
@@ -60,6 +69,62 @@ namespace MobileGL::MG_ConfigLoader {
         }
     }
 
+    // Unified truthy rule for boolean feature env variables: set, non-empty, not "0",
+    // and not "false" (case-insensitive).
+    static Bool IsTruthyValue(const String& value) {
+        if (value.empty() || value == "0") {
+            return false;
+        }
+        String lowered = value;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return lowered != "false";
+    }
+
+    inline Bool QueryEnvFlag(const String& key) {
+        auto it = acceptedEnvVariablesMap->find(key);
+        return it != acceptedEnvVariablesMap->end() && IsTruthyValue(it->second);
+    }
+
+    inline Uint32 QueryEnvUint32(const String& key, Uint32 defaultValue, Uint32 minValue, Uint32 maxValue) {
+        auto it = acceptedEnvVariablesMap->find(key);
+        if (it == acceptedEnvVariablesMap->end()) {
+            return defaultValue;
+        }
+
+        const String& value = it->second;
+        char* parseEnd = nullptr;
+        errno = 0;
+        const unsigned long parsedValue = std::strtoul(value.c_str(), &parseEnd, 10);
+        if (parseEnd == value.c_str() || *parseEnd != '\0' || errno == ERANGE || parsedValue < minValue ||
+            parsedValue > maxValue) {
+            MGLOG_W("Config: Ignoring invalid env variable %s='%s'; expected an integer in range [%u, %u], "
+                    "using default %u",
+                    key.c_str(), value.c_str(), minValue, maxValue, defaultValue);
+            return defaultValue;
+        }
+
+        return static_cast<Uint32>(parsedValue);
+    }
+
+    inline void InitFeatures() {
+        auto& features = MG_Config::Features;
+        features.DisableTimerQuery = QueryEnvFlag("MOBILEGL_DISABLE_TIMERQUERY");
+        features.UseAngle = QueryEnvFlag("MOBILEGL_USE_ANGLE");
+#if defined(MOBILEGL_TRACE_ANGLE_VARIANTS)
+        QueryEnvVariable("MOBILEGL_TRACE_ANGLE_VARIANT", features.TraceAngleVariant, "");
+#endif
+        features.DisableSubgroup = QueryEnvFlag("MOBILEGL_DISABLE_SUBGROUP");
+        features.MagmaR11G11B10FFallback = QueryEnvFlag("MOBILEGL_MAGMA_R11G11B10F_FALLBACK");
+        features.MagmaFramesInFlight = QueryEnvUint32("MOBILEGL_MAGMA_FRAMESINFLIGHT", 3, 1, 64);
+        features.AvoidSamplerMipmapMinFilter =
+            QueryEnvFlag("MOBILEGL_AVOID_SAMPLER_MIPMAP_MIN_FILTER");
+        features.CoherentAsFlush = QueryEnvFlag("MOBILEGL_COHERENT_AS_FLUSH");
+        features.TraceSkipAutodestroy = QueryEnvFlag("MOBILEGL_TRACE_SKIP_AUTODESTROY");
+        features.DisableUboRing = QueryEnvFlag("MOBILEGL_DISABLE_UBO_RING");
+        features.RelaxedSemantics = QueryEnvFlag("MOBILEGL_RELAXED_SEMANTICS");
+    }
+
     inline void InitBackendType() {
         String backendTypeStr;
         QueryEnvVariable("MOBILEGL_BACKEND_TYPE", backendTypeStr, "DirectGLES");
@@ -81,6 +146,7 @@ namespace MobileGL::MG_ConfigLoader {
         InitializeAcceptedEnvVariables();
 
         InitBackendType();
+        InitFeatures();
 
         // Destroy the map since we won't need it anymore
         acceptedEnvVariablesMap.reset();

@@ -33,7 +33,10 @@ namespace MobileGL::MG_Impl::GLImpl {
     void PointSize(GLfloat size);
     void PointParameterf(GLenum pname, GLfloat param);
     void PointParameteri(GLenum pname, GLint param);
+    void PointParameterfv(GLenum pname, const GLfloat* params);
+    void PointParameteriv(GLenum pname, const GLint* params);
     void PixelStorei(GLenum pname, GLint param);
+    void PixelStoref(GLenum pname, GLfloat param);
     void LogicOp(GLenum opcode);
     void LineWidth(GLfloat width);
     GLboolean IsEnabledi(GLenum target, GLuint index);
@@ -48,7 +51,9 @@ namespace MobileGL::MG_Impl::GLImpl {
     void DepthFunc(GLenum func);
     void CullFace(GLenum mode);
     void ColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha);
+    void ColorMaski(GLuint index, GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha);
     void ClampColor(GLenum target, GLenum clamp);
+    void PrimitiveRestartIndex(GLuint index);
     void BlendFuncSeparate(GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha, GLenum dfactorAlpha);
     void BlendEquation(GLenum mode);
     void BlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha);

@@ -73,6 +73,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         static Bool ResolveSamplerTexture(const MG_State::GLState::ProgramObject& program,
                                    const ProgramFactory::VkProgramObject& programObj, Uint32 binding,
                                    SharedPtr<MG_State::GLState::ITextureObject>& outTexture);
+        // Raw-pointer variant for the per-draw sampled-texture walk (CollectSampledTextures):
+        // the bound texture stays alive through the draw via GL binding state, so callers that
+        // only need the pointer skip the SharedPtr copy's atomic refcount churn.
+        static MG_State::GLState::ITextureObject* ResolveSamplerTextureRaw(
+            const MG_State::GLState::ProgramObject& program,
+            const ProgramFactory::VkProgramObject& programObj, Uint32 binding);
         SharedPtr<MG_State::GLState::ITextureObject> GetFallbackTexture(TextureTarget target) const;
         Bool ResolveSamplerDescriptor(VkCommandBuffer commandBuffer, const MG_State::GLState::ProgramObject& program,
                                       const ProgramFactory::VkProgramObject& programObj, Uint32 binding,
@@ -89,9 +95,19 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                            const MG_State::GLState::ProgramObject& program,
                                            const ProgramFactory::VkProgramObject& programObj, Uint32 binding,
                                            VkDescriptorImageInfo& outImageInfo) const;
+        // Result of resolving a UBO binding: either a zero-copy direct bind to the app's resident
+        // VkBuffer (the GLES backend's approach - no per-draw copy) or the CPU payload to upload.
+        struct UboBindResult {
+            Bool directBindable = false;
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceSize range = 0;         // reflected block size; constant across draws (hashed)
+            VkDeviceSize dynamicOffset = 0; // block range start; moves per draw (NOT hashed)
+            const void* payload = nullptr;  // fallback UploadTransient path
+            VkDeviceSize payloadSize = 0;
+        };
         Bool ResolveUniformBufferPayload(const MG_State::GLState::ProgramObject& program,
                                          const ProgramFactory::VkProgramObject& programObj, Uint32 binding,
-                                         const void*& outData, VkDeviceSize& outSize) const;
+                                         UboBindResult& out) const;
         Bool CreateDescriptorPool(Uint32 maxSets, VkDescriptorPool& outPool) const;
         Bool GrowFrameDescriptorPool(FrameResources& frame, Uint32 frameIndex);
         VkResult AllocateDescriptorSetsFromActivePool(
@@ -113,6 +129,45 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         VkTextureManager* m_textureManager = nullptr;
         VkSamplerManager* m_samplerManager = nullptr;
         mutable SharedPtr<MG_State::GLState::ITextureObject> m_fallbackTexture2D;
+
+        // Per-draw scratch buffers for BindProgramUniformBuffers: reused (clear keeps
+        // capacity) so the descriptor-write path stops allocating on every draw.
+        Vector<VkWriteDescriptorSet> m_writesScratch;
+        Vector<VkDescriptorBufferInfo> m_bufferInfosScratch;
+        Vector<VkDescriptorImageInfo> m_imageInfosScratch;
+        Vector<VkBufferView> m_texelBufferViewsScratch;
+        Vector<Uint32> m_dynamicOffsetsScratch;
+
+        // Descriptor-set reuse across consecutive draws (see BindProgramUniformBuffers).
+        // When a draw's resolved descriptor content is byte-identical to the previous
+        // draw's, reuse the same VkDescriptorSet and skip AcquireDescriptorSet +
+        // vkUpdateDescriptorSets - only the bind-time dynamic offsets differ. Reset each
+        // frame in BeginFrame because the frame's descriptor sets are recycled there.
+        VkDescriptorSet m_lastBoundDescriptorSet = VK_NULL_HANDLE;
+        Uint64 m_lastDescriptorSignature = 0;
+        Bool m_hasLastDescriptor = false;
+
+        // Per-binding fast path over VkSamplerManager's content-hashed sampler cache, which
+        // stays the source of truth: its key hashes all sampler+texture state, so two distinct
+        // sampler objects with identical state still resolve to one VkSampler. This memo only
+        // skips recomputing that hash. Across a draw batch the bound sampler set is stable, so a
+        // binding whose sampler (lifetime id + version, bumped on every setter) and texture
+        // (lifetime id + params version, bumped on the format/border-color setters that feed the
+        // key) are unchanged recycles the VkSampler it resolved last draw; a param change bumps
+        // a version and forces a re-resolve. Both objects are keyed by a never-reused monotonic
+        // lifetime id, so a freed-and-reallocated sampler or texture at the same heap address
+        // always gets a fresh id and misses (a raw pointer would false-hit that ABA) - so a
+        // stale guess can only miss and fall through to the hash, never resolve wrong. Still
+        // reset each frame alongside the descriptor-set cache. Indexed by binding.
+        struct SamplerResolveMemo {
+            Uint64 samplerLifetimeId = 0;
+            Uint64 textureLifetimeId = 0;
+            VkSampler sampler = VK_NULL_HANDLE;
+            Uint16 samplerVersion = 0;
+            Uint16 textureParamsVersion = 0;
+            Bool valid = false;
+        };
+        mutable Vector<SamplerResolveMemo> m_samplerResolveMemo;
     };
 } // namespace MobileGL::MG_Backend::DirectVulkan
 

@@ -611,8 +611,15 @@ namespace MobileGL {
                             GLbitfield flags)
             GL_FUNC_TYPEDEF(void, glGetQueryObjectivEXT, GLuint id, GLenum pname, GLint* params)
             GL_FUNC_TYPEDEF(void, glGetQueryObjecti64vEXT, GLuint id, GLenum pname, GLint64* params)
+            GL_FUNC_TYPEDEF(void, glQueryCounterEXT, GLuint id, GLenum target)
+            GL_FUNC_TYPEDEF(void, glGetQueryObjectui64vEXT, GLuint id, GLenum pname, GLuint64* params)
             GL_FUNC_TYPEDEF(void, glBindFragDataLocationEXT, GLuint program, GLuint colorNumber, const GLchar* name)
             GL_FUNC_TYPEDEF(void*, glMapBufferOES, GLenum target, GLenum access)
+            // Extension aliases for glPolygonMode (GLES core has none) and indexed glColorMaski.
+            GL_FUNC_TYPEDEF(void, glPolygonModeNV, GLenum face, GLenum mode)
+            GL_FUNC_TYPEDEF(void, glPolygonModeANGLE, GLenum face, GLenum mode)
+            GL_FUNC_TYPEDEF(void, glColorMaskiEXT, GLuint index, GLboolean r, GLboolean g, GLboolean b, GLboolean a)
+            GL_FUNC_TYPEDEF(void, glColorMaskiOES, GLuint index, GLboolean r, GLboolean g, GLboolean b, GLboolean a)
 
             GL_FUNC_TYPEDEF(void, glMultiDrawArraysIndirectEXT, GLenum mode, const void* indirect, GLsizei drawcount,
                             GLsizei stride)
@@ -1000,8 +1007,14 @@ namespace MobileGL {
             GL_FUNC_DECL(glBufferStorageEXT)
             GL_FUNC_DECL(glGetQueryObjectivEXT)
             GL_FUNC_DECL(glGetQueryObjecti64vEXT)
+            GL_FUNC_DECL(glQueryCounterEXT)
+            GL_FUNC_DECL(glGetQueryObjectui64vEXT)
             GL_FUNC_DECL(glBindFragDataLocationEXT)
             GL_FUNC_DECL(glMapBufferOES)
+            GL_FUNC_DECL(glPolygonModeNV)
+            GL_FUNC_DECL(glPolygonModeANGLE)
+            GL_FUNC_DECL(glColorMaskiEXT)
+            GL_FUNC_DECL(glColorMaskiOES)
 
             GL_FUNC_DECL(glMultiDrawArraysIndirectEXT)
             GL_FUNC_DECL(glMultiDrawElementsIndirectEXT)
@@ -1018,6 +1031,39 @@ namespace MobileGL {
             String GLESShadingLanguageVersionString;
             Bool SupportsPersistentMapping = false;
             Bool SupportsNorm16Texture = false;
+            // GL_EXT_texture_filter_anisotropic is present, so sampler/texture
+            // anisotropy may be forwarded without raising GL_INVALID_ENUM in GLES.
+            Bool SupportsTextureFilterAnisotropy = false;
+            // GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT of the host driver; only queried when the
+            // extension above is present, and left at 1.0 (no anisotropy) otherwise.
+            Float MaxTextureMaxAnisotropy = 1.0f;
+            Bool SupportsBaseInstance = false;
+            // GL_EXT_disjoint_timer_query is present in the extension string.
+            Bool SupportsDisjointTimerQuery = false;
+            // glPolygonModeNV/ANGLE loaded (GL_NV_polygon_mode / GL_ANGLE_polygon_mode). GLES core
+            // has no glPolygonMode, so without this the mode stays FILL.
+            Bool SupportsPolygonMode = false;
+            // An indexed glColorMaski entry point loaded (GLES 3.2 core, or GL_OES/EXT_draw_buffers_indexed).
+            // Without it, only the non-indexed glColorMask (draw buffer 0 broadcast) is available.
+            Bool SupportsIndexedColorMask = false;
+            // GL_EXT_blend_func_extended is present: the driver accepts GL_SRC1_* dual-source blend
+            // factors and layout(index = 1) fragment outputs. GLES core has no dual-source blending,
+            // so without this a draw using a SRC1 factor cannot proceed.
+            Bool SupportsDualSourceBlend = false;
+            // GL_RENDERER contains "ANGLE".
+            Bool IsAngleRenderer = false;
+            // GL_RENDERER contains both "ANGLE" and "llvmpipe".
+            Bool IsAngleLlvmpipeRenderer = false;
+            // IsAngleLlvmpipeRenderer combined with the
+            // MOBILEGL_AVOID_SAMPLER_MIPMAP_MIN_FILTER feature toggle:
+            // sampler min filters should drop their mipmap component.
+            Bool AvoidSamplerMipmapMinFilter = false;
+            // True when indirect draws leak the command's baseInstance word ("reserved,
+            // must be zero" in unextended ES) into gl_InstanceID. Conforming ES drivers
+            // keep gl_InstanceID zero-based; ANGLE's Vulkan backend hands the command
+            // straight to vkCmdDraw*Indirect and compiles gl_InstanceID to SPIR-V
+            // InstanceIndex, which includes firstInstance.
+            Bool IndirectDrawInstanceIdIncludesBaseInstance = false;
             Int UniformBufferOffsetAlignment = 256;
             Float AliasedLineWidthRangeMin = 1.0f;
             Float AliasedLineWidthRangeMax = 1.0f;
@@ -1075,6 +1121,11 @@ namespace MobileGL {
         void AcquireEGLFunctions(MG_External::EGLFunctionsTable& funcs);
         Bool FillInGLESCapabilities(MG_External::GLESCapabilities& caps,
                                     const MG_External::GLESFunctionsTable& glesFuncs);
+        // Detects whether indirect draws leak the command's baseInstance word into
+        // gl_InstanceID (see Loader.cpp). Called by FillInGLESCapabilities; exposed
+        // so MG_Test can drive it against a fake GLES functions table.
+        Bool ProbeIndirectInstanceIdIncludesBaseInstance(const MG_External::GLESCapabilities& caps,
+                                                         const MG_External::GLESFunctionsTable& glesFuncs);
     } // namespace MG_Util::BackendLoader
 } // namespace MobileGL
 #undef MOBILEGL_EXTERNAL_GLES

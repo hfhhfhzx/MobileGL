@@ -40,10 +40,16 @@ if (APPLE)
     target_link_libraries(DirectVulkanSanityTest PRIVATE objc)
     target_link_libraries(DirectVulkanSanityTest PRIVATE ${QUARTZCORE_FRAMEWORK})
 endif()
+if (MSVC)
+    # The GLES headers declare gl* as dllimport on Windows, so objects like GetProcAddress.cpp
+    # reference __imp_gl*. Those resolve against the in-library GL entry-point definitions only
+    # if their objects are part of the link; pull the whole static library like the DLL does.
+    target_link_options(DirectVulkanSanityTest PRIVATE /WHOLEARCHIVE:MobileGL_s)
+endif()
 target_compile_definitions(DirectVulkanSanityTest PRIVATE -DNOMINMAX)
 
 include(GoogleTest)
-gtest_discover_tests(DirectVulkanSanityTest)
+gtest_discover_tests(DirectVulkanSanityTest DISCOVERY_TIMEOUT 30 PROPERTIES LABELS integration)
 
 add_executable(
         DirectVulkanTestExec

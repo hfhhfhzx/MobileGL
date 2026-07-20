@@ -7,14 +7,48 @@
         android:theme="@style/Theme.MobileGLPlugin">
 
         <activity
-            android:name=".PluginActivity"
+            android:name=".PostActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|uiMode"
             android:exported="true"
-            android:theme="@style/Theme.MobileGLPlugin.NoDisplay">
+            android:theme="@style/Theme.MobileGLPlugin">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".PluginActivity"
+            android:exported="true"
+            android:theme="@style/Theme.MobileGLPlugin.NoDisplay" />
+
+        <meta-data
+            android:name="fclPlugin_V2"
+            android:resource="@string/config" />
+        <meta-data
+            android:name="mobilegl_backend_type_title"
+            android:resource="@string/mobilegl_backend_type_title" />
+        <meta-data
+            android:name="mobilegl_disable_timerquery_title"
+            android:resource="@string/mobilegl_disable_timerquery_title" />
+        <meta-data
+            android:name="mobilegl_disable_subgroup_title"
+            android:resource="@string/mobilegl_disable_subgroup_title" />
+        <meta-data
+            android:name="mobilegl_magma_r11g11b10f_fallback_title"
+            android:resource="@string/mobilegl_magma_r11g11b10f_fallback_title" />
+        <meta-data
+            android:name="mobilegl_magma_frames_inflight_title"
+            android:resource="@string/mobilegl_magma_frames_inflight_title" />
+        <meta-data
+            android:name="mobilegl_avoid_sampler_mipmap_min_filter_title"
+            android:resource="@string/mobilegl_avoid_sampler_mipmap_min_filter_title" />
+        <meta-data
+            android:name="mobilegl_coherent_as_flush_title"
+            android:resource="@string/mobilegl_coherent_as_flush_title" />
+        <meta-data
+            android:name="mobilegl_use_angle_title"
+            android:resource="@string/mobilegl_use_angle_title" />
 
         <meta-data
             android:name="fclPlugin"

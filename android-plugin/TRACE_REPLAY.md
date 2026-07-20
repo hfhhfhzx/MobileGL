@@ -32,22 +32,26 @@ target_frame  target frame index, or -1
 target_call   target call number, or -1
 width         optional replay surface width override
 height        optional replay surface height override
-tolerance     allowed mismatching pixel count after fuzz is applied
-fuzz_percent  per-channel fuzz percentage; default is 20
+ssim_threshold minimum SSIM required to pass; default is 0.99
 crop_x        optional compare crop x
 crop_y        optional compare crop y
 crop_width    optional compare crop width
 crop_height   optional compare crop height
+use_angle     optional boolean; DirectGLES uses packaged ANGLE when true
+use_pbuffer   optional boolean; DirectGLES uses an offscreen EGL pbuffer when true
+angle_variant required with use_angle; signed packaged ANGLE short hash (`ec889e6ea831` or `90a62123d794`)
 ```
 
 Implementation notes:
 
 - The trace APK builds independently from FCL and can be launched with `adb shell am start`.
 - The native runner validates inputs, sets `MOBILEGL_BACKEND_TYPE`, loads `libMobileGL.so`, runs apitrace GL retrace, writes `actual.png`, and writes `result.json`.
+- Snapshot capture stays entirely in the retrace layer: apitrace selects the target call, obtains drawable/read-buffer state, calls MobileGL's public `glReadPixels`, and encodes the returned pixels to PNG. MobileGL has no trace-call or output-path hooks.
 - The runner uses a MobileGL-backed EGL window-system shim. GLX calls in PC traces are consumed by apitrace's GLX retrace frontend and mapped onto this EGL shim; the Android runner does not require or call a MobileGL GLX implementation.
-- `DirectGLES` replays on an EGL pbuffer by default, avoiding Android `SurfaceView` lifetime coupling. `DirectVulkan` still uses the Activity surface because it needs a native window-backed Vulkan swapchain.
-- Golden comparison is implemented in native C++ with libpng RGBA decode. The Java Activity only passes arguments and displays the native result, so the replay/compare core is not tied to Android UI or Bitmap APIs and can be ported to Linux.
+- `DirectGLES` and `DirectVulkan` replay on the Activity `SurfaceView` by default. DirectGLES can still use the old offscreen EGL pbuffer path by passing `use_pbuffer=true`.
+- Golden comparison is implemented in native C++ with libpng RGBA decode and SSIM validation. The Java Activity only passes arguments and displays the native result, so the replay/compare core is not tied to Android UI or Bitmap APIs and can be ported to Linux.
 - The plugin profile still excludes `libtrace_replay_runner.so`; normal plugin APK behavior is preserved.
+- Set `MOBILEGL_USE_ANGLE=1` and `MOBILEGL_TRACE_ANGLE_VARIANT=<short-hash>` when running `trace-replay-ci.sh` for DirectGLES. The trace APK contains both allowlisted ANGLE builds with short-hash filenames and SONAMEs; MobileGL resolves its signed native library directory and loads the selected pair by absolute path. Set `MOBILEGL_RETRACE_USE_PBUFFER=1` or pass `--use-pbuffer` to keep DirectGLES offscreen.
 
 Example core-profile trace smoke command for a debug trace APK:
 
@@ -64,8 +68,9 @@ adb shell am start -a top.mobilegl.plugin.TRACE_REPLAY \
   --es output_dir /data/user/0/top.mobilegl.plugin.espryt.trace/files/trace-replay/output \
   --es diff_path /data/user/0/top.mobilegl.plugin.espryt.trace/files/trace-replay/output/app-diff.png \
   --es backend DirectGLES \
+  --ez use_angle true \
+  --es angle_variant ec889e6ea831 \
   --el target_call 31249 \
-  --ei tolerance 0 \
-  --ei fuzz_percent 20
+  --es ssim_threshold 0.99
 adb shell run-as top.mobilegl.plugin.espryt.trace cat files/trace-replay/output/result.json
 ```

@@ -11,36 +11,317 @@
 #include "DirectVulkan.h"
 #include "MG_State/GLState/FramebufferState/FramebufferObject.h"
 #include "MG_State/GLState/TextureState/TextureState.h"
+#include "MG_Util/Classifiers/TextureEnumClassifier.h"
+#include "MG_Util/Converters/MGToGL/TextureEnumConverter.h"
+#include "MG_Util/Converters/MGToStr/TextureEnumConverter.h"
+#include "MG_Util/Converters/MGToVk/TextureEnumConverter.h"
+#include "MG_Util/Texture/TextureFormatProcessor.h"
+
+#include <Config.h>
+#include <cstdlib>
+#include <cstring>
 
 namespace MobileGL::MG_Backend::DirectVulkan {
     namespace {
+        Bool IsR11G11B10FFallbackEnabled() {
+            return MG_Config::Features.MagmaR11G11B10FFallback;
+        }
+
         Bool IsReleaseCurrentRequest(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
-            return dpy == EGL_NO_DISPLAY && draw == EGL_NO_SURFACE && read == EGL_NO_SURFACE && ctx == EGL_NO_CONTEXT;
+            (void)dpy;
+            return draw == EGL_NO_SURFACE && read == EGL_NO_SURFACE && ctx == EGL_NO_CONTEXT;
+        }
+
+        Bool IsFormatIndexValid(TextureInternalFormat format) {
+            return format != TextureInternalFormat::Unknown && static_cast<Int>(format) >= 0 &&
+                   static_cast<SizeT>(format) < kFormatCapabilityFormatCount;
+        }
+
+        Bool IsLayeredTarget(TextureTarget target) {
+            return target == TextureTarget::Texture3D || target == TextureTarget::Texture1DArray ||
+                   target == TextureTarget::Texture2DArray || target == TextureTarget::TextureCubeMap ||
+                   target == TextureTarget::TextureCubeMapArray ||
+                   target == TextureTarget::Texture2DMultisampleArray;
+        }
+
+        Bool IsMultisampleTarget(TextureTarget target) {
+            return target == TextureTarget::Texture2DMultisample ||
+                   target == TextureTarget::Texture2DMultisampleArray;
+        }
+
+        Bool IsTextureBufferTarget(TextureTarget target) {
+            return target == TextureTarget::TextureBuffer;
+        }
+
+        Bool IsIntegerInternalFormat(TextureInternalFormat format) {
+            const GLenum glFormat = MG_Util::ConvertTextureInternalFormatToGLEnum(format);
+            GLenum normalizedInternalFormat = glFormat;
+            GLenum imageFormat = GL_RGBA;
+            GLenum imageType = GL_UNSIGNED_BYTE;
+            MG_Util::TextureFormatProcessor::NormalizePixelFormat(
+                glFormat, PixelFormatNormalizeOptionBit::None, &normalizedInternalFormat, &imageFormat, &imageType);
+            return imageFormat == GL_RED_INTEGER || imageFormat == GL_RG_INTEGER || imageFormat == GL_RGB_INTEGER ||
+                   imageFormat == GL_RGBA_INTEGER;
+        }
+
+        FormatCapabilityFlags GetAttachmentCaps(TextureInternalFormat format) {
+            FormatCapabilityFlags caps = FormatCapability::FramebufferRenderable;
+            const Bool isDepth = MG_Util::IsDepthFormatInternalFormat(format);
+            const Bool isStencil = MG_Util::IsStencilFormatInternalFormat(format);
+            if (!isDepth && !isStencil) {
+                caps |= FormatCapability::ColorAttachment;
+            }
+            if (isDepth) {
+                caps |= FormatCapability::DepthAttachment;
+            }
+            if (isStencil) {
+                caps |= FormatCapability::StencilAttachment;
+            }
+            return caps;
+        }
+
+        FormatCapabilityFlags BuildVulkanCaps(TextureInternalFormat logicalFormat,
+                                              TextureTarget target,
+                                              VkFormatFeatureFlags features) {
+            FormatCapabilityFlags caps;
+            const Bool isDepth = MG_Util::IsDepthFormatInternalFormat(logicalFormat);
+            const Bool isStencil = MG_Util::IsStencilFormatInternalFormat(logicalFormat);
+            const Bool isInteger = IsIntegerInternalFormat(logicalFormat);
+
+            if (IsTextureBufferTarget(target)) {
+                if ((features & VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT) != 0) {
+                    caps |= FormatCapability::Creatable;
+                    caps |= FormatCapability::Sampled;
+                    caps |= FormatCapability::TextureBuffer;
+                }
+                return caps;
+            }
+
+            const Bool sampled = (features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+            const Bool linearFilter = (features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+            const Bool colorRenderable = (features & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+            const Bool depthStencilRenderable =
+                (features & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+            const Bool renderable = (isDepth || isStencil) ? depthStencilRenderable : colorRenderable;
+
+            if (sampled || renderable) {
+                caps |= FormatCapability::Creatable;
+            }
+            if (sampled) {
+                caps |= FormatCapability::Sampled;
+                if (linearFilter && !isInteger && !isStencil) {
+                    caps |= FormatCapability::LinearFilter;
+                }
+                if (!isStencil && (features & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0 &&
+                    (features & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0) {
+                    caps |= FormatCapability::GenerateMipmap;
+                }
+                if (!isInteger && !isDepth && !isStencil) {
+                    caps |= FormatCapability::TextureGather;
+                }
+                if (isDepth && !isStencil) {
+                    caps |= FormatCapability::TextureShadow;
+                }
+            }
+            if (renderable) {
+                caps |= GetAttachmentCaps(logicalFormat);
+                if (IsLayeredTarget(target)) {
+                    caps |= FormatCapability::FramebufferLayered;
+                }
+            }
+            if (IsMultisampleTarget(target)) {
+                caps |= FormatCapability::MultisampleTexture;
+            }
+            return caps;
+        }
+
+        Optional<TextureInternalFormat> ResolveVulkanFallbackLogicalFormat(TextureInternalFormat format) {
+            switch (format) {
+            case TextureInternalFormat::RGB:
+            case TextureInternalFormat::RGB8:
+                return TextureInternalFormat::RGBA8;
+            case TextureInternalFormat::SRGB8:
+                return TextureInternalFormat::SRGB8Alpha8;
+            case TextureInternalFormat::RGB8Snorm:
+                return TextureInternalFormat::RGBA8Snorm;
+            case TextureInternalFormat::RGB16:
+                return TextureInternalFormat::RGBA16;
+            case TextureInternalFormat::RGB16Snorm:
+                return TextureInternalFormat::RGBA16Snorm;
+            case TextureInternalFormat::RGB16F:
+                return TextureInternalFormat::RGBA16F;
+            case TextureInternalFormat::R11FG11FB10F:
+                if (IsR11G11B10FFallbackEnabled()) {
+                    return TextureInternalFormat::RGBA16F;
+                }
+                return Nullopt;
+            case TextureInternalFormat::RGB32F:
+                return TextureInternalFormat::RGBA32F;
+            case TextureInternalFormat::RGB8I:
+                return TextureInternalFormat::RGBA8I;
+            case TextureInternalFormat::RGB8UI:
+                return TextureInternalFormat::RGBA8UI;
+            case TextureInternalFormat::RGB16I:
+                return TextureInternalFormat::RGBA16I;
+            case TextureInternalFormat::RGB16UI:
+                return TextureInternalFormat::RGBA16UI;
+            case TextureInternalFormat::RGB32I:
+                return TextureInternalFormat::RGBA32I;
+            case TextureInternalFormat::RGB32UI:
+                return TextureInternalFormat::RGBA32UI;
+            default:
+                return Nullopt;
+            }
+        }
+
+        Optional<VkFormat> ResolveVulkanFallbackFormat(TextureInternalFormat format) {
+            const Optional<TextureInternalFormat> fallbackLogicalFormat = ResolveVulkanFallbackLogicalFormat(format);
+            if (!fallbackLogicalFormat) {
+                return Nullopt;
+            }
+            return MG_Util::ConvertTextureInternalFormatToVkEnum(*fallbackLogicalFormat);
+        }
+
+        Bool HasNewCaveatFormatCaps(FormatCapabilityFlags nativeCaps, FormatCapabilityFlags fallbackCaps) {
+            for (FormatCapability capability : kReportedFormatCapabilities) {
+                if (HasFormatCapability(fallbackCaps, capability) &&
+                    !HasFormatCapability(nativeCaps, capability)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void LogVulkanFormatCaveat(TextureInternalFormat logicalFormat,
+                                   SizeT targetIndex,
+                                   TextureInternalFormat fallbackFormat) {
+            MGLOG_D("Caveat: %s %s not fully supported. Reason: native Vulkan format is not fully supported. Fallback: %s",
+                    GetFormatCapabilityTargetName(targetIndex).c_str(),
+                    MG_Util::ConvertTextureInternalFormatToString(logicalFormat).c_str(),
+                    MG_Util::ConvertTextureInternalFormatToString(fallbackFormat).c_str());
+        }
+
+        Vector<Int> BuildSampleCounts(Int maxSamples) {
+            Vector<Int> counts;
+            for (Int samples = std::max(maxSamples, 1); samples > 1; samples >>= 1) {
+                counts.push_back(samples);
+            }
+            counts.push_back(1);
+            return counts;
+        }
+
+        void PopulateFormatCapabilitiesImpl(VkPhysicalDevice physicalDevice,
+                                            PFN_vkGetPhysicalDeviceFormatProperties getFormatProperties,
+                                            const MG_External::VulkanCapabilities& capabilities,
+                                            FormatCapabilityCache& cache) {
+            cache.Clear();
+            if (physicalDevice == VK_NULL_HANDLE || getFormatProperties == nullptr) {
+                return;
+            }
+
+            for (SizeT formatIndex = 0; formatIndex < kFormatCapabilityFormatCount; ++formatIndex) {
+                const auto logicalFormat = static_cast<TextureInternalFormat>(formatIndex);
+                if (!IsFormatIndexValid(logicalFormat)) {
+                    continue;
+                }
+
+                VkFormat nativeFormat = MG_Util::ConvertTextureInternalFormatToVkEnum(logicalFormat);
+                const Optional<TextureInternalFormat> fallbackLogicalFormat =
+                    ResolveVulkanFallbackLogicalFormat(logicalFormat);
+                VkFormat fallbackFormat = ResolveVulkanFallbackFormat(logicalFormat).value_or(VK_FORMAT_UNDEFINED);
+
+                VkFormatProperties nativeProperties{};
+                if (nativeFormat != VK_FORMAT_UNDEFINED) {
+                    getFormatProperties(physicalDevice, nativeFormat, &nativeProperties);
+                }
+
+                VkFormatProperties fallbackProperties{};
+                if (fallbackFormat != VK_FORMAT_UNDEFINED && fallbackFormat != nativeFormat) {
+                    getFormatProperties(physicalDevice, fallbackFormat, &fallbackProperties);
+                }
+
+                for (SizeT targetIndex = 0; targetIndex < kFormatCapabilityTextureTargetCount; ++targetIndex) {
+                    const auto target = static_cast<TextureTarget>(targetIndex);
+                    const VkFormatFeatureFlags nativeFeatures =
+                        IsTextureBufferTarget(target) ? nativeProperties.bufferFeatures
+                                                      : nativeProperties.optimalTilingFeatures;
+                    FormatCapabilityFlags nativeCaps = BuildVulkanCaps(logicalFormat, target, nativeFeatures);
+                    cache.FullCaps[targetIndex][formatIndex] |= nativeCaps;
+
+                    const VkFormatFeatureFlags fallbackFeatures =
+                        IsTextureBufferTarget(target) ? fallbackProperties.bufferFeatures
+                                                      : fallbackProperties.optimalTilingFeatures;
+                    FormatCapabilityFlags fallbackCaps = BuildVulkanCaps(logicalFormat, target, fallbackFeatures);
+                    if (fallbackFormat != VK_FORMAT_UNDEFINED && fallbackFormat != nativeFormat) {
+                        cache.CaveatCaps[targetIndex][formatIndex] |= fallbackCaps;
+                        if (fallbackLogicalFormat && HasNewCaveatFormatCaps(nativeCaps, fallbackCaps)) {
+                            LogVulkanFormatCaveat(logicalFormat, targetIndex, *fallbackLogicalFormat);
+                        }
+                    }
+
+                    if (HasFormatCapability(nativeCaps | fallbackCaps, FormatCapability::MultisampleTexture)) {
+                        const Bool isDepth = MG_Util::IsDepthFormatInternalFormat(logicalFormat);
+                        const Bool isStencil = MG_Util::IsStencilFormatInternalFormat(logicalFormat);
+                        const Bool isInteger = IsIntegerInternalFormat(logicalFormat);
+                        Int maxSamples = capabilities.MaxColorTextureSamples;
+                        if (isDepth || isStencil) {
+                            maxSamples = capabilities.MaxDepthTextureSamples;
+                        } else if (isInteger) {
+                            maxSamples = capabilities.MaxIntegerSamples;
+                        }
+                        cache.SampleCounts[targetIndex][formatIndex] = BuildSampleCounts(maxSamples);
+                    }
+                }
+
+                const SizeT renderbufferTargetIndex = GetRenderbufferFormatCapabilityTargetIndex();
+                FormatCapabilityFlags renderbufferCaps =
+                    BuildVulkanCaps(logicalFormat, TextureTarget::Texture2D, nativeProperties.optimalTilingFeatures);
+                renderbufferCaps &= FormatCapability::Creatable;
+                if ((nativeProperties.optimalTilingFeatures &
+                     (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0) {
+                    renderbufferCaps |= GetAttachmentCaps(logicalFormat);
+                    renderbufferCaps |= FormatCapability::MultisampleRenderbuffer;
+                }
+                cache.FullCaps[renderbufferTargetIndex][formatIndex] |= renderbufferCaps;
+
+                if (fallbackFormat != VK_FORMAT_UNDEFINED && fallbackFormat != nativeFormat) {
+                    FormatCapabilityFlags fallbackRenderbufferCaps =
+                        BuildVulkanCaps(logicalFormat, TextureTarget::Texture2D,
+                                        fallbackProperties.optimalTilingFeatures);
+                    fallbackRenderbufferCaps &= FormatCapability::Creatable;
+                    if ((fallbackProperties.optimalTilingFeatures &
+                         (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) !=
+                        0) {
+                        fallbackRenderbufferCaps |= GetAttachmentCaps(logicalFormat);
+                        fallbackRenderbufferCaps |= FormatCapability::MultisampleRenderbuffer;
+                    }
+                    cache.CaveatCaps[renderbufferTargetIndex][formatIndex] |= fallbackRenderbufferCaps;
+                    if (fallbackLogicalFormat &&
+                        HasNewCaveatFormatCaps(renderbufferCaps, fallbackRenderbufferCaps)) {
+                        LogVulkanFormatCaveat(logicalFormat, renderbufferTargetIndex, *fallbackLogicalFormat);
+                    }
+                }
+
+                const FormatCapabilityFlags rbCaps = cache.FullCaps[renderbufferTargetIndex][formatIndex] |
+                                                     cache.CaveatCaps[renderbufferTargetIndex][formatIndex];
+                if (HasFormatCapability(rbCaps, FormatCapability::MultisampleRenderbuffer)) {
+                    cache.SampleCounts[renderbufferTargetIndex][formatIndex] =
+                        BuildSampleCounts(capabilities.MaxFramebufferSamples);
+                }
+            }
         }
     } // namespace
 
+    void PopulateFormatCapabilities(VkPhysicalDevice physicalDevice,
+                                    PFN_vkGetPhysicalDeviceFormatProperties getFormatProperties,
+                                    const MG_External::VulkanCapabilities& capabilities,
+                                    FormatCapabilityCache& cache) {
+        PopulateFormatCapabilitiesImpl(physicalDevice, getFormatProperties, capabilities, cache);
+    }
+
     BackendObject_DirectVulkan::~BackendObject_DirectVulkan() = default;
 
-    BackendObject_DirectVulkan::BackendObject_DirectVulkan():
-        m_rendererInfo{
-            .RendererName = "Magma",
-            .BackendName = "Direct (Vulkan)",
-            .ExtraVendor = Nullopt,
-            .RendererGLInfo =
-                {
-                    .TargetGLVersion = {3, 3, 0},
-                    .TargetGLSLVersion = {4, 6, 0},
-                    .Extensions = {V_OpenGL30, V_OpenGL31, V_OpenGL32,
-                                   V_OpenGL33, E_GL_ARB_draw_buffers_blend, E_GL_ARB_compute_shader,
-                                   E_GL_ARB_shader_storage_buffer_object, E_GL_ARB_shader_image_load_store,
-                                   E_GL_ARB_program_interface_query, E_GL_ARB_framebuffer_object,
-                                   E_GL_ARB_multi_draw_indirect, E_GL_ARB_indirect_parameters,
-                                   E_GL_EXT_framebuffer_object, E_GL_ARB_depth_texture, E_GL_ARB_buffer_storage,
-                                   E_GL_ARB_texture_storage, E_GL_ARB_direct_state_access,
-                                   E_GL_ARB_shader_draw_parameters, E_GL_ARB_gpu_shader_int64},
-                    .IsCompatibilityProfile = false
-                },
-            .StaticBackendCapability = {.AllowVSOnlyPrograms = false}} {}
+    BackendObject_DirectVulkan::BackendObject_DirectVulkan(): m_rendererInfo{GetRendererIdentity()} {}
 
     Bool BackendObject_DirectVulkan::InitWindowSurface() {
         if (!m_windowHandle.Handle) {
@@ -50,6 +331,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
         auto nativeWindow = reinterpret_cast<NativeWindowType>(m_windowHandle.Handle);
 
+        // Any renderer instance this assignment replaces is destroyed here;
+        // fence/timer-query handles stamped with the old generation go stale.
+        BumpRendererGeneration();
         pVulkanRenderer = MakeUnique<MG_Backend::DirectVulkan::VulkanRenderer>(nativeWindow);
         MOBILEGL_ASSERT(pVulkanRenderer != nullptr, "InitWindowSurface: VulkanRenderer creation failed");
         pVulkanRenderer->Initialize();
@@ -60,6 +344,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         VulkanRendererConfig config;
         config.SurfaceWidth = static_cast<Uint32>(std::max<EGLint>(width, 1));
         config.SurfaceHeight = static_cast<Uint32>(std::max<EGLint>(height, 1));
+        // Any renderer instance this assignment replaces is destroyed here;
+        // fence/timer-query handles stamped with the old generation go stale.
+        BumpRendererGeneration();
         pVulkanRenderer = MakeUnique<MG_Backend::DirectVulkan::VulkanRenderer>(NativeWindowType{}, config);
         MOBILEGL_ASSERT(pVulkanRenderer != nullptr, "InitPbufferSurface: VulkanRenderer creation failed");
         pVulkanRenderer->Initialize();
@@ -88,6 +375,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
         UpdateDynamicBackendParameters();
         UpdateAdvertisedExtensions();
+        PopulateFormatCapabilities(physicalDevice.handle, vkGetPhysicalDeviceFormatProperties, m_vulkanCaps,
+                                   MutableFormatCapabilities());
+        PrintFormatCapabilities(GetFormatCapabilities());
         return true;
     }
 
@@ -99,56 +389,48 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return BackendObject::InitializeEGLDisplay(dpy, major, minor);
     }
 
-    Bool BackendObject_DirectVulkan::CreateEGLWindowSurface(const WindowHandle& handle) {
+    Bool BackendObject_DirectVulkan::CreateEGLWindowSurface(EGLSurface surface, const WindowHandle& handle) {
         const std::lock_guard<std::recursive_mutex> lock(m_eglStateMutex);
         if (!m_initialized) {
             MGLOG_E("DirectVulkan backend not initialized");
             return false;
         }
-        if (!handle.Handle || (handle.Backend != WindowBackend::Android && handle.Backend != WindowBackend::X11)) {
-            MGLOG_E("DirectVulkan backend only supports Android and X11 native windows");
+        if (!handle.Handle || (handle.Backend != WindowBackend::Android &&
+                               handle.Backend != WindowBackend::X11 &&
+                               handle.Backend != WindowBackend::MetalLayer)) {
+            MGLOG_E("DirectVulkan backend only supports Android, X11, and CAMetalLayer native windows");
             return false;
         }
 
-        const Bool sameHandle = m_eglSurfaceInitialized && m_eglSurfaceKind == SurfaceKind::Window &&
-                                m_windowHandle.Backend == handle.Backend && m_windowHandle.Handle == handle.Handle;
-        if (sameHandle) {
-            return true;
-        }
-
-        if (m_eglSurfaceInitialized || pVulkanRenderer) {
-            pVulkanRenderer.reset();
-            ResetEGLRuntimeState();
-        }
-
-        return BackendObject::CreateEGLWindowSurface(handle);
+        return RegisterEGLWindowSurface(surface, handle);
     }
 
-    Bool BackendObject_DirectVulkan::CreateEGLPbufferSurface(EGLint width, EGLint height) {
+    Bool BackendObject_DirectVulkan::ResizeEGLWindowSurface(EGLSurface surface, Uint32 width, Uint32 height) {
         const std::lock_guard<std::recursive_mutex> lock(m_eglStateMutex);
         if (!m_initialized) {
             MGLOG_E("DirectVulkan backend not initialized");
             return false;
         }
-        if (m_eglSurfaceInitialized && m_eglSurfaceKind == SurfaceKind::Pbuffer) {
-            return true;
+        if (!BackendObject::ResizeEGLWindowSurface(surface, width, height)) {
+            return false;
         }
-        if (m_eglSurfaceInitialized || pVulkanRenderer) {
-            pVulkanRenderer.reset();
-            ResetEGLRuntimeState();
+        if (pVulkanRenderer && m_eglSurface == surface) {
+            pVulkanRenderer->RequestSwapchainResize(width, height);
         }
-        return BackendObject::CreateEGLPbufferSurface(width, height);
+        return true;
+    }
+
+    Bool BackendObject_DirectVulkan::CreateEGLPbufferSurface(EGLSurface surface, EGLint width, EGLint height) {
+        const std::lock_guard<std::recursive_mutex> lock(m_eglStateMutex);
+        if (!m_initialized) {
+            MGLOG_E("DirectVulkan backend not initialized");
+            return false;
+        }
+        return RegisterEGLPbufferSurface(surface, width, height);
     }
 
     Bool BackendObject_DirectVulkan::MakeEGLCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
         const std::lock_guard<std::recursive_mutex> lock(m_eglStateMutex);
-        if (IsReleaseCurrentRequest(dpy, draw, read, ctx)) {
-            return BackendObject::MakeEGLCurrent(dpy, draw, read, ctx);
-        }
-        if (!pVulkanRenderer) {
-            MGLOG_E("DirectVulkan renderer is not initialized");
-            return false;
-        }
         return BackendObject::MakeEGLCurrent(dpy, draw, read, ctx);
     }
 
@@ -161,10 +443,26 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return BackendObject::SwapEGLBuffers(dpy, draw);
     }
 
+    void BackendObject_DirectVulkan::ReleaseEGLSurface(EGLSurface surface) {
+        const std::lock_guard<std::recursive_mutex> lock(m_eglStateMutex);
+        BackendObject::ReleaseEGLSurface(surface);
+    }
+
     void BackendObject_DirectVulkan::ReleaseEGLResources() {
         const std::lock_guard<std::recursive_mutex> lock(m_eglStateMutex);
+        // Outstanding fence/timer-query handles now refer to a dead renderer;
+        // treat them as signaled/available with zero results from here on.
+        BumpRendererGeneration();
         pVulkanRenderer.reset();
         BackendObject::ReleaseEGLResources();
+    }
+
+    void BackendObject_DirectVulkan::OnEGLSurfaceReleased(EGLSurface surface) {
+        (void)surface;
+        // Outstanding fence/timer-query handles now refer to a dead renderer;
+        // treat them as signaled/available with zero results from here on.
+        BumpRendererGeneration();
+        pVulkanRenderer.reset();
     }
 
     const RendererInfo& BackendObject_DirectVulkan::GetRendererInfo() const {
@@ -175,11 +473,65 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         if (!m_initialized) {
             return "<uninitialized DirectVulkan backend>";
         }
+        return FormatBackendAPIVersionString(m_vulkanCaps.DeviceName, m_vulkanCaps.VulkanAPIVersion.toString(),
+                                             m_vulkanCaps.DriverVersionString);
+    }
+
+    const RendererInfo& GetRendererIdentity() {
+        static const RendererInfo rendererInfo = {
+            .RendererName = "Magma",
+            .BackendName = "Direct (Vulkan)",
+            .ExtraVendor = Nullopt,
+            .RendererGLInfo =
+                {
+                    .TargetGLVersion = {3, 3, 0},
+                    .TargetGLSLVersion = {4, 6, 0},
+                    // Baseline advertisement (no shader subgroup, no timer queries); a
+                    // live backend reconciles its copy in UpdateAdvertisedExtensions.
+                    .Extensions = BuildAdvertisedExtensions(false, false, false),
+                    .IsCompatibilityProfile = false
+                },
+            .StaticBackendCapability = {.AllowVSOnlyPrograms = false}};
+        return rendererInfo;
+    }
+
+    Vector<GLExtension> BuildAdvertisedExtensions(Bool shaderSubgroupSupported, Bool timerQueriesSupported,
+                                                  Bool anisotropicFilteringSupported) {
+        Vector<GLExtension> extensions = {V_OpenGL30, V_OpenGL31, V_OpenGL32,
+                                          V_OpenGL33, E_GL_ARB_draw_buffers_blend, E_GL_ARB_compute_shader,
+                                          E_GL_ARB_shader_storage_buffer_object, E_GL_ARB_shader_image_load_store,
+                                          E_GL_ARB_program_interface_query, E_GL_ARB_framebuffer_object,
+                                          E_GL_ARB_multi_draw_indirect, E_GL_ARB_indirect_parameters,
+                                          E_GL_EXT_framebuffer_object, E_GL_ARB_depth_texture, E_GL_ARB_buffer_storage,
+                                          E_GL_ARB_texture_storage, E_GL_ARB_texture_storage_multisample,
+                                          E_GL_ARB_direct_state_access,
+                                          E_GL_ARB_shader_draw_parameters, E_GL_ARB_gpu_shader_int64, E_GL_KHR_debug,
+                                          E_GL_ARB_gpu_shader5, E_GL_ARB_multi_bind, E_GL_ARB_shading_language_420pack,
+                                          E_GL_ARB_vertex_attrib_binding, E_GL_ARB_shader_image_size};
+        if (shaderSubgroupSupported && !MG_Config::Features.DisableSubgroup) {
+            extensions.push_back(E_GL_KHR_shader_subgroup);
+        }
+        // GL_ARB_timer_query gates MC's F3 GPU% (LWJGL checks the extension string);
+        // only advertised when the device actually supports timestamp queries and the
+        // MOBILEGL_DISABLE_TIMERQUERY escape hatch is off.
+        if (timerQueriesSupported && !MG_Config::Features.DisableTimerQuery) {
+            extensions.push_back(E_GL_ARB_timer_query);
+        }
+        // Only advertised when the samplerAnisotropy device feature was granted: without it the
+        // sampler state is accepted but never applied, and an app trusting the string (LWJGL builds
+        // GLCapabilities from it) would think it enabled anisotropic filtering.
+        if (anisotropicFilteringSupported) {
+            extensions.push_back(E_GL_EXT_texture_filter_anisotropic);
+            extensions.push_back(E_GL_ARB_texture_filter_anisotropic);
+        }
+        return extensions;
+    }
+
+    String FormatBackendAPIVersionString(const String& deviceName, const String& vulkanApiVersionString,
+                                         const String& driverVersionString) {
         // Format:
         // <GPU Name>, Vulkan <Vulkan Version>, Driver <Driver Version>
-        String str = m_vulkanCaps.DeviceName + ", Vulkan " + m_vulkanCaps.VulkanAPIVersion.toString() + ", Driver " +
-                     m_vulkanCaps.DriverVersionString;
-        return str;
+        return deviceName + ", Vulkan " + vulkanApiVersionString + ", Driver " + driverVersionString;
     }
 
     BackendType BackendObject_DirectVulkan::GetBackendType() const {
@@ -194,6 +546,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             funcsTable.GL.DrawArrays = DrawArrays;
             funcsTable.GL.DrawElements = DrawElements;
             funcsTable.GL.DrawElementsBaseVertex = DrawElementsBaseVertex;
+            funcsTable.GL.MultiDrawArrays = MultiDrawArrays;
             funcsTable.GL.MultiDrawElements = MultiDrawElements;
             funcsTable.GL.MultiDrawElementsBaseVertex = MultiDrawElementsBaseVertex;
             funcsTable.GL.MultiDrawElementsIndirect = MultiDrawElementsIndirect;
@@ -221,6 +574,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             funcsTable.GL.BlitNamedFramebuffer = BlitNamedFramebuffer;
             funcsTable.GL.CopyTexImage2D = CopyTexImage2D;
             funcsTable.GL.CopyTexSubImage2D = CopyTexSubImage2D;
+            funcsTable.GL.CopyImageSubData = CopyImageSubData;
             funcsTable.GL.GenerateMipmap = GenerateMipmap;
             funcsTable.GL.ReadPixels = ReadPixels;
             funcsTable.GL.GetTexImage = GetTexImage;
@@ -240,6 +594,25 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             funcsTable.GL.GetProgramResourceLocation = GetProgramResourceLocation;
             funcsTable.GL.GetProgramResourceLocationIndex = GetProgramResourceLocationIndex;
             funcsTable.GL.ShaderStorageBlockBinding = ShaderStorageBlockBinding;
+            funcsTable.GL.FenceSync = FenceSync;
+            funcsTable.GL.ClientWaitSync = ClientWaitSync;
+            funcsTable.GL.WaitSync = WaitSync;
+            funcsTable.GL.DeleteSync = DeleteSync;
+            funcsTable.GL.GetSyncStatus = GetSyncStatus;
+            // Optional timer-query group: left null (the frontend then falls
+            // back) when disabled via MOBILEGL_DISABLE_TIMERQUERY. The hooks
+            // themselves additionally degrade to null handles when the device
+            // lacks timestamp support.
+            if (!MG_Config::Features.DisableTimerQuery) {
+                funcsTable.GL.IsTimerQuerySupported = IsTimerQuerySupported;
+                funcsTable.GL.BeginTimeElapsedQuery = BeginTimeElapsedQuery;
+                funcsTable.GL.EndTimeElapsedQuery = EndTimeElapsedQuery;
+                funcsTable.GL.QueryCounterTimestamp = QueryCounterTimestamp;
+                funcsTable.GL.IsQueryResultAvailable = IsQueryResultAvailable;
+                funcsTable.GL.GetQueryResult64 = GetQueryResult64;
+                funcsTable.GL.DeleteBackendQuery = DeleteBackendQuery;
+                funcsTable.GL.GetGpuTimestampNs = GetGpuTimestampNs;
+            }
             funcsTableInitialized = true;
         }
         return funcsTable;
@@ -254,16 +627,19 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         m_vulkanCaps = capabilities;
         UpdateDynamicBackendParameters();
         UpdateAdvertisedExtensions();
+        MutableFormatCapabilities().Clear();
     }
 
     void BackendObject_DirectVulkan::UpdateAdvertisedExtensions() {
-        auto& extensions = m_rendererInfo.RendererGLInfo.Extensions;
-        extensions.erase(std::remove(extensions.begin(), extensions.end(), E_GL_KHR_shader_subgroup),
-                         extensions.end());
-
-        if (m_vulkanCaps.SupportsShaderSubgroup) {
-            extensions.push_back(E_GL_KHR_shader_subgroup);
-        }
+        // GL_ARB_timer_query gates MC's F3 GPU% (LWJGL checks the extension
+        // string). InitCapabilities runs after InitWindowSurface has created
+        // and initialized the renderer, so the advertisement can be gated on
+        // real device timestamp support. ApplyVulkanCapabilitiesForTesting may
+        // run without a renderer; no timer query is advertised then. Rebuilding
+        // the whole list keeps re-runs idempotent.
+        m_rendererInfo.RendererGLInfo.Extensions = BuildAdvertisedExtensions(
+            m_vulkanCaps.SupportsShaderSubgroup, pVulkanRenderer && pVulkanRenderer->IsTimerQuerySupported(),
+            pVulkanRenderer && pVulkanRenderer->IsSamplerAnisotropySupported());
     }
 
     void BackendObject_DirectVulkan::UpdateDynamicBackendParameters() {
@@ -313,6 +689,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         m_dynamicParameters.UniformBufferOffsetAlignment = m_vulkanCaps.UniformBufferOffsetAlignment;
         m_dynamicParameters.AliasedLineWidthRangeMin = m_vulkanCaps.AliasedLineWidthRangeMin;
         m_dynamicParameters.AliasedLineWidthRangeMax = m_vulkanCaps.AliasedLineWidthRangeMax;
+        // Without the samplerAnisotropy feature the limit is unusable, so report 1.0 (no anisotropy)
+        // rather than a maximum the sampler manager will never apply.
+        m_dynamicParameters.MaxTextureMaxAnisotropy =
+            (pVulkanRenderer && pVulkanRenderer->IsSamplerAnisotropySupported()) ? m_vulkanCaps.MaxSamplerAnisotropy
+                                                                                : 1.0f;
         m_dynamicParameters.SmoothLineWidthRangeMin = m_vulkanCaps.SmoothLineWidthRangeMin;
         m_dynamicParameters.SmoothLineWidthRangeMax = m_vulkanCaps.SmoothLineWidthRangeMax;
         m_dynamicParameters.SmoothLineWidthGranularity = m_vulkanCaps.SmoothLineWidthGranularity;
@@ -335,14 +716,28 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         m_dynamicParameters.MaxSampleMaskWords = m_vulkanCaps.MaxSampleMaskWords;
         const Int maxSupportedTextureUnits =
             static_cast<Int>(MG_State::GLState::TextureState::MAX_TEXTURE_IMAGE_UNITS);
-        m_dynamicParameters.MaxTextureImageUnits = std::min(m_vulkanCaps.MaxTextureImageUnits, maxSupportedTextureUnits);
+        // GL_MAX_TEXTURE_IMAGE_UNITS is a *per-stage* sampler limit. Adreno/Qualcomm report a huge
+        // maxPerStageDescriptorSampledImages (descriptor-indexing scale), so clamping it only to our
+        // combined array capacity (192) still advertises 192 per stage. Host code treats this value as
+        // an array bound: Minecraft's Blaze3D GlStateManager.TEXTURES[] holds 128 entries and Iris
+        // iterates [0, GL_MAX_TEXTURE_IMAGE_UNITS) over it (CompositeRenderer.renderAll), so any value
+        // > 128 throws ArrayIndexOutOfBoundsException. Match desktop drivers (32) for the per-stage
+        // limits while keeping the combined limit at our texture-unit array capacity.
+        constexpr Int maxPerStageTextureUnits =
+            static_cast<Int>(MG_State::GLState::TextureState::MAX_PER_STAGE_TEXTURE_IMAGE_UNITS);
+        m_dynamicParameters.MaxTextureImageUnits =
+            std::min(m_vulkanCaps.MaxTextureImageUnits, maxPerStageTextureUnits);
         m_dynamicParameters.MaxVertexTextureImageUnits =
-            std::min(m_vulkanCaps.MaxVertexTextureImageUnits, maxSupportedTextureUnits);
+            std::min(m_vulkanCaps.MaxVertexTextureImageUnits, maxPerStageTextureUnits);
         m_dynamicParameters.MaxComputeTextureImageUnits =
-            std::min(m_vulkanCaps.MaxComputeTextureImageUnits, maxSupportedTextureUnits);
+            std::min(m_vulkanCaps.MaxComputeTextureImageUnits, maxPerStageTextureUnits);
         m_dynamicParameters.MaxCombinedTextureImageUnits =
             std::min(m_vulkanCaps.MaxCombinedTextureImageUnits, maxSupportedTextureUnits);
-        m_dynamicParameters.MaxVertexAttribs = m_vulkanCaps.MaxVertexAttribs;
+        // Never advertise more attributes than the state layer can store: the current-value array and
+        // the Uint32 attribute masks the draw path passes around are both bounded by MAX_VERTEX_ATTRIBS.
+        m_dynamicParameters.MaxVertexAttribs =
+            std::min(m_vulkanCaps.MaxVertexAttribs,
+                     static_cast<Int>(MG_State::GLState::VertexArrayObject::MAX_VERTEX_ATTRIBS));
         m_dynamicParameters.MaxComputeShaderStorageBlocks = m_vulkanCaps.MaxComputeShaderStorageBlocks;
         m_dynamicParameters.MaxCombinedShaderStorageBlocks = m_vulkanCaps.MaxCombinedShaderStorageBlocks;
         m_dynamicParameters.MaxComputeUniformBlocks = m_vulkanCaps.MaxComputeUniformBlocks;
@@ -351,7 +746,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         m_dynamicParameters.MaxTextureBufferSize = m_vulkanCaps.MaxTextureBufferSize;
         m_dynamicParameters.MaxUniformBufferBindings = m_vulkanCaps.MaxUniformBufferBindings;
         m_dynamicParameters.MaxUniformBlockSize = m_vulkanCaps.MaxUniformBlockSize;
-        m_dynamicParameters.MaxImageUnits = m_vulkanCaps.MaxImageUnits;
+        m_dynamicParameters.MaxImageUnits = std::min(m_vulkanCaps.MaxImageUnits, maxSupportedTextureUnits);
         m_dynamicParameters.MaxCombinedImageUniforms = m_vulkanCaps.MaxCombinedImageUniforms;
         m_dynamicParameters.MaxComputeImageUniforms = m_vulkanCaps.MaxComputeImageUniforms;
         const Int maxSupportedDrawBuffers =

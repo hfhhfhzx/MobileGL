@@ -10,11 +10,18 @@
 
 #include "SpirvPasses/EliminateFloatEqualsZeroPass.h"
 #include "SpirvPasses/FlattenInterfaceStructPass.h"
+#include "SpirvPasses/RenameSamplerFunctionParameterPass.h"
+#include "SpirvPasses/DecomposeWorkgroupVec3Pass.h"
+#include "SpirvPasses/LowerDrawParametersPass.h"
+#include "SpirvPasses/RebaseInstanceIndexPass.h"
+#include "SpirvPasses/StripUboMemberRelaxedPrecisionPass.h"
 #include "spirv-tools/libspirv.h"
 #include "spirv-tools/optimizer.hpp"
 
+#include "ShaderSourceProcessor.h"
 #include <MG_Util/Converters/GLToStr/GLEnumConverter.h>
 #include <MG_Util/Converters/GLToGlslang/ProgramEnumConverter.h>
+#include <cstdlib>
 
 namespace MobileGL {
     namespace MG_Util {
@@ -46,7 +53,8 @@ namespace MobileGL {
                 Resources.maxComputeWorkGroupCountZ = 65535;
                 Resources.maxComputeWorkGroupSizeX = 1024;
                 Resources.maxComputeWorkGroupSizeY = 1024;
-                Resources.maxComputeWorkGroupSizeZ = 64;
+                // TODO: Drive glslang compute resource limits from the active backend instead of this permissive cap.
+                Resources.maxComputeWorkGroupSizeZ = 1024;
                 Resources.maxComputeUniformComponents = 1024;
                 Resources.maxComputeTextureImageUnits = 16;
                 Resources.maxComputeImageUniforms = 8;
@@ -127,25 +135,23 @@ namespace MobileGL {
                 return Resources;
             }
 
-            Result<SharedPtr<glslang::TShader>> ShaderCompiler::CompileShader(const ShaderAttrib& attrib) {
-                auto shaderType = attrib.shaderType;
-                auto& sourceStr = attrib.sourceStr;
-
-                auto lang = MG_Util::ConvertGLEnumToEShLanguage(shaderType);
-                if (lang == EShLanguage::EShLangCount) {
-                    ResultInfo r;
-                    r.log += "Error: [Preprocess] Unsupported shader type: " + ConvertGLEnumToString(shaderType);
-                    r.errc = -1;
-                    return std::unexpected(r);
-                }
-
+            // One parse attempt. A glslang::TShader cannot be re-parsed, so a retry has to build a
+            // fresh one with byte-identical setup - hence a single factored body rather than two
+            // copies that could drift apart.
+            static Result<SharedPtr<glslang::TShader>> ParseShaderSource(EShLanguage lang, GLenum shaderType,
+                                                                         const String& source,
+                                                                         Flags<ShaderCompileBits> flags) {
                 SharedPtr<glslang::TShader> res;
                 auto& tshader = res;
                 tshader = MakeShared<glslang::TShader>(lang);
-                const char* src[] = {sourceStr.data()};
+                // setStrings gets no length array, so it relies on NUL termination: source must be an
+                // owning buffer that outlives parse(), never a StringView's substring.
+                const char* src[] = {source.c_str()};
                 tshader->setStrings(src, 1);
+                tshader->setNanMinMaxClamp(true);
                 tshader->setInvertY(true);
-                if (attrib.flags & ShaderCompileBits::CompileForOpenGL) {
+                tshader->setPreamble("#undef VULKAN\n");
+                if (flags & ShaderCompileBits::CompileForOpenGL) {
                     tshader->setEnvInput(glslang::EShSourceGlsl, lang, glslang::EShClientVulkan, 450);
                     tshader->setEnvClient(glslang::EShClientOpenGL, glslang::EShTargetOpenGL_450);
                     tshader->setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_3);
@@ -174,6 +180,39 @@ namespace MobileGL {
                 return res;
             }
 
+            Result<SharedPtr<glslang::TShader>> ShaderCompiler::CompileShader(const ShaderAttrib& attrib) {
+                auto shaderType = attrib.shaderType;
+
+                auto lang = MG_Util::ConvertGLEnumToEShLanguage(shaderType);
+                if (lang == EShLanguage::EShLangCount) {
+                    ResultInfo r;
+                    r.log += "Error: [Preprocess] Unsupported shader type: " + ConvertGLEnumToString(shaderType);
+                    r.errc = -1;
+                    return std::unexpected(r);
+                }
+
+                const String source(attrib.sourceStr);
+                auto result = ParseShaderSource(lang, shaderType, source, attrib.flags);
+                if (result) return result;
+
+                // Legacy desktop sources are normalized to "#version 330 core", which parses under
+                // stricter rules than the 460 they used to be forced to: a shader declaring 330 while
+                // using e.g. layout(binding=...) without the matching #extension line compiles on real
+                // drivers but is rejected here. Retry once at 460 before reporting failure; a genuinely
+                // broken shader fails both attempts and keeps its original diagnostics.
+                String retrySource = source;
+                if (!MG_Util::ShaderTranspiler::RetargetLegacyVersionDirectiveTo460(retrySource)) {
+                    return result;
+                }
+
+                auto retryResult = ParseShaderSource(lang, shaderType, retrySource, attrib.flags);
+                if (!retryResult) return result;
+
+                MGLOG_D("CompileShader: %s only parsed after retargeting its legacy #version to 460",
+                        ConvertGLEnumToString(shaderType).c_str());
+                return retryResult;
+            }
+
             Result<SharedPtr<glslang::TProgram>> ShaderCompiler::LinkProgram(const ProgramAttrib& attrib) {
                 SharedPtr<glslang::TProgram> program = MakeShared<glslang::TProgram>();
                 for (auto& s : attrib.shaders) {
@@ -197,7 +236,9 @@ namespace MobileGL {
                     if (program->getIntermediate((EShLanguage)stage) == nullptr) continue;
                     resolver =
                         MakeUnique<TMglGlslIoResolver>(*program, (EShLanguage)stage, attrib.explicitVertexInLocations,
-                                                       attrib.explicitFragmentOutLocations);
+                                                       attrib.explicitFragmentOutLocations,
+                                                       attrib.explicitFragmentOutIndices,
+                                                       attrib.explicitOpaqueUniformBindings);
                     break;
                 }
                 auto ioMapper = UniquePtr<glslang::TIoMapper>(glslang::GetGlslIoMapper());
@@ -235,10 +276,120 @@ namespace MobileGL {
 
                 Optimizer optimizer(SPV_ENV_VULKAN_1_1);
 
+                optimizer.RegisterPass(CreateAggressiveDCEPass(false));
+                optimizer.RegisterPass(CreateRemoveUnusedInterfaceVariablesPass());
                 optimizer.RegisterPass(FlattenInterfaceStructPass::CreateFlattenInterfaceStructPass());
+                optimizer.RegisterPass(RenameSamplerFunctionParameterPass::CreateRenameSamplerFunctionParameterPass());
                 optimizer.RegisterPass(EliminateFloatEqualsZeroPass::CreateEliminateFloatEqualsZeroPass());
+                optimizer.RegisterPass(DecomposeWorkgroupVec3Pass::CreateDecomposeWorkgroupVec3Pass());
 
                 return optimizer.Run(inputBinary.data(), inputBinary.size(), &outputBinary, options);
+            }
+
+            bool ShaderCompiler::LowerDrawParametersForEssl(const Vector<Uint32>& inputBinary,
+                                                            Vector<uint32_t>& outputBinary) {
+                using namespace spvtools;
+                OptimizerOptions options;
+                options.set_run_validator(false);
+
+                Optimizer optimizer(SPV_ENV_VULKAN_1_1);
+                optimizer.RegisterPass(LowerDrawParametersPass::CreateLowerDrawParametersPass());
+
+                return optimizer.Run(inputBinary.data(), inputBinary.size(), &outputBinary, options);
+            }
+
+            bool ShaderCompiler::StripUboMemberRelaxedPrecisionForEssl(const Vector<Uint32>& inputBinary,
+                                                                       Vector<uint32_t>& outputBinary) {
+                using namespace spvtools;
+                OptimizerOptions options;
+                options.set_run_validator(false);
+
+                Optimizer optimizer(SPV_ENV_VULKAN_1_1);
+                optimizer.RegisterPass(
+                    StripUboMemberRelaxedPrecisionPass::CreateStripUboMemberRelaxedPrecisionPass());
+
+                return optimizer.Run(inputBinary.data(), inputBinary.size(), &outputBinary, options);
+            }
+
+            bool ShaderCompiler::RebaseInstanceIndexForVulkan(const Vector<Uint32>& inputBinary,
+                                                              Vector<uint32_t>& outputBinary) {
+                using namespace spvtools;
+                OptimizerOptions options;
+                options.set_run_validator(false);
+
+                Optimizer optimizer(SPV_ENV_VULKAN_1_1);
+                optimizer.RegisterPass(RebaseInstanceIndexPass::CreateRebaseInstanceIndexPass());
+
+                return optimizer.Run(inputBinary.data(), inputBinary.size(), &outputBinary, options);
+            }
+
+            bool ShaderCompiler::DecoratePositionInvariantForVulkan(const Vector<Uint32>& inputBinary,
+                                                                    Vector<uint32_t>& outputBinary) {
+                static constexpr Uint32 kHeaderWords = 5;
+                static constexpr Uint32 kOpDecorate = 71;
+                static constexpr Uint32 kOpMemberDecorate = 72;
+                static constexpr Uint32 kDecorationInvariant = 18;
+                static constexpr Uint32 kDecorationBuiltIn = 11;
+                static constexpr Uint32 kBuiltInPosition = 0;
+                if (inputBinary.size() < kHeaderWords) {
+                    return false;
+                }
+
+                // First pass: find targets that already carry Invariant so we never duplicate.
+                struct MemberKey {
+                    Uint32 id;
+                    Uint32 member;
+                    bool operator==(const MemberKey& o) const { return id == o.id && member == o.member; }
+                };
+                Vector<Uint32> invariantIds;
+                Vector<MemberKey> invariantMembers;
+                for (SizeT i = kHeaderWords; i < inputBinary.size();) {
+                    const Uint32 word0 = inputBinary[i];
+                    const Uint32 opcode = word0 & 0xFFFFu;
+                    const Uint32 length = word0 >> 16;
+                    if (length == 0 || i + length > inputBinary.size()) {
+                        return false;
+                    }
+                    if (opcode == kOpDecorate && length >= 3 && inputBinary[i + 2] == kDecorationInvariant) {
+                        invariantIds.push_back(inputBinary[i + 1]);
+                    } else if (opcode == kOpMemberDecorate && length >= 4 &&
+                               inputBinary[i + 3] == kDecorationInvariant) {
+                        invariantMembers.push_back({inputBinary[i + 1], inputBinary[i + 2]});
+                    }
+                    i += length;
+                }
+
+                outputBinary.clear();
+                outputBinary.reserve(inputBinary.size() + 8);
+                outputBinary.insert(outputBinary.end(), inputBinary.begin(), inputBinary.begin() + kHeaderWords);
+                for (SizeT i = kHeaderWords; i < inputBinary.size();) {
+                    const Uint32 word0 = inputBinary[i];
+                    const Uint32 opcode = word0 & 0xFFFFu;
+                    const Uint32 length = word0 >> 16;
+                    outputBinary.insert(outputBinary.end(), inputBinary.begin() + i,
+                                        inputBinary.begin() + i + length);
+                    if (opcode == kOpDecorate && length == 4 &&
+                        inputBinary[i + 2] == kDecorationBuiltIn && inputBinary[i + 3] == kBuiltInPosition) {
+                        const Uint32 target = inputBinary[i + 1];
+                        if (std::find(invariantIds.begin(), invariantIds.end(), target) == invariantIds.end()) {
+                            outputBinary.push_back((3u << 16) | kOpDecorate);
+                            outputBinary.push_back(target);
+                            outputBinary.push_back(kDecorationInvariant);
+                        }
+                    } else if (opcode == kOpMemberDecorate && length == 5 &&
+                               inputBinary[i + 3] == kDecorationBuiltIn && inputBinary[i + 4] == kBuiltInPosition) {
+                        const MemberKey key{inputBinary[i + 1], inputBinary[i + 2]};
+                        if (std::find(invariantMembers.begin(), invariantMembers.end(), key) ==
+                            invariantMembers.end()) {
+                            outputBinary.push_back((4u << 16) | kOpMemberDecorate);
+                            outputBinary.push_back(key.id);
+                            outputBinary.push_back(key.member);
+                            outputBinary.push_back(kDecorationInvariant);
+                        }
+                    }
+                    i += length;
+                }
+                return true;
             }
 
             Result<String> ShaderCompiler::DecompileShader(SpvcSession& session) {

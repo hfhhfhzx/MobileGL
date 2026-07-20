@@ -31,6 +31,20 @@ namespace MobileGL {
             }
         }
 
+        VkPolygonMode ConvertPolygonModeToVkEnum(GLenum mode) {
+            switch (mode) {
+            case GL_FILL:
+                return VK_POLYGON_MODE_FILL;
+            case GL_LINE:
+                return VK_POLYGON_MODE_LINE;
+            case GL_POINT:
+                return VK_POLYGON_MODE_POINT;
+            default:
+                MGLOG_W("Unrecognized polygon mode");
+                return VK_POLYGON_MODE_FILL;
+            }
+        }
+
         VkCullModeFlags ConvertCullFaceModeToVkEnum(CullFaceMode v, Bool invertClockwise) {
             switch (v) {
             case CullFaceMode::Front:
@@ -161,6 +175,14 @@ namespace MobileGL {
                 return VK_BLEND_FACTOR_CONSTANT_ALPHA;
             case BlendFactor::OneMinusConstantAlpha:
                 return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+            case BlendFactor::Src1Color:
+                return VK_BLEND_FACTOR_SRC1_COLOR;
+            case BlendFactor::OneMinusSrc1Color:
+                return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+            case BlendFactor::Src1Alpha:
+                return VK_BLEND_FACTOR_SRC1_ALPHA;
+            case BlendFactor::OneMinusSrc1Alpha:
+                return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
             default:
                 return VK_BLEND_FACTOR_ONE;
             }

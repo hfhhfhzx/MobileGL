@@ -14,17 +14,21 @@ void PrintUsage(const char *argv0) {
             << "\n"
             << "Options:\n"
             << "  --golden PATH             Golden PNG to compare against\n"
+            << "  --alternate-golden PATH   Additional acceptable golden PNG\n"
             << "  --diff PATH               Difference PNG output path\n"
             << "  --backend NAME            DirectGLES or DirectVulkan (default: DirectGLES)\n"
             << "  --mobilegl-library PATH   libMobileGL.so path (default: libMobileGL.so)\n"
             << "  --width N                 Replay surface width override\n"
             << "  --height N                Replay surface height override\n"
-            << "  --tolerance N             Allowed mismatch pixels\n"
-            << "  --fuzz-percent N          Per-channel fuzz threshold, 0-100 (default: 20)\n"
+            << "  --window-surface          Replay to a native window surface\n"
+            << "  --pbuffer-surface         Replay to an EGL pbuffer surface (default)\n"
+            << "  --hold-ms N               Keep the replay process alive after retrace (default: 0)\n"
+            << "  --ssim-threshold N        Minimum SSIM required to pass (default: 0.99)\n"
             << "  --crop-x N                Compare crop x\n"
             << "  --crop-y N                Compare crop y\n"
             << "  --crop-width N            Compare crop width\n"
-            << "  --crop-height N           Compare crop height\n";
+            << "  --crop-height N           Compare crop height\n"
+            << "  --coherent-as-flush       Set MOBILEGL_COHERENT_AS_FLUSH=1 for the replay\n";
 }
 
 bool ReadValue(int argc, char **argv, int &index, std::string &out) {
@@ -54,9 +58,17 @@ bool ReadLongLong(int argc, char **argv, int &index, long long &out) {
     return true;
 }
 
+bool ReadDouble(int argc, char **argv, int &index, double &out) {
+    std::string value;
+    if (!ReadValue(argc, argv, index, value)) {
+        return false;
+    }
+    out = std::strtod(value.c_str(), nullptr);
+    return true;
+}
+
 bool ParseArgs(int argc, char **argv, mobilegl_trace::Request &request) {
     request.backend = "DirectGLES";
-    request.fuzzPercent = 20;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -64,6 +76,12 @@ bool ParseArgs(int argc, char **argv, mobilegl_trace::Request &request) {
             if (!ReadValue(argc, argv, i, request.tracePath)) return false;
         } else if (arg == "--golden") {
             if (!ReadValue(argc, argv, i, request.goldenPath)) return false;
+        } else if (arg == "--alternate-golden") {
+            std::string alternateGolden;
+            if (!ReadValue(argc, argv, i, alternateGolden)) return false;
+            if (!alternateGolden.empty()) {
+                request.alternateGoldenPaths.push_back(alternateGolden);
+            }
         } else if (arg == "--diff") {
             if (!ReadValue(argc, argv, i, request.diffPath)) return false;
         } else if (arg == "--output") {
@@ -80,8 +98,14 @@ bool ParseArgs(int argc, char **argv, mobilegl_trace::Request &request) {
             if (!ReadInt(argc, argv, i, request.width)) return false;
         } else if (arg == "--height") {
             if (!ReadInt(argc, argv, i, request.height)) return false;
-        } else if (arg == "--tolerance") {
-            if (!ReadInt(argc, argv, i, request.tolerance)) return false;
+        } else if (arg == "--window-surface") {
+            request.usePbuffer = false;
+        } else if (arg == "--pbuffer-surface") {
+            request.usePbuffer = true;
+        } else if (arg == "--hold-ms") {
+            if (!ReadInt(argc, argv, i, request.holdMs)) return false;
+        } else if (arg == "--ssim-threshold") {
+            if (!ReadDouble(argc, argv, i, request.ssimThreshold)) return false;
         } else if (arg == "--crop-x") {
             if (!ReadInt(argc, argv, i, request.cropX)) return false;
         } else if (arg == "--crop-y") {
@@ -90,8 +114,8 @@ bool ParseArgs(int argc, char **argv, mobilegl_trace::Request &request) {
             if (!ReadInt(argc, argv, i, request.cropWidth)) return false;
         } else if (arg == "--crop-height") {
             if (!ReadInt(argc, argv, i, request.cropHeight)) return false;
-        } else if (arg == "--fuzz-percent") {
-            if (!ReadInt(argc, argv, i, request.fuzzPercent)) return false;
+        } else if (arg == "--coherent-as-flush") {
+            request.coherentAsFlush = true;
         } else if (arg == "--help" || arg == "-h") {
             return false;
         } else {
@@ -110,6 +134,10 @@ bool ParseArgs(int argc, char **argv, mobilegl_trace::Request &request) {
     }
     if (request.targetCall < 0) {
         std::cerr << "--target-call is required\n";
+        return false;
+    }
+    if (request.holdMs < 0) {
+        std::cerr << "--hold-ms must be non-negative\n";
         return false;
     }
     return true;

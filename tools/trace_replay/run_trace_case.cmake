@@ -4,8 +4,8 @@ foreach(required TRACE_REPLAY_EXE MOBILEGL_LIBRARY TRACE_ARCHIVE TRACE_FILE TRAC
     endif()
 endforeach()
 
-if(NOT DEFINED TRACE_TOLERANCE OR "${TRACE_TOLERANCE}" STREQUAL "")
-    set(TRACE_TOLERANCE 0)
+if(NOT DEFINED TRACE_SSIM_THRESHOLD OR "${TRACE_SSIM_THRESHOLD}" STREQUAL "")
+    set(TRACE_SSIM_THRESHOLD 0.99)
 endif()
 if(NOT DEFINED TRACE_CROP_X OR "${TRACE_CROP_X}" STREQUAL "")
     set(TRACE_CROP_X 0)
@@ -19,8 +19,13 @@ endif()
 if(NOT DEFINED TRACE_CROP_HEIGHT OR "${TRACE_CROP_HEIGHT}" STREQUAL "")
     set(TRACE_CROP_HEIGHT 0)
 endif()
-if(NOT DEFINED TRACE_FUZZ_PERCENT OR "${TRACE_FUZZ_PERCENT}" STREQUAL "")
-    set(TRACE_FUZZ_PERCENT 20)
+set(alternate_golden_args)
+if(DEFINED TRACE_ALTERNATE_GOLDEN AND NOT "${TRACE_ALTERNATE_GOLDEN}" STREQUAL "")
+    list(APPEND alternate_golden_args --alternate-golden "${TRACE_ALTERNATE_GOLDEN}")
+endif()
+set(coherent_as_flush_args)
+if(TRACE_COHERENT_AS_FLUSH)
+    list(APPEND coherent_as_flush_args --coherent-as-flush)
 endif()
 
 if(EXISTS "${TRACE_OUTPUT_DIR}")
@@ -50,6 +55,7 @@ execute_process(
         COMMAND "${TRACE_REPLAY_EXE}"
         --trace "${trace_path}"
         --golden "${TRACE_GOLDEN}"
+        ${alternate_golden_args}
         --diff "${TRACE_OUTPUT_DIR}/output/${TRACE_CASE_NAME}-diff.png"
         --output "${TRACE_OUTPUT_DIR}/output"
         --backend "${TRACE_BACKEND}"
@@ -57,12 +63,12 @@ execute_process(
         --target-call "${TRACE_TARGET_CALL}"
         --width "${TRACE_WIDTH}"
         --height "${TRACE_HEIGHT}"
-        --tolerance "${TRACE_TOLERANCE}"
+        --ssim-threshold "${TRACE_SSIM_THRESHOLD}"
         --crop-x "${TRACE_CROP_X}"
         --crop-y "${TRACE_CROP_Y}"
         --crop-width "${TRACE_CROP_WIDTH}"
         --crop-height "${TRACE_CROP_HEIGHT}"
-        --fuzz-percent "${TRACE_FUZZ_PERCENT}"
+        ${coherent_as_flush_args}
         RESULT_VARIABLE replay_result
         OUTPUT_VARIABLE replay_stdout
         ERROR_VARIABLE replay_stderr)
@@ -85,6 +91,12 @@ if(DEFINED TRACE_ARTIFACT_DIR AND NOT "${TRACE_ARTIFACT_DIR}" STREQUAL "")
     set(actual_png "${TRACE_OUTPUT_DIR}/output/actual.png")
     if(EXISTS "${actual_png}")
         file(COPY_FILE "${actual_png}" "${TRACE_ARTIFACT_DIR}/${TRACE_CASE_NAME}-${TRACE_BACKEND}-actual.png")
+    endif()
+    if(EXISTS "${TRACE_GOLDEN}")
+        file(COPY_FILE "${TRACE_GOLDEN}" "${TRACE_ARTIFACT_DIR}/${TRACE_CASE_NAME}-${TRACE_BACKEND}-golden.png")
+    endif()
+    if(DEFINED TRACE_ALTERNATE_GOLDEN AND NOT "${TRACE_ALTERNATE_GOLDEN}" STREQUAL "" AND EXISTS "${TRACE_ALTERNATE_GOLDEN}")
+        file(COPY_FILE "${TRACE_ALTERNATE_GOLDEN}" "${TRACE_ARTIFACT_DIR}/${TRACE_CASE_NAME}-${TRACE_BACKEND}-alternate-golden.png")
     endif()
     if(EXISTS "${result_json}")
         file(COPY_FILE "${result_json}" "${TRACE_ARTIFACT_DIR}/${TRACE_CASE_NAME}-${TRACE_BACKEND}-result.json")

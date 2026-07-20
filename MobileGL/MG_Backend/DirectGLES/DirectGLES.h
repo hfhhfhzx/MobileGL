@@ -8,6 +8,7 @@
 
 #pragma once
 #include <Includes.h>
+#include <MG_Backend/BackendObject.h>
 #include <MG_State/GLState/FramebufferState/FramebufferObject.h>
 #include <MG_State/GLState/TextureState/TextureState.h>
 #include <MG_State/GLState/SamplerState/SamplerObject.h>
@@ -18,6 +19,10 @@
     operation Utils::CheckGLESError();
 
 namespace MobileGL::MG_Backend::DirectGLES {
+    // Re-establishes the frontend texture-unit bindings on the native ES context.
+    // Content uploads use scratch bindings, so draws and dispatches call this after
+    // texture synchronization.
+    void BindCurrentTextures();
     void ClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil);
     void ClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat* value);
     void ClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint* value);
@@ -26,6 +31,7 @@ namespace MobileGL::MG_Backend::DirectGLES {
     void DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices);
     void DrawArrays(GLenum mode, GLint first, GLsizei count);
     void DrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices, GLint basevertex);
+    void MultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount);
     void MultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const GLvoid* const* indices,
                            GLsizei drawcount);
     void MultiDrawElementsBaseVertex(GLenum mode, const GLsizei* count, GLenum type, const GLvoid* const* indices,
@@ -64,6 +70,11 @@ namespace MobileGL::MG_Backend::DirectGLES {
                         GLsizei height, GLint border);
     void CopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width,
                            GLsizei height);
+    void CopyImageSubData(const SharedPtr<MG_State::GLState::ITextureObject>& srcTexture,
+                          GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ,
+                          const SharedPtr<MG_State::GLState::ITextureObject>& dstTexture,
+                          GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ,
+                          GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth);
     void GenerateMipmap(GLenum target);
     const GLubyte* GetString(GLenum name);
     void ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void* pixels);
@@ -88,7 +99,56 @@ namespace MobileGL::MG_Backend::DirectGLES {
     void ShaderStorageBlockBinding(GLuint program, GLuint storageBlockIndex, GLuint storageBlockBinding);
     Bool InitWindowSurface(NativeWindowType window);
     Bool InitPbufferSurface(EGLint width, EGLint height);
+    Bool MakeCurrent();
+    Bool ReleaseCurrent();
+    // True when the backend ES context is current on the calling thread, i.e.
+    // immediate buffer ops may issue GL calls right now.
+    Bool IsBackendContextCurrentOnThisThread();
+    // GL fence sync objects, backed by native ES fences. FenceSync returns null
+    // (the frontend then falls back to an always-signaled sync) when the calling
+    // thread does not own the ES context. Waits/queries degrade to "signaled" in
+    // the same situation, and handles created under a since-destroyed ES context
+    // are always treated as signaled.
+    BackendSyncHandle FenceSync();
+    GLenum ClientWaitSync(BackendSyncHandle sync, GLbitfield flags, GLuint64 timeout);
+    void WaitSync(BackendSyncHandle sync, GLbitfield flags, GLuint64 timeout);
+    void DeleteSync(BackendSyncHandle sync);
+    Bool GetSyncStatus(BackendSyncHandle sync);
+    // True when GL_EXT_disjoint_timer_query and every entry point the timer
+    // hooks below need are present. Also gates the E_GL_ARB_timer_query
+    // advertisement in BackendObject_DirectGLES::InitCapabilities, and is
+    // registered as the GLFunctionsTable::IsTimerQuerySupported hook: a pure
+    // capability read needs no current ES context, and it stays false until
+    // the ES capabilities have been filled in.
+    Bool AreTimerQueriesSupported();
+    // GL timer-query objects, backed by GL_EXT_disjoint_timer_query. The
+    // creators return null (the frontend then falls back to an immediately
+    // available zero result) when the calling thread does not own the ES
+    // context or the extension/entry points are missing, and handles created
+    // under a since-destroyed ES context are always treated as complete with
+    // a zero result (mirrors the fence-sync handles above).
+    BackendQueryHandle BeginTimeElapsedQuery();
+    void EndTimeElapsedQuery(BackendQueryHandle query);
+    BackendQueryHandle QueryCounterTimestamp();
+    Bool IsQueryResultAvailable(BackendQueryHandle query);
+    // Returns true when a final value landed in *outNanoseconds (a zero for
+    // null or stale-generation handles IS final: the frontend may cache it
+    // and release the handle). Returns false only when the calling thread
+    // does not own the ES context, so the value is genuinely unobtainable
+    // right now; the handle stays alive and readable later.
+    Bool GetQueryResult64(BackendQueryHandle query, Bool wait, Uint64* outNanoseconds);
+    void DeleteBackendQuery(BackendQueryHandle query);
+    Int64 GetGpuTimestampNs();
     void Present();
+    // Frame-completion watermarks for the buffer-storage pool: CurrentFrameSerial()
+    // is bumped once per Present(); CompletedFrameSerial() is the newest frame whose
+    // GPU work has provably finished (advanced by polling a one-fence-per-frame ring).
+    // A buffer retired during frame N is safe to recycle once CompletedFrameSerial() >= N.
+    Uint64 CurrentFrameSerial();
+    Uint64 CompletedFrameSerial();
+    // Applies (or defers until the window surface exists) the app-requested
+    // eglSwapInterval on the native EGL surface.
+    void SetSwapInterval(Int interval);
     void SetEGLFuncsTable(const MG_External::EGLFunctionsTable& eglFuncs);
     void SetGLESFuncsTable(const MG_External::GLESFunctionsTable& glesFuncs);
     void SetGLESCapabilities(const MG_External::GLESCapabilities& capabilities);

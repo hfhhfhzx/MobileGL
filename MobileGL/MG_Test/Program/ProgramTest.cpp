@@ -108,6 +108,35 @@ void main() {
     fragColor = vec4(OutColor, float(intVal));
 })";
 
+const char* sodiumStylePushConstantVs = R"(#version 460 core
+
+layout(location = 0) in vec3 Position;
+
+#ifdef VULKAN
+layout(push_constant) uniform PC {
+    vec3 u_RegionOffset;
+    int u_CurrentTime;
+    uint u_RegionID;
+};
+#else
+uniform vec3 u_RegionOffset;
+uniform int u_CurrentTime;
+uniform uint u_RegionID;
+#endif
+
+void main() {
+    vec3 offset = u_RegionOffset + vec3(float(u_CurrentTime) * 0.0 + float(u_RegionID) * 0.0);
+    gl_Position = vec4(Position + offset, 1.0);
+})";
+
+const char* sodiumStylePushConstantFs = R"(#version 460 core
+
+out vec4 fragColor;
+
+void main() {
+    fragColor = vec4(1.0);
+})";
+
 TEST_F(ProgramTest, CompileVertex) {
     GLuint vs = CreateShader(GL_VERTEX_SHADER);
     ShaderSource(vs, 1, &vsSrc, NULL);
@@ -455,6 +484,58 @@ TEST_F(ProgramTest, CompileAndLink) {
         }
         printf("shader dump: \n%s\n", result);
     }
+}
+
+TEST_F(ProgramTest, SodiumStyleVulkanMacroShaderUsesPlainUniforms) {
+    char infoLog[1024] = "";
+
+    GLuint vs = CreateShader(GL_VERTEX_SHADER);
+    ShaderSource(vs, 1, &sodiumStylePushConstantVs, NULL);
+    CompileShader(vs);
+    GLint vsStatus = GL_FALSE;
+    GetShaderiv(vs, GL_COMPILE_STATUS, &vsStatus);
+    GetShaderInfoLog(vs, sizeof(infoLog), nullptr, infoLog);
+    ASSERT_EQ(vsStatus, GL_TRUE) << infoLog;
+
+    GLuint fs = CreateShader(GL_FRAGMENT_SHADER);
+    ShaderSource(fs, 1, &sodiumStylePushConstantFs, NULL);
+    CompileShader(fs);
+    GLint fsStatus = GL_FALSE;
+    GetShaderiv(fs, GL_COMPILE_STATUS, &fsStatus);
+    GetShaderInfoLog(fs, sizeof(infoLog), nullptr, infoLog);
+    ASSERT_EQ(fsStatus, GL_TRUE) << infoLog;
+
+    GLuint program = CreateProgram();
+    AttachShader(program, vs);
+    AttachShader(program, fs);
+    LinkProgram(program);
+    GLint linkStatus = GL_FALSE;
+    GetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+    GetProgramInfoLog(program, sizeof(infoLog), nullptr, infoLog);
+    ASSERT_EQ(linkStatus, GL_TRUE) << infoLog;
+
+    const GLint regionOffsetLoc = GetUniformLocation(program, "u_RegionOffset");
+    const GLint currentTimeLoc = GetUniformLocation(program, "u_CurrentTime");
+    const GLint regionIdLoc = GetUniformLocation(program, "u_RegionID");
+    ASSERT_GE(regionOffsetLoc, 0);
+    ASSERT_GE(currentTimeLoc, 0);
+    ASSERT_GE(regionIdLoc, 0);
+
+    auto programObject = MG_State::pGLContext->GetProgramObject(program);
+    ASSERT_NE(programObject, nullptr);
+    ASSERT_GT(programObject->GetUBOSize(), 0u);
+
+    UseProgram(program);
+    Uniform3f(regionOffsetLoc, 1.0f, 2.0f, 3.0f);
+    Uniform1i(currentTimeLoc, 4);
+    Uniform1ui(regionIdLoc, 5u);
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
+
+    GLfloat regionOffset[3] = {};
+    GetUniformfv(program, regionOffsetLoc, regionOffset);
+    EXPECT_EQ(regionOffset[0], 1.0f);
+    EXPECT_EQ(regionOffset[1], 2.0f);
+    EXPECT_EQ(regionOffset[2], 3.0f);
 }
 
 TEST_F(ProgramTest, Uniform1uiStoresUnsignedValue) {
@@ -1279,6 +1360,11 @@ TEST_F(ProgramTest, CompileAndLinkWithExplicitFragmentOut) {
     GLint fragColorLoc = GetFragDataLocation(program, "fragColor");
     ASSERT_EQ(fragColorLoc, 7);
 
+    // glGetFragDataIndex: a valid user output uses color index 0 (dual-source index 1 is not tracked);
+    // a name that is not an active output returns -1. Neither records a GL error.
+    EXPECT_EQ(GetFragDataIndex(program, "fragColor"), 0);
+    EXPECT_EQ(GetFragDataIndex(program, "notAnActiveOutput"), -1);
+
     auto programObject = MG_State::pGLContext->GetCurrentProgram();
     auto& spirvs = programObject->GetGeneratedSpirv();
     auto& fragSpirv = spirvs[programObject->GetShaderIndexByStage(ShaderStage::Fragment)];
@@ -1303,6 +1389,49 @@ TEST_F(ProgramTest, CompileAndLinkWithExplicitFragmentOut) {
     // }
     ASSERT_TRUE(pSrcfragOut != nullptr) << "Not found expected string in generated shader.\n(Searching for \"" << needle
                                         << "\")";
+
+    // glBindFragDataLocationIndexed round-trips the color index through a re-link. index 1 requires
+    // colorNumber 0 (GL_MAX_DUAL_SOURCE_DRAW_BUFFERS is 1).
+    BindFragDataLocationIndexed(program, 0, 1, "fragColor");
+    LinkProgram(program);
+    GetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+    ASSERT_EQ(linkStatus, GL_TRUE);
+    EXPECT_EQ(GetFragDataIndex(program, "fragColor"), 1);
+    EXPECT_EQ(GetFragDataIndex(program, "notAnActiveOutput"), -1);
+
+    // The color index must reach the transpiled shader as layout(location = 0, index = 1) so the
+    // driver binds fragColor as the second dual-source input; the SPIR-V Index decoration set from
+    // the glslang layoutIndex round-trips through SPIRV-Cross.
+    auto& spirvsIndexed = programObject->GetGeneratedSpirv();
+    auto& fragSpirvIndexed = spirvsIndexed[programObject->GetShaderIndexByStage(ShaderStage::Fragment)];
+    MG_Util::ShaderTranspiler::SpvcSession spvcSessionIndexed(fragSpirvIndexed,
+                                                              MG_Util::ShaderTranspiler::SessionUsageBit::Transpile);
+    spvc_compiler_options optionsIndexed;
+    spvcSessionIndexed.CreateOptions(&optionsIndexed);
+    spvc_compiler_options_set_uint(optionsIndexed, SPVC_COMPILER_OPTION_GLSL_VERSION, 460);
+    spvc_compiler_options_set_bool(optionsIndexed, SPVC_COMPILER_OPTION_GLSL_ES, SPVC_FALSE);
+    spvcSessionIndexed.SetOptions(optionsIndexed);
+    const char* resultIndexed = nullptr;
+    spvcSessionIndexed.Compile(&resultIndexed);
+    printf("%s\n\n", resultIndexed);
+    const char* indexNeedle = "index = 1";
+    ASSERT_TRUE(strstr(resultIndexed, indexNeedle) != nullptr)
+        << "Expected dual-source color index in generated shader.\n(Searching for \"" << indexNeedle << "\")";
+
+    // glBindFragDataLocation is equivalent to index 0 and resets it.
+    BindFragDataLocation(program, 0, "fragColor");
+    LinkProgram(program);
+    EXPECT_EQ(GetFragDataIndex(program, "fragColor"), 0);
+
+    // Validation: index > 1 and a too-large colorNumber for index 1 are GL_INVALID_VALUE; a gl_ name is
+    // GL_INVALID_OPERATION.
+    BindFragDataLocationIndexed(program, 0, 2, "fragColor");
+    EXPECT_EQ(GetError(), GL_INVALID_VALUE);
+    BindFragDataLocationIndexed(program, 1, 1, "fragColor"); // colorNumber 1 invalid for index 1
+    EXPECT_EQ(GetError(), GL_INVALID_VALUE);
+    BindFragDataLocationIndexed(program, 0, 0, "gl_FragColor");
+    EXPECT_EQ(GetError(), GL_INVALID_OPERATION);
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
 }
 
 const char* vs_sampler_as_varname = R"(#version 330
@@ -1473,6 +1602,18 @@ void main() {
     fragColor = apply_fog(color, sphericalVertexDistance, cylindricalVertexDistance, FogEnvironmentalStart, FogEnvironmentalEnd, FogRenderDistanceStart, FogRenderDistanceEnd, FogColor);
 })";
 
+TEST_F(ProgramTest, GetFragDataIndexRejectsInvalidProgram) {
+    // A handle that was never generated is rejected and returns -1. Like glGetFragDataLocation, this
+    // routes through the shared program-name check, which records GL_INVALID_VALUE for an unknown name.
+    EXPECT_EQ(GetFragDataIndex(999999u, "fragColor"), -1);
+    EXPECT_EQ(GetError(), GL_INVALID_VALUE);
+    // Exactly ONE error is recorded per bad call: the redundant second GL_INVALID_OPERATION that the
+    // FragData entry points used to queue on top of the name check has been removed.
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
+    // Defensive drain: keep the shared error queue clean regardless (the fixture never resets it).
+    while (GetError() != GL_NO_ERROR) {}
+}
+
 TEST_F(ProgramTest, CompileShaderWithSamplerAsVarName) {
     char infoLog[1024] = "";
 
@@ -1520,4 +1661,624 @@ TEST_F(ProgramTest, CompileShaderWithSamplerAsVarName) {
     const char* result = nullptr;
     spvcSession.Compile(&result);
     printf("decomp from fragSpirv:\n%s\n\n", result);
+}
+
+namespace {
+    // Links a VS+FS pair whose fragment shader carries a std140 uniform block (scalar + array + mat4)
+    // plus a default-block sampler, and returns the linked program. matrixLayout lets a test flip the
+    // block to row_major.
+    GLuint LinkUboReflectionProgram(const char* matrixLayout) {
+        char infoLog[1024] = "";
+        const char* vsSrc = R"(#version 330 core
+void main() { gl_Position = vec4(0.0); }
+)";
+        std::string fsSrc = std::string("#version 330 core\n") +
+                            "layout(std140" + matrixLayout + ") uniform Block {\n" +
+                            "    float uScalar;\n" +
+                            "    vec4  uArray[3];\n" +
+                            "    mat4  uMatrix;\n" +
+                            "};\n" +
+                            "uniform sampler2D uTex;\n" +
+                            "out vec4 fragColor;\n" +
+                            "void main() {\n" +
+                            "    fragColor = texture(uTex, uArray[0].xy) * uScalar * uMatrix[0];\n" +
+                            "}\n";
+        const char* fsPtr = fsSrc.c_str();
+
+        GLuint vs = CreateShader(GL_VERTEX_SHADER);
+        ShaderSource(vs, 1, &vsSrc, nullptr);
+        CompileShader(vs);
+        GLint vsStatus = GL_FALSE;
+        GetShaderiv(vs, GL_COMPILE_STATUS, &vsStatus);
+        GetShaderInfoLog(vs, sizeof(infoLog), nullptr, infoLog);
+        EXPECT_EQ(vsStatus, GL_TRUE) << infoLog;
+
+        GLuint fs = CreateShader(GL_FRAGMENT_SHADER);
+        ShaderSource(fs, 1, &fsPtr, nullptr);
+        CompileShader(fs);
+        GLint fsStatus = GL_FALSE;
+        GetShaderiv(fs, GL_COMPILE_STATUS, &fsStatus);
+        GetShaderInfoLog(fs, sizeof(infoLog), nullptr, infoLog);
+        EXPECT_EQ(fsStatus, GL_TRUE) << infoLog;
+
+        GLuint program = CreateProgram();
+        AttachShader(program, vs);
+        AttachShader(program, fs);
+        LinkProgram(program);
+        GLint linkStatus = GL_FALSE;
+        GetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+        GetProgramInfoLog(program, sizeof(infoLog), nullptr, infoLog);
+        EXPECT_EQ(linkStatus, GL_TRUE) << infoLog;
+        return program;
+    }
+
+    GLuint UniformIndexByName(GLuint program, const char* name) {
+        GLuint index = GL_INVALID_INDEX;
+        GetUniformIndices(program, 1, &name, &index);
+        return index;
+    }
+
+    GLint QueryUniformiv(GLuint program, GLuint uniformIndex, GLenum pname) {
+        GLint value = -12345; // sentinel that is not a legal answer for any queried pname
+        GetActiveUniformsiv(program, 1, &uniformIndex, pname, &value);
+        return value;
+    }
+} // namespace
+
+TEST_F(ProgramTest, GetActiveUniformsivStd140Block) {
+    GLuint program = LinkUboReflectionProgram(/*matrixLayout=*/"");
+
+    GLint activeUniforms = 0;
+    GetProgramiv(program, GL_ACTIVE_UNIFORMS, &activeUniforms);
+    EXPECT_EQ(activeUniforms, 4);
+
+    const GLuint s = UniformIndexByName(program, "uScalar");
+    const GLuint a = UniformIndexByName(program, "uArray");
+    const GLuint m = UniformIndexByName(program, "uMatrix");
+    const GLuint t = UniformIndexByName(program, "uTex");
+    ASSERT_NE(s, GL_INVALID_INDEX);
+    ASSERT_NE(a, GL_INVALID_INDEX);
+    ASSERT_NE(m, GL_INVALID_INDEX);
+    ASSERT_NE(t, GL_INVALID_INDEX);
+
+    // Types and sizes.
+    EXPECT_EQ(QueryUniformiv(program, s, GL_UNIFORM_TYPE), GL_FLOAT);
+    EXPECT_EQ(QueryUniformiv(program, a, GL_UNIFORM_TYPE), GL_FLOAT_VEC4);
+    EXPECT_EQ(QueryUniformiv(program, m, GL_UNIFORM_TYPE), GL_FLOAT_MAT4);
+    EXPECT_EQ(QueryUniformiv(program, t, GL_UNIFORM_TYPE), GL_SAMPLER_2D);
+    EXPECT_EQ(QueryUniformiv(program, s, GL_UNIFORM_SIZE), 1);
+    EXPECT_EQ(QueryUniformiv(program, a, GL_UNIFORM_SIZE), 3);
+    EXPECT_EQ(QueryUniformiv(program, m, GL_UNIFORM_SIZE), 1);
+
+    // Block membership: -1 for the default-block sampler.
+    EXPECT_GE(QueryUniformiv(program, s, GL_UNIFORM_BLOCK_INDEX), 0);
+    EXPECT_EQ(QueryUniformiv(program, t, GL_UNIFORM_BLOCK_INDEX), -1);
+
+    // std140 offsets.
+    EXPECT_EQ(QueryUniformiv(program, s, GL_UNIFORM_OFFSET), 0);
+    EXPECT_EQ(QueryUniformiv(program, a, GL_UNIFORM_OFFSET), 16);
+    EXPECT_EQ(QueryUniformiv(program, m, GL_UNIFORM_OFFSET), 64);
+    EXPECT_EQ(QueryUniformiv(program, t, GL_UNIFORM_OFFSET), -1);
+
+    // ARRAY_STRIDE: 16 for the array, 0 for non-array block members, -1 for the default block.
+    EXPECT_EQ(QueryUniformiv(program, a, GL_UNIFORM_ARRAY_STRIDE), 16);
+    EXPECT_EQ(QueryUniformiv(program, s, GL_UNIFORM_ARRAY_STRIDE), 0);
+    EXPECT_EQ(QueryUniformiv(program, m, GL_UNIFORM_ARRAY_STRIDE), 0);
+    EXPECT_EQ(QueryUniformiv(program, t, GL_UNIFORM_ARRAY_STRIDE), -1);
+
+    // MATRIX_STRIDE: 16 for the matrix, 0 for non-matrix block members, -1 for the default block.
+    EXPECT_EQ(QueryUniformiv(program, m, GL_UNIFORM_MATRIX_STRIDE), 16);
+    EXPECT_EQ(QueryUniformiv(program, s, GL_UNIFORM_MATRIX_STRIDE), 0);
+    EXPECT_EQ(QueryUniformiv(program, a, GL_UNIFORM_MATRIX_STRIDE), 0);
+    EXPECT_EQ(QueryUniformiv(program, t, GL_UNIFORM_MATRIX_STRIDE), -1);
+
+    // Column-major block: nothing is row-major.
+    EXPECT_EQ(QueryUniformiv(program, m, GL_UNIFORM_IS_ROW_MAJOR), 0);
+    EXPECT_EQ(QueryUniformiv(program, s, GL_UNIFORM_IS_ROW_MAJOR), 0);
+
+    // NAME_LENGTH includes the terminator and matches glGetActiveUniform's reported name.
+    char nameBuf[64] = "";
+    GLsizei nameLen = 0;
+    GLint size = 0;
+    GLenum type = 0;
+    GetActiveUniform(program, m, sizeof(nameBuf), &nameLen, &size, &type, nameBuf);
+    EXPECT_EQ(QueryUniformiv(program, m, GL_UNIFORM_NAME_LENGTH),
+              static_cast<GLint>(std::strlen(nameBuf) + 1));
+
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
+}
+
+// A block-level layout(row_major) with no per-member qualifier: only the matrix is row-major, and
+// only via the block-inheritance fallback (member layoutMatrix == ElmNone). A naive per-member check
+// returns 0 here.
+TEST_F(ProgramTest, GetActiveUniformsivRowMajorBlock) {
+    GLuint program = LinkUboReflectionProgram(/*matrixLayout=*/", row_major");
+
+    const GLuint s = UniformIndexByName(program, "uScalar");
+    const GLuint a = UniformIndexByName(program, "uArray");
+    const GLuint m = UniformIndexByName(program, "uMatrix");
+    ASSERT_NE(m, GL_INVALID_INDEX);
+
+    EXPECT_EQ(QueryUniformiv(program, m, GL_UNIFORM_IS_ROW_MAJOR), 1);
+    EXPECT_EQ(QueryUniformiv(program, s, GL_UNIFORM_IS_ROW_MAJOR), 0); // non-matrix, isMatrix() guard
+    EXPECT_EQ(QueryUniformiv(program, a, GL_UNIFORM_IS_ROW_MAJOR), 0);
+    EXPECT_EQ(QueryUniformiv(program, m, GL_UNIFORM_MATRIX_STRIDE), 16); // unchanged by majorness
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
+}
+
+TEST_F(ProgramTest, GetActiveUniformsivErrors) {
+    GLuint program = LinkUboReflectionProgram(/*matrixLayout=*/"");
+    GLint activeUniforms = 0;
+    GetProgramiv(program, GL_ACTIVE_UNIFORMS, &activeUniforms);
+    ASSERT_GT(activeUniforms, 0);
+
+    GLuint validIndex = 0;
+    GLint params[4] = {-999, -999, -999, -999};
+
+    // E1: negative count -> GL_INVALID_VALUE, params untouched.
+    GetActiveUniformsiv(program, -1, &validIndex, GL_UNIFORM_TYPE, params);
+    EXPECT_EQ(GetError(), GL_INVALID_VALUE);
+    EXPECT_EQ(params[0], -999);
+
+    // E2: index == ACTIVE_UNIFORMS -> GL_INVALID_VALUE, params untouched.
+    GLuint outOfRange = static_cast<GLuint>(activeUniforms);
+    GetActiveUniformsiv(program, 1, &outOfRange, GL_UNIFORM_TYPE, params);
+    EXPECT_EQ(GetError(), GL_INVALID_VALUE);
+    EXPECT_EQ(params[0], -999);
+
+    // E3: GL 4.2 token -> GL_INVALID_ENUM here.
+    GetActiveUniformsiv(program, 1, &validIndex, GL_UNIFORM_ATOMIC_COUNTER_BUFFER_INDEX, params);
+    EXPECT_EQ(GetError(), GL_INVALID_ENUM);
+    EXPECT_EQ(params[0], -999);
+
+    // E4a: a live shader name -> GL_INVALID_OPERATION.
+    GLuint shader = CreateShader(GL_VERTEX_SHADER);
+    GetActiveUniformsiv(shader, 1, &validIndex, GL_UNIFORM_TYPE, params);
+    EXPECT_EQ(GetError(), GL_INVALID_OPERATION);
+
+    // E4b: a never-generated name -> GL_INVALID_VALUE.
+    GetActiveUniformsiv(9999u, 1, &validIndex, GL_UNIFORM_TYPE, params);
+    EXPECT_EQ(GetError(), GL_INVALID_VALUE);
+
+    // E6: zero count on a linked program is a valid no-op.
+    GetActiveUniformsiv(program, 0, &validIndex, GL_UNIFORM_TYPE, params);
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
+    EXPECT_EQ(params[0], -999);
+}
+
+namespace {
+    GLuint LinkVsFsProgram(const char* vsSource, const char* fsSource) {
+        char infoLog[4096] = "";
+        GLuint vs = CreateShader(GL_VERTEX_SHADER);
+        ShaderSource(vs, 1, &vsSource, nullptr);
+        CompileShader(vs);
+        GLint vsStatus = GL_FALSE;
+        GetShaderiv(vs, GL_COMPILE_STATUS, &vsStatus);
+        GetShaderInfoLog(vs, sizeof(infoLog), nullptr, infoLog);
+        EXPECT_EQ(vsStatus, GL_TRUE) << infoLog;
+
+        GLuint fs = CreateShader(GL_FRAGMENT_SHADER);
+        ShaderSource(fs, 1, &fsSource, nullptr);
+        CompileShader(fs);
+        GLint fsStatus = GL_FALSE;
+        GetShaderiv(fs, GL_COMPILE_STATUS, &fsStatus);
+        GetShaderInfoLog(fs, sizeof(infoLog), nullptr, infoLog);
+        EXPECT_EQ(fsStatus, GL_TRUE) << infoLog;
+
+        GLuint program = CreateProgram();
+        AttachShader(program, vs);
+        AttachShader(program, fs);
+        LinkProgram(program);
+        GLint linkStatus = GL_FALSE;
+        GetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+        GetProgramInfoLog(program, sizeof(infoLog), nullptr, infoLog);
+        EXPECT_EQ(linkStatus, GL_TRUE) << infoLog;
+        return program;
+    }
+
+    const char* kPassthroughCoordsVs = R"(#version 330
+in vec4 a_position;
+in vec4 a_coords;
+out vec4 coords_in;
+void main() {
+    gl_Position = a_position;
+    coords_in = a_coords;
+})";
+} // namespace
+
+// Repro for KHR-GL33.shaders.loops.do_while_dynamic_iterations.empty_body_* (and the
+// only_continue / unconditional_break variants): the loop is dead code, so the SPIR-V
+// optimizer eliminates it together with the only loads of `one` / `ui_one` -- and with
+// them the entire global UBO. The uniforms stay active in link reflection, so
+// glUniform1i on them must still have backing storage instead of memcpy-ing to null.
+TEST_F(ProgramTest, DoWhileDeadLoopUniformsKeepBackingStorage) {
+    const char* loopBodies[] = {"", "continue;", "break;"};
+    for (const char* body : loopBodies) {
+        const String fsSource = String(R"(#version 330
+uniform int ui_one;
+uniform mediump int one;
+in vec4 coords_in;
+out vec4 o_color;
+void main() {
+    vec4 res = coords_in;
+    mediump int i = 0;
+    do {)") + body + R"(} while (i++ < one*ui_one);
+    o_color = res;
+})";
+        GLuint program = LinkVsFsProgram(kPassthroughCoordsVs, fsSource.c_str());
+
+        const GLint locOne = GetUniformLocation(program, "one");
+        const GLint locUiOne = GetUniformLocation(program, "ui_one");
+        ASSERT_GE(locOne, 0) << "body: '" << body << "'";
+        ASSERT_GE(locUiOne, 0) << "body: '" << body << "'";
+
+        UseProgram(program);
+        Uniform1i(locOne, 1);   // crashed with a null MapUBO() before the fallback storage
+        Uniform1i(locUiOne, 2);
+        EXPECT_EQ(GetError(), GL_NO_ERROR) << "body: '" << body << "'";
+
+        GLint readback = -1;
+        GetUniformiv(program, locOne, &readback);
+        EXPECT_EQ(readback, 1) << "body: '" << body << "'";
+        readback = -1;
+        GetUniformiv(program, locUiOne, &readback);
+        EXPECT_EQ(readback, 2) << "body: '" << body << "'";
+        EXPECT_EQ(GetError(), GL_NO_ERROR) << "body: '" << body << "'";
+    }
+}
+
+// Repro for KHR-GL33.shaders.struct.uniform.*nested_struct_array_*: leaf uniforms of
+// nested struct arrays need (a) one location per array element and (b) real byte
+// offsets inside the global UBO. Before the fix every leaf had a single location and
+// offset 0, so glUniform2fv(loc, 2, ...) tripped the size assert on the neighboring
+// float uniform (and corrupted it in release builds).
+TEST_F(ProgramTest, NestedStructArrayUniformElementWrites) {
+    // Struct shape from CTS glcShaderStructTests nested_struct_array (uniform case).
+    const char* fsSource = R"(#version 330
+struct T {
+    mediump float   a;
+    mediump vec2    b[2];
+};
+struct S {
+    mediump float   a;
+    T               b[3];
+    int             c;
+};
+uniform S s[2];
+in vec4 coords_in;
+out vec4 o_color;
+void main() {
+    mediump float r = (s[0].b[1].b[0].x + s[1].b[2].b[1].y) * s[0].b[0].a;
+    mediump float g = s[1].b[0].b[0].y * s[0].b[2].a * s[1].b[2].a;
+    mediump float b = (s[0].b[2].b[1].y + s[0].b[1].b[0].y + s[1].a) * s[0].b[1].a;
+    mediump float a = float(s[0].c) + s[1].b[2].a - s[1].b[1].a;
+    o_color = vec4(r, g, b, a);
+})";
+    GLuint program = LinkVsFsProgram(kPassthroughCoordsVs, fsSource);
+    UseProgram(program);
+
+    const GLint locVecArray = GetUniformLocation(program, "s[0].b[1].b");
+    ASSERT_GE(locVecArray, 0);
+    // Element locations are consecutive and reachable via the "[k]" suffix.
+    EXPECT_EQ(GetUniformLocation(program, "s[0].b[1].b[0]"), locVecArray);
+    EXPECT_EQ(GetUniformLocation(program, "s[0].b[1].b[1]"), locVecArray + 1);
+    EXPECT_EQ(GetUniformLocation(program, "s[0].b[1].b[2]"), -1);
+
+    // Distinct scalar leaves must land at distinct UBO offsets (they all aliased
+    // offset 0 before the fix).
+    const char* scalarLeaves[] = {"s[0].b[0].a", "s[0].b[1].a", "s[0].b[2].a", "s[1].a", "s[1].b[1].a",
+                                  "s[1].b[2].a"};
+    const GLfloat scalarValues[] = {0.5f, 0.25f, 0.125f, 7.0f, 3.0f, 4.0f};
+    for (SizeT i = 0; i < std::size(scalarLeaves); ++i) {
+        const GLint loc = GetUniformLocation(program, scalarLeaves[i]);
+        ASSERT_GE(loc, 0) << scalarLeaves[i];
+        Uniform1f(loc, scalarValues[i]);
+    }
+
+    // CTS-style whole-array write: glUniform2fv with count = 2 on a vec2[2] leaf.
+    // Before the fix this asserted/corrupted the next uniform ("s[0].b[2].a").
+    const GLfloat vecData[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    Uniform2fv(locVecArray, 2, vecData);
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
+
+    GLfloat vecReadback[2] = {};
+    GetUniformfv(program, locVecArray, vecReadback);
+    EXPECT_EQ(vecReadback[0], 1.0f);
+    EXPECT_EQ(vecReadback[1], 2.0f);
+    GetUniformfv(program, locVecArray + 1, vecReadback);
+    EXPECT_EQ(vecReadback[0], 3.0f);
+    EXPECT_EQ(vecReadback[1], 4.0f);
+
+    // All scalar leaves survived the array write intact.
+    for (SizeT i = 0; i < std::size(scalarLeaves); ++i) {
+        GLfloat readback = -1.0f;
+        GetUniformfv(program, GetUniformLocation(program, scalarLeaves[i]), &readback);
+        EXPECT_EQ(readback, scalarValues[i]) << scalarLeaves[i];
+    }
+
+    // std140: vec2 array elements inside the struct are 16 bytes apart, and the
+    // per-element offsets differ.
+    auto programObject = MG_State::pGLContext->GetProgramObject(program);
+    ASSERT_NE(programObject, nullptr);
+    const Uint offsetElement0 = programObject->GetUniformOffset(static_cast<Uint>(locVecArray));
+    const Uint offsetElement1 = programObject->GetUniformOffset(static_cast<Uint>(locVecArray + 1));
+    EXPECT_EQ(offsetElement1, offsetElement0 + 16u);
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
+}
+
+// Plain top-level uniform arrays share the same per-element location machinery.
+TEST_F(ProgramTest, PlainArrayUniformElementLocationsAndWrites) {
+    const char* fsSource = R"(#version 330
+uniform float arr[4];
+uniform float guard;
+in vec4 coords_in;
+out vec4 o_color;
+void main() {
+    o_color = vec4(arr[0] + arr[1], arr[2] + arr[3], guard, 1.0);
+})";
+    GLuint program = LinkVsFsProgram(kPassthroughCoordsVs, fsSource);
+    UseProgram(program);
+
+    const GLint locArr = GetUniformLocation(program, "arr");
+    ASSERT_GE(locArr, 0);
+    EXPECT_EQ(GetUniformLocation(program, "arr[0]"), locArr);
+    EXPECT_EQ(GetUniformLocation(program, "arr[2]"), locArr + 2);
+    EXPECT_EQ(GetUniformLocation(program, "arr[4]"), -1);
+
+    const GLint locGuard = GetUniformLocation(program, "guard");
+    ASSERT_GE(locGuard, 0);
+    EXPECT_EQ(GetUniformLocation(program, "guard[0]"), -1); // not an array
+
+    Uniform1f(locGuard, 9.0f);
+
+    const GLfloat values[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    Uniform1fv(locArr, 4, values);
+    for (int i = 0; i < 4; ++i) {
+        GLfloat readback = -1.0f;
+        GetUniformfv(program, locArr + i, &readback);
+        EXPECT_EQ(readback, values[i]) << "arr[" << i << "]";
+    }
+
+    // Overlong writes stop at the end of the array (GL 3.3 §2.11.4) instead of
+    // spilling into the next uniform.
+    const GLfloat tail[3] = {30.0f, 40.0f, 50.0f};
+    Uniform1fv(GetUniformLocation(program, "arr[2]"), 3, tail);
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
+    GLfloat readback = -1.0f;
+    GetUniformfv(program, locArr + 2, &readback);
+    EXPECT_EQ(readback, 30.0f);
+    GetUniformfv(program, locArr + 3, &readback);
+    EXPECT_EQ(readback, 40.0f);
+    GetUniformfv(program, locGuard, &readback);
+    EXPECT_EQ(readback, 9.0f); // untouched by the overlong write
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
+}
+
+// ---------------------------------------------------------------------------
+// GL CTS KHR-GL33.shaders.uniform_block regression pack. MobileGL's SPIR-V
+// pipeline lays every uniform block out as std140; the frontend implements the
+// GL-visible consequences of that choice: packed/shared qualifiers compile (as
+// std140), reflection uses GL naming ("arr[0]", per-element struct arrays),
+// unused block members stay active, block sizes are vec4-padded, and array
+// strides are std140 even for arrays nested inside struct members.
+// ---------------------------------------------------------------------------
+
+TEST_F(ProgramTest, UniformBlockPackedAndSharedLayoutsCompileAsStd140) {
+    const char* fsSource = R"(#version 330
+layout(packed) uniform PackedBlock {
+    vec4 pv;
+};
+layout(shared, row_major) uniform SharedBlock {
+    float sf;
+    mat4 sm;
+};
+out vec4 o_color;
+void main() {
+    o_color = pv + vec4(sf) + vec4(sm[0][0]);
+})";
+    GLuint program = LinkVsFsProgram(kPassthroughCoordsVs, fsSource);
+
+    // The blocks land on the implementation's chosen layout: std140 offsets.
+    const GLuint pv = UniformIndexByName(program, "pv");
+    const GLuint sf = UniformIndexByName(program, "sf");
+    const GLuint sm = UniformIndexByName(program, "sm");
+    ASSERT_NE(pv, GL_INVALID_INDEX);
+    ASSERT_NE(sf, GL_INVALID_INDEX);
+    ASSERT_NE(sm, GL_INVALID_INDEX);
+    EXPECT_EQ(QueryUniformiv(program, pv, GL_UNIFORM_OFFSET), 0);
+    EXPECT_EQ(QueryUniformiv(program, sf, GL_UNIFORM_OFFSET), 0);
+    EXPECT_EQ(QueryUniformiv(program, sm, GL_UNIFORM_OFFSET), 16);
+    // The remaining qualifiers in the rewritten layout() list survive.
+    EXPECT_EQ(QueryUniformiv(program, sm, GL_UNIFORM_IS_ROW_MAJOR), 1);
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
+}
+
+TEST_F(ProgramTest, UniformBlockReflectsUnusedMembersWithGLNamesAndPaddedSize) {
+    const char* fsSource = R"(#version 330
+layout(std140) uniform Blk {
+    float used;
+    vec4 unusedArr[3];
+    ivec3 tail;
+};
+out vec4 o_color;
+void main() {
+    o_color = vec4(used);
+})";
+    GLuint program = LinkVsFsProgram(kPassthroughCoordsVs, fsSource);
+
+    const GLuint blockIndex = GetUniformBlockIndex(program, "Blk");
+    ASSERT_NE(blockIndex, GL_INVALID_INDEX);
+
+    // All three members are active (unusedArr and tail are never read), the array is
+    // reported under its GL name "unusedArr[0]", and both spellings resolve.
+    const GLuint used = UniformIndexByName(program, "used");
+    const GLuint unusedSuffixed = UniformIndexByName(program, "unusedArr[0]");
+    const GLuint unusedBare = UniformIndexByName(program, "unusedArr");
+    const GLuint tail = UniformIndexByName(program, "tail");
+    ASSERT_NE(used, GL_INVALID_INDEX);
+    ASSERT_NE(unusedSuffixed, GL_INVALID_INDEX);
+    ASSERT_NE(tail, GL_INVALID_INDEX);
+    EXPECT_EQ(unusedSuffixed, unusedBare);
+
+    char nameBuf[64] = "";
+    GLsizei nameLen = 0;
+    GLint arraySize = 0;
+    GLenum type = 0;
+    GetActiveUniform(program, unusedSuffixed, sizeof(nameBuf), &nameLen, &arraySize, &type, nameBuf);
+    EXPECT_STREQ(nameBuf, "unusedArr[0]");
+    EXPECT_EQ(arraySize, 3);
+    EXPECT_EQ(type, static_cast<GLenum>(GL_FLOAT_VEC4));
+
+    // std140 layout of the unused members.
+    EXPECT_EQ(QueryUniformiv(program, unusedSuffixed, GL_UNIFORM_OFFSET), 16);
+    EXPECT_EQ(QueryUniformiv(program, unusedSuffixed, GL_UNIFORM_ARRAY_STRIDE), 16);
+    EXPECT_EQ(QueryUniformiv(program, tail, GL_UNIFORM_OFFSET), 64);
+
+    // GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS agrees with the INDICES list and counts all members.
+    GLint activeInBlock = 0;
+    GetActiveUniformBlockiv(program, blockIndex, GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS, &activeInBlock);
+    ASSERT_EQ(activeInBlock, 3);
+    GLint indices[3] = {-1, -1, -1};
+    GetActiveUniformBlockiv(program, blockIndex, GL_UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES, indices);
+    for (GLint index : indices) {
+        EXPECT_TRUE(index == static_cast<GLint>(used) || index == static_cast<GLint>(unusedSuffixed) ||
+                    index == static_cast<GLint>(tail));
+    }
+
+    // The block ends with an ivec3 at offset 64 (unpadded end 76); the backend compiles
+    // the std140 block at its vec4-padded size, and the reported size must cover it or
+    // buffers sized from this query are too small to draw with.
+    GLint dataSize = 0;
+    GetActiveUniformBlockiv(program, blockIndex, GL_UNIFORM_BLOCK_DATA_SIZE, &dataSize);
+    EXPECT_EQ(dataSize, 80);
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
+}
+
+TEST_F(ProgramTest, UniformBlockStructArrayExpandsPerElementWithStd140Strides) {
+    const char* fsSource = R"(#version 330
+struct S {
+    ivec2 v[2];
+    float f;
+};
+layout(std140) uniform Blk2 {
+    S s[2];
+} inst;
+out vec4 o_color;
+void main() {
+    o_color = vec4(inst.s[0].f);
+})";
+    GLuint program = LinkVsFsProgram(kPassthroughCoordsVs, fsSource);
+
+    // ARB_program_interface_query naming: one entry per struct array element, prefixed
+    // with the BLOCK name (not the instance name), basic arrays suffixed with "[0]".
+    const GLuint v0 = UniformIndexByName(program, "Blk2.s[0].v[0]");
+    const GLuint f0 = UniformIndexByName(program, "Blk2.s[0].f");
+    const GLuint v1 = UniformIndexByName(program, "Blk2.s[1].v[0]");
+    const GLuint f1 = UniformIndexByName(program, "Blk2.s[1].f");
+    ASSERT_NE(v0, GL_INVALID_INDEX);
+    ASSERT_NE(f0, GL_INVALID_INDEX);
+    ASSERT_NE(v1, GL_INVALID_INDEX);
+    ASSERT_NE(f1, GL_INVALID_INDEX);
+
+    // std140: ivec2 v[2] rounds each element up to a vec4 (stride 16, NOT the tight 8
+    // glslang reflects for arrays nested inside a struct member); struct size rounds to
+    // 48, giving s[1] members a 48-byte bias.
+    EXPECT_EQ(QueryUniformiv(program, v0, GL_UNIFORM_OFFSET), 0);
+    EXPECT_EQ(QueryUniformiv(program, v0, GL_UNIFORM_ARRAY_STRIDE), 16);
+    EXPECT_EQ(QueryUniformiv(program, v0, GL_UNIFORM_SIZE), 2);
+    EXPECT_EQ(QueryUniformiv(program, f0, GL_UNIFORM_OFFSET), 32);
+    EXPECT_EQ(QueryUniformiv(program, v1, GL_UNIFORM_OFFSET), 48);
+    EXPECT_EQ(QueryUniformiv(program, f1, GL_UNIFORM_OFFSET), 80);
+
+    GLint dataSize = 0;
+    const GLuint blockIndex = GetUniformBlockIndex(program, "Blk2");
+    ASSERT_NE(blockIndex, GL_INVALID_INDEX);
+    GetActiveUniformBlockiv(program, blockIndex, GL_UNIFORM_BLOCK_DATA_SIZE, &dataSize);
+    EXPECT_EQ(dataSize, 96);
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
+}
+
+TEST_F(ProgramTest, UniformBlockInstanceArrayReportsPerInstanceBlocks) {
+    const char* fsSource = R"(#version 330
+layout(std140) uniform ArrBlk {
+    vec4 av;
+} insts[2];
+out vec4 o_color;
+void main() {
+    o_color = insts[0].av + insts[1].av;
+})";
+    GLuint program = LinkVsFsProgram(kPassthroughCoordsVs, fsSource);
+
+    const GLuint inst0 = GetUniformBlockIndex(program, "ArrBlk[0]");
+    const GLuint inst1 = GetUniformBlockIndex(program, "ArrBlk[1]");
+    ASSERT_NE(inst0, GL_INVALID_INDEX);
+    ASSERT_NE(inst1, GL_INVALID_INDEX);
+    EXPECT_NE(inst0, inst1);
+    // A bare block name resolves to the first instance.
+    EXPECT_EQ(GetUniformBlockIndex(program, "ArrBlk"), inst0);
+
+    // Every instance of the array shares the single reflected member set.
+    GLint count0 = 0;
+    GLint count1 = 0;
+    GetActiveUniformBlockiv(program, inst0, GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS, &count0);
+    GetActiveUniformBlockiv(program, inst1, GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS, &count1);
+    EXPECT_EQ(count0, 1);
+    EXPECT_EQ(count1, 1);
+    GLint index0 = -1;
+    GLint index1 = -1;
+    GetActiveUniformBlockiv(program, inst0, GL_UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES, &index0);
+    GetActiveUniformBlockiv(program, inst1, GL_UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES, &index1);
+    EXPECT_EQ(index0, index1);
+    EXPECT_EQ(static_cast<GLuint>(index0), UniformIndexByName(program, "ArrBlk.av"));
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
+}
+
+TEST_F(ProgramTest, DeleteShaderWhileAttachedKeepsNameUsableUntilDetach) {
+    // GL CTS compiles through exactly this sequence (create, attach, DELETE, source,
+    // compile): glDeleteShader on an attached shader only flags it, and the name must
+    // keep working until the last detach.
+    const char* vsSource = R"(#version 330
+void main() { gl_Position = vec4(0.0); }
+)";
+    const char* fsSource = R"(#version 330
+out vec4 o_color;
+void main() { o_color = vec4(1.0); }
+)";
+
+    GLuint program = CreateProgram();
+    GLuint vs = CreateShader(GL_VERTEX_SHADER);
+    AttachShader(program, vs);
+    DeleteShader(vs);
+    EXPECT_EQ(IsShader(vs), GL_TRUE); // still alive: attached
+
+    ShaderSource(vs, 1, &vsSource, nullptr);
+    CompileShader(vs);
+    GLint status = GL_FALSE;
+    GetShaderiv(vs, GL_COMPILE_STATUS, &status);
+    EXPECT_EQ(status, GL_TRUE);
+    status = GL_FALSE;
+    GetShaderiv(vs, GL_DELETE_STATUS, &status);
+    EXPECT_EQ(status, GL_TRUE);
+
+    GLuint fs = CreateShader(GL_FRAGMENT_SHADER);
+    AttachShader(program, fs);
+    DeleteShader(fs);
+    ShaderSource(fs, 1, &fsSource, nullptr);
+    CompileShader(fs);
+
+    LinkProgram(program);
+    GLint linkStatus = GL_FALSE;
+    char infoLog[1024] = "";
+    GetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+    GetProgramInfoLog(program, sizeof(infoLog), nullptr, infoLog);
+    EXPECT_EQ(linkStatus, GL_TRUE) << infoLog;
+
+    // The last GL-visible detach releases the flagged shader's name.
+    DetachShader(program, vs);
+    EXPECT_EQ(IsShader(vs), GL_FALSE);
+
+    // Deleting the program releases the other flagged shader.
+    DeleteProgram(program);
+    EXPECT_EQ(IsShader(fs), GL_FALSE);
+    EXPECT_EQ(GetError(), GL_NO_ERROR);
 }

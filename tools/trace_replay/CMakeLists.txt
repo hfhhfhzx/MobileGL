@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-if(NOT UNIX OR APPLE OR ANDROID)
-    message(STATUS "MobileGL trace replay runner is only enabled on Linux")
+if(NOT UNIX OR ANDROID)
+    message(STATUS "MobileGL trace replay runner is only enabled on desktop Unix")
     return()
 endif()
 
@@ -140,12 +140,16 @@ target_link_libraries(mobilegl_trace_common PUBLIC
 add_library(mobilegl_trace_glproc STATIC
         "${APITRACE_GENERATED_DIR}/glproc.cpp"
         "${MOBILEGL_TRACE_ROOT}/apitrace_glproc_mobilegl.cpp")
+if(APPLE)
+    target_compile_definitions(mobilegl_trace_glproc PRIVATE GL_SILENCE_DEPRECATION)
+endif()
 target_include_directories(mobilegl_trace_glproc PUBLIC
+        "${CMAKE_SOURCE_DIR}/include"
         "${APITRACE_GENERATED_DIR}"
         "${APITRACE_ROOT}/dispatch"
         "${APITRACE_ROOT}/lib/os"
         "${APITRACE_ROOT}/thirdparty/khronos")
-target_link_libraries(mobilegl_trace_glproc PUBLIC mobilegl_trace_apitrace_os dl)
+target_link_libraries(mobilegl_trace_glproc PUBLIC mobilegl_trace_apitrace_os ${CMAKE_DL_LIBS})
 
 execute_process(
         COMMAND ${Python3_EXECUTABLE} "${APITRACE_ROOT}/retrace/glretrace.py"
@@ -221,6 +225,15 @@ add_library(mobilegl_trace_glretrace_common STATIC
         "${APITRACE_ROOT}/retrace/metric_helper.cpp"
         "${APITRACE_ROOT}/retrace/metric_writer.cpp"
         "${MOBILEGL_TRACE_ROOT}/apitrace_glws_egl.cpp")
+if(APPLE)
+    set(MOBILEGL_TRACE_APPLE_FRAMEWORKS
+            "-framework Cocoa"
+            "-framework QuartzCore"
+            "-framework Foundation")
+    target_sources(mobilegl_trace_glretrace_common PRIVATE
+            "${MOBILEGL_TRACE_ROOT}/macos_cgs_surface_bounds.cpp")
+    target_compile_definitions(mobilegl_trace_glretrace_common PRIVATE GL_SILENCE_DEPRECATION)
+endif()
 target_include_directories(mobilegl_trace_glretrace_common PUBLIC
         "${APITRACE_GENERATED_DIR}"
         "${APITRACE_ROOT}/dispatch"
@@ -244,8 +257,7 @@ target_compile_definitions(mobilegl_trace_replay PRIVATE
 target_include_directories(mobilegl_trace_replay PRIVATE
         "${MOBILEGL_TRACE_SHARED_CPP_DIR}"
         "${APITRACE_ROOT}/lib/image")
-target_link_libraries(mobilegl_trace_replay PRIVATE
-        "-Wl,--start-group"
+set(MOBILEGL_TRACE_REPLAY_LINK_LIBRARIES
         mobilegl_trace_glretrace_common
         mobilegl_trace_retrace_common
         mobilegl_trace_image
@@ -253,8 +265,18 @@ target_link_libraries(mobilegl_trace_replay PRIVATE
         mobilegl_trace_glhelpers
         mobilegl_trace_glproc
         mobilegl_trace_apitrace_os
-        "-Wl,--end-group"
-        dl)
+        ${CMAKE_DL_LIBS})
+
+if(APPLE)
+    target_link_libraries(mobilegl_trace_replay PRIVATE
+            ${MOBILEGL_TRACE_REPLAY_LINK_LIBRARIES}
+            ${MOBILEGL_TRACE_APPLE_FRAMEWORKS})
+else()
+    target_link_libraries(mobilegl_trace_replay PRIVATE
+            "-Wl,--start-group"
+            ${MOBILEGL_TRACE_REPLAY_LINK_LIBRARIES}
+            "-Wl,--end-group")
+endif()
 
 if(MOBILEGL_TRACE_REPLAY_MOBILEGL_LIBRARY)
     set(mobilegl_trace_replay_mobilegl_library "${MOBILEGL_TRACE_REPLAY_MOBILEGL_LIBRARY}")
@@ -269,15 +291,16 @@ function(add_trace_replay_test CASE_NAME BACKEND)
             TRACE_ARCHIVE
             TRACE_FILE
             GOLDEN
+            ALTERNATE_GOLDEN
             TARGET_CALL
             WIDTH
             HEIGHT
-            TOLERANCE
+            SSIM_THRESHOLD
             CROP_X
             CROP_Y
             CROP_WIDTH
             CROP_HEIGHT
-            FUZZ_PERCENT)
+            COHERENT_AS_FLUSH)
     cmake_parse_arguments(TRACE_CASE "" "${oneValueArgs}" "" ${ARGN})
     foreach(required TRACE_ARCHIVE GOLDEN TARGET_CALL WIDTH HEIGHT)
         if(NOT TRACE_CASE_${required})
@@ -287,8 +310,8 @@ function(add_trace_replay_test CASE_NAME BACKEND)
     if(NOT TRACE_CASE_TRACE_FILE)
         set(TRACE_CASE_TRACE_FILE trace.trace)
     endif()
-    if(NOT TRACE_CASE_TOLERANCE)
-        set(TRACE_CASE_TOLERANCE 0)
+    if(NOT TRACE_CASE_SSIM_THRESHOLD)
+        set(TRACE_CASE_SSIM_THRESHOLD 0.99)
     endif()
     if(NOT TRACE_CASE_CROP_X)
         set(TRACE_CASE_CROP_X 0)
@@ -302,9 +325,6 @@ function(add_trace_replay_test CASE_NAME BACKEND)
     if(NOT TRACE_CASE_CROP_HEIGHT)
         set(TRACE_CASE_CROP_HEIGHT 0)
     endif()
-    if(NOT TRACE_CASE_FUZZ_PERCENT)
-        set(TRACE_CASE_FUZZ_PERCENT 20)
-    endif()
     add_test(
             NAME MobileGLTraceReplay.${CASE_NAME}.${BACKEND}
             COMMAND "${CMAKE_COMMAND}"
@@ -314,16 +334,17 @@ function(add_trace_replay_test CASE_NAME BACKEND)
             -DTRACE_ARCHIVE=${TRACE_CASE_TRACE_ARCHIVE}
             -DTRACE_FILE=${TRACE_CASE_TRACE_FILE}
             -DTRACE_GOLDEN=${TRACE_CASE_GOLDEN}
+            -DTRACE_ALTERNATE_GOLDEN=${TRACE_CASE_ALTERNATE_GOLDEN}
             -DTRACE_BACKEND=${BACKEND}
             -DTRACE_TARGET_CALL=${TRACE_CASE_TARGET_CALL}
             -DTRACE_WIDTH=${TRACE_CASE_WIDTH}
             -DTRACE_HEIGHT=${TRACE_CASE_HEIGHT}
-            -DTRACE_TOLERANCE=${TRACE_CASE_TOLERANCE}
+            -DTRACE_SSIM_THRESHOLD=${TRACE_CASE_SSIM_THRESHOLD}
             -DTRACE_CROP_X=${TRACE_CASE_CROP_X}
             -DTRACE_CROP_Y=${TRACE_CASE_CROP_Y}
             -DTRACE_CROP_WIDTH=${TRACE_CASE_CROP_WIDTH}
             -DTRACE_CROP_HEIGHT=${TRACE_CASE_CROP_HEIGHT}
-            -DTRACE_FUZZ_PERCENT=${TRACE_CASE_FUZZ_PERCENT}
+            -DTRACE_COHERENT_AS_FLUSH=${TRACE_CASE_COHERENT_AS_FLUSH}
             -DTRACE_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/${CASE_NAME}/${BACKEND}
             -DTRACE_ARTIFACT_DIR=${CMAKE_CURRENT_BINARY_DIR}/${CASE_NAME}/actual-images
             -P ${MOBILEGL_TRACE_ROOT}/run_trace_case.cmake)
@@ -341,86 +362,12 @@ function(add_trace_replay_test_for_backends CASE_NAME)
     add_trace_replay_test(${CASE_NAME} DirectVulkan ${ARGN})
 endfunction()
 
-add_trace_replay_test_for_backends(OpenRA
-        TRACE_ARCHIVE ${MOBILEGL_TRACE_ROOT}/fixtures/openra.tgz
-        TRACE_FILE openra.trace
-        GOLDEN ${MOBILEGL_TRACE_ROOT}/fixtures/openra.0000031249.png
-        TARGET_CALL 31249
-        WIDTH 640
-        HEIGHT 480
-        TOLERANCE 20
-        CROP_X 1
-        CROP_Y 1
-        CROP_WIDTH 638
-        CROP_HEIGHT 478
-        FUZZ_PERCENT 20)
-
-add_trace_replay_test_for_backends(minecraft-1.21.4-startup
-        TRACE_ARCHIVE ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-startup.tgz
-        TRACE_FILE trace.trace
-        GOLDEN ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-startup.0000092195.png
-        TARGET_CALL 92195
-        WIDTH 854
-        HEIGHT 480
-        TOLERANCE 20
-        FUZZ_PERCENT 20)
-
-add_trace_replay_test_for_backends(minecraft-1.21.4-main-menu
-        TRACE_ARCHIVE ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-main-menu.tgz
-        TRACE_FILE trace.trace
-        GOLDEN ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-main-menu.0000481787.png
-        TARGET_CALL 481787
-        WIDTH 854
-        HEIGHT 480
-        TOLERANCE 500
-        FUZZ_PERCENT 20)
-
-add_trace_replay_test_for_backends(minecraft-1.21.4-in-world
-        TRACE_ARCHIVE ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-in-world.tgz
-        TRACE_FILE trace.trace
-        GOLDEN ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-in-world.0000280000.png
-        TARGET_CALL 280000
-        WIDTH 854
-        HEIGHT 480
-        TOLERANCE 500
-        FUZZ_PERCENT 20)
-
-add_trace_replay_test_for_backends(minecraft-1.21.4-fabric-sodium-in-world
-        TRACE_ARCHIVE ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-fabric-sodium-in-world.tgz
-        TRACE_FILE trace.trace
-        GOLDEN ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-fabric-sodium-in-world.0000923340.png
-        TARGET_CALL 923340
-        WIDTH 854
-        HEIGHT 480
-        TOLERANCE 20
-        FUZZ_PERCENT 20)
-
-add_trace_replay_test_for_backends(minecraft-1.21.4-fabric-iris-bsl-in-world
-        TRACE_ARCHIVE ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-fabric-iris-bsl-in-world.tgz
-        TRACE_FILE trace.trace
-        GOLDEN ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-fabric-iris-bsl-in-world.0000110725.png
-        TARGET_CALL 110725
-        WIDTH 854
-        HEIGHT 480
-        TOLERANCE 20
-        FUZZ_PERCENT 20)
-
-add_trace_replay_test_for_backends(minecraft-1.21.4-fabric-iris-makeup-ultrafast-in-world
-        TRACE_ARCHIVE ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-fabric-iris-makeup-ultrafast-in-world.tgz
-        TRACE_FILE trace.trace
-        GOLDEN ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-fabric-iris-makeup-ultrafast-in-world.0000095322.png
-        TARGET_CALL 95322
-        WIDTH 854
-        HEIGHT 480
-        TOLERANCE 20
-        FUZZ_PERCENT 20)
-
-add_trace_replay_test_for_backends(minecraft-1.21.4-fabric-iris-mellow-in-world
-        TRACE_ARCHIVE ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-fabric-iris-mellow-in-world.tgz
-        TRACE_FILE trace.trace
-        GOLDEN ${MOBILEGL_TRACE_ROOT}/fixtures/minecraft-1.21.4-fabric-iris-mellow-in-world.0000096143.png
-        TARGET_CALL 96143
-        WIDTH 854
-        HEIGHT 480
-        TOLERANCE 20
-        FUZZ_PERCENT 20)
+set(MOBILEGL_TRACE_CASES_CMAKE "${CMAKE_CURRENT_BINARY_DIR}/trace_cases.cmake")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MOBILEGL_TRACE_ROOT}/trace_cases.json")
+execute_process(
+        COMMAND ${Python3_EXECUTABLE} "${MOBILEGL_TRACE_ROOT}/trace_cases.py"
+        --format cmake
+        --fixture-root "${MOBILEGL_TRACE_ROOT}/fixtures"
+        OUTPUT_FILE "${MOBILEGL_TRACE_CASES_CMAKE}"
+        COMMAND_ERROR_IS_FATAL ANY)
+include("${MOBILEGL_TRACE_CASES_CMAKE}")

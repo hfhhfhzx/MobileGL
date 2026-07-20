@@ -7,8 +7,10 @@
 // End of Source File Header
 
 #include "GL_Getter.h"
+#include <cmath>
 #include <Config.h>
 #include <MGGitHash.h>
+#include <MG_Impl/GLImpl/VertexArray/Validators.h>
 #include <MG_State/EGLState/Core.h>
 #include <MG_State/GLState/Core.h>
 #include <MG_State/GLState/ErrorState/ErrorInfo.h>
@@ -39,7 +41,9 @@ namespace MobileGL::MG_Impl::GLImpl {
 
         constexpr GLint kFrontendMaxComputeUniformComponents = 1024;
         constexpr GLint kFrontendMaxComputeAtomicCounters = 8;
-        constexpr GLint kFrontendMaxComputeAtomicCounterBuffers = 1;
+        constexpr GLint kFrontendMaxComputeAtomicCounterBuffers = 8;
+        constexpr GLint kFrontendMaxComputeSharedMemorySize = 32768;
+        constexpr GLint kFrontendMaxComputeWorkGroupInvocations = 1024;
         constexpr GLint kFrontendMaxCombinedAtomicCounters = 8;
         constexpr GLint kFrontendMaxFragmentAtomicCounters = 8;
         constexpr GLint kFrontendMaxGeometryAtomicCounters = 0;
@@ -62,10 +66,26 @@ namespace MobileGL::MG_Impl::GLImpl {
         constexpr GLint kFrontendMaxCombinedUniformBlocks = kFrontendMaxVertexUniformBlocks +
                                                             kFrontendMaxGeometryUniformBlocks +
                                                             kFrontendMaxFragmentUniformBlocks;
-        constexpr GLint kFrontendMaxVaryingComponents = 60;
+        constexpr GLint kFrontendMaxVaryingComponents = 64;
         constexpr GLint kFrontendMaxVaryingVectors = 8;
         constexpr GLint kFrontendMaxProgramTexelOffset = 7;
         constexpr GLint kFrontendMinProgramTexelOffset = -8;
+        constexpr GLint kFrontendMaxTransformFeedbackInterleavedComponents = 64;
+        constexpr GLint kFrontendMaxTransformFeedbackSeparateAttribs = 4;
+        constexpr GLint kFrontendMaxTransformFeedbackSeparateComponents = 4;
+        constexpr GLint kFrontendMaxGeometryOutputVertices = 256;
+        constexpr GLint kFrontendMaxGeometryTotalOutputComponents = 1024;
+        constexpr GLint kFrontendMinUniformBufferBindings = 36;
+        constexpr GLint kFrontendSubpixelBits = 4;
+        constexpr GLint kFrontendMaxSamples = 4;
+
+        constexpr GLint GetMinComputeWorkGroupCount(GLuint index) {
+            return index < 3 ? 65535 : 0;
+        }
+
+        constexpr GLint GetMinComputeWorkGroupSize(GLuint index) {
+            return index < 2 ? 1024 : (index == 2 ? 64 : 0);
+        }
 
         GLint GetMaxCombinedUniformComponents(GLint maxDefaultUniformComponents, GLint maxUniformBlocks,
                                               GLint maxUniformBlockSizeBytes) {
@@ -133,6 +153,16 @@ namespace MobileGL::MG_Impl::GLImpl {
 
         bool IsIndexedBufferRangeQueryKind(IndexedBufferQueryKind queryKind) {
             return queryKind == IndexedBufferQueryKind::Start || queryKind == IndexedBufferQueryKind::Size;
+        }
+
+        SizeT GetIndexedBufferQueryPointCount(BufferTarget bufferTarget) {
+            const SizeT frontendCount = MG_State::pGLContext->GetBufferBindingPointCount(bufferTarget);
+            if (bufferTarget == BufferTarget::ShaderStorage && MG_Backend::pActiveBackendObject) {
+                const Int backendCount =
+                    MG_Backend::pActiveBackendObject->GetDynamicParameters().MaxShaderStorageBufferBindings;
+                return std::min(frontendCount, static_cast<SizeT>(std::max(backendCount, 0)));
+            }
+            return frontendCount;
         }
 
         bool TryDecodeDrawBufferQuery(GLenum pname, SizeT& drawBufferIndex) {
@@ -215,7 +245,7 @@ namespace MobileGL::MG_Impl::GLImpl {
                 return false;
             }
 
-            if (index >= MG_State::pGLContext->GetBufferBindingPointCount(bufferTarget)) {
+            if (index >= GetIndexedBufferQueryPointCount(bufferTarget)) {
                 MG_State::pGLContext->RecordError(
                     ErrorCode::InvalidValue,
                     MakeUnique<GenericErrorInfo>(
@@ -499,6 +529,13 @@ namespace MobileGL::MG_Impl::GLImpl {
             params[1] = dynamicParameters.AliasedLineWidthRangeMax;
             return;
         }
+        case GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT: {
+            // EXT_texture_filter_anisotropic queries this as a float; the integer path below widens
+            // from here, so this case is the authoritative one.
+            const auto& dynamicParameters = MG_Backend::pActiveBackendObject->GetDynamicParameters();
+            params[0] = dynamicParameters.MaxTextureMaxAnisotropy;
+            return;
+        }
         case GL_ALIASED_POINT_SIZE_RANGE:
         case GL_POINT_SIZE_RANGE: {
             const auto& dynamicParameters = MG_Backend::pActiveBackendObject->GetDynamicParameters();
@@ -532,6 +569,10 @@ namespace MobileGL::MG_Impl::GLImpl {
             return;
         case GL_SAMPLE_COVERAGE_VALUE:
             params[0] = MG_State::pGLContext->GetSampleCoverageValue();
+            return;
+        case GL_POINT_FADE_THRESHOLD_SIZE:
+            // Float state: read it directly so the fractional part is not lost to the integer path.
+            params[0] = MG_State::pGLContext->GetPointFadeThresholdSize();
             return;
         default:
             break;
@@ -581,9 +622,17 @@ namespace MobileGL::MG_Impl::GLImpl {
                 *data = static_cast<GLint>(bufferObject->GetExternalIndex());
                 return;
             case IndexedBufferQueryKind::Start:
+                if (!bindingPoint.HasExplicitRange()) {
+                    *data = 0;
+                    return;
+                }
                 *data = static_cast<GLint>(bindingPoint.GetRange().start);
                 return;
             case IndexedBufferQueryKind::Size: {
+                if (!bindingPoint.HasExplicitRange()) {
+                    *data = 0;
+                    return;
+                }
                 const Range1D range = bindingPoint.GetRange();
                 const auto start = std::min(range.start, bufferObject->GetSize());
                 const auto end = std::min(range.end, bufferObject->GetSize());
@@ -595,7 +644,74 @@ namespace MobileGL::MG_Impl::GLImpl {
             }
         }
 
+        switch (target) {
+        case GL_IMAGE_BINDING_NAME:
+        case GL_IMAGE_BINDING_LEVEL:
+        case GL_IMAGE_BINDING_LAYERED:
+        case GL_IMAGE_BINDING_LAYER:
+        case GL_IMAGE_BINDING_ACCESS:
+        case GL_IMAGE_BINDING_FORMAT: {
+            const auto maxImageUnits = static_cast<GLuint>(std::min<GLint>(
+                MG_Backend::pActiveBackendObject->GetDynamicParameters().MaxImageUnits,
+                MG_State::GLState::TextureState::MAX_TEXTURE_IMAGE_UNITS));
+            if (index >= maxImageUnits) {
+                *data = 0;
+                MG_State::pGLContext->RecordError(
+                    ErrorCode::InvalidValue,
+                    MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__, "Image unit index is out of range."));
+                return;
+            }
+
+            const auto& binding = MG_State::pGLContext->GetImageTextureBinding(static_cast<Int>(index));
+            switch (target) {
+            case GL_IMAGE_BINDING_NAME:
+                *data = binding.Texture ? static_cast<GLint>(binding.Texture->GetExternalIndex()) : 0;
+                return;
+            case GL_IMAGE_BINDING_LEVEL:
+                *data = binding.Level;
+                return;
+            case GL_IMAGE_BINDING_LAYERED:
+                *data = binding.Layered;
+                return;
+            case GL_IMAGE_BINDING_LAYER:
+                *data = binding.Layer;
+                return;
+            case GL_IMAGE_BINDING_ACCESS:
+                *data = static_cast<GLint>(binding.Access);
+                return;
+            case GL_IMAGE_BINDING_FORMAT:
+                *data = static_cast<GLint>(binding.Format);
+                return;
+            default:
+                break;
+            }
+        }
+        default:
+            break;
+        }
+
         auto getIntegeri = MG_Backend::gBackendFunctionsTable.GL.GetIntegeri_v;
+        if (target == GL_MAX_COMPUTE_WORK_GROUP_COUNT || target == GL_MAX_COMPUTE_WORK_GROUP_SIZE) {
+            if (index >= 3) {
+                *data = 0;
+                MG_State::pGLContext->RecordError(
+                    ErrorCode::InvalidValue,
+                    MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__,
+                                                 "Compute work group index is out of range."));
+                return;
+            }
+
+            const GLint minimum = target == GL_MAX_COMPUTE_WORK_GROUP_COUNT
+                ? GetMinComputeWorkGroupCount(index)
+                : GetMinComputeWorkGroupSize(index);
+            GLint backendValue = 0;
+            if (getIntegeri) {
+                getIntegeri(target, index, &backendValue);
+            }
+            *data = std::max(backendValue, minimum);
+            return;
+        }
+
         if (!getIntegeri) {
             *data = 0;
             MG_State::pGLContext->RecordError(
@@ -631,9 +747,17 @@ namespace MobileGL::MG_Impl::GLImpl {
                 *data = static_cast<GLint64>(bufferObject->GetExternalIndex());
                 return;
             case IndexedBufferQueryKind::Start:
+                if (!bindingPoint.HasExplicitRange()) {
+                    *data = 0;
+                    return;
+                }
                 *data = static_cast<GLint64>(range.start);
                 return;
             case IndexedBufferQueryKind::Size: {
+                if (!bindingPoint.HasExplicitRange()) {
+                    *data = 0;
+                    return;
+                }
                 const auto start = std::min(range.start, bufferObject->GetSize());
                 const auto end = std::min(range.end, bufferObject->GetSize());
                 *data = static_cast<GLint64>(end - start);
@@ -682,6 +806,18 @@ namespace MobileGL::MG_Impl::GLImpl {
             params[0] = static_cast<GLint64>(value);
             return;
         }
+        case GL_TIMESTAMP: {
+            // Handled here (not via the 32-bit GetIntegerv fallback) so the
+            // full 64-bit GPU timestamp survives; LWJGL reads it this way.
+            Int64 timestamp = 0;
+            if (!MG_Config::Features.DisableTimerQuery) {
+                if (const auto getGpuTimestampNs = MG_Backend::gBackendFunctionsTable.GL.GetGpuTimestampNs) {
+                    timestamp = getGpuTimestampNs();
+                }
+            }
+            params[0] = static_cast<GLint64>(timestamp);
+            return;
+        }
         default:
             break;
         }
@@ -710,6 +846,46 @@ namespace MobileGL::MG_Impl::GLImpl {
         default:
             params[0] = static_cast<GLint64>(ints[0]);
             return;
+        }
+    }
+
+    // glGetDoublev shares GetFloatv's accepted-pname set (and its INVALID_ENUM handling) and widens the
+    // result. MobileGL stores no native-double state (depth range/clear are float), so widening from
+    // float matches the resolution MobileGL actually holds. Only the pname's own component count is
+    // written, never a fixed 4, so a 1-component query cannot overrun the caller's buffer.
+    void GetDoublev(GLenum pname, GLdouble* params) {
+        if (!params) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__, "params pointer cannot be null"));
+            return;
+        }
+        GLfloat floats[4] = {};
+        GetFloatv(pname, floats);
+        GLsizei count = 1;
+        switch (pname) {
+        case GL_DEPTH_RANGE:
+        case GL_VIEWPORT_BOUNDS_RANGE:
+        case GL_ALIASED_LINE_WIDTH_RANGE:
+        case GL_ALIASED_POINT_SIZE_RANGE:
+        case GL_POINT_SIZE_RANGE:
+        case GL_SMOOTH_LINE_WIDTH_RANGE:
+        case GL_MAX_VIEWPORT_DIMS:
+            count = 2;
+            break;
+        case GL_BLEND_COLOR:
+        case GL_COLOR_CLEAR_VALUE:
+        case GL_VIEWPORT:
+        case GL_SCISSOR_BOX:
+        case GL_COLOR_WRITEMASK:
+            count = 4;
+            break;
+        default:
+            count = 1;
+            break;
+        }
+        for (GLsizei i = 0; i < count; ++i) {
+            params[i] = static_cast<GLdouble>(floats[i]);
         }
     }
 
@@ -783,6 +959,12 @@ namespace MobileGL::MG_Impl::GLImpl {
             *params = static_cast<GLint>(MG_Util::ConvertBlendFactorToGLEnum(srcRGB));
             return;
         }
+        case GL_CLAMP_READ_COLOR:
+            // Tri-state enum (GL_TRUE / GL_FALSE / GL_FIXED_ONLY). glGetIntegerv returns the raw
+            // enum; GetFloatv/GetDoublev widen it and GetBooleanv converts nonzero to GL_TRUE, so
+            // this single case serves every getter flavor.
+            *params = static_cast<GLint>(MG_State::pGLContext->GetClampReadColor());
+            return;
         case GL_COLOR_CLEAR_VALUE: {
             const FloatVec4& clearColor = MG_State::pGLContext->GetClearColor();
             params[0] = static_cast<GLint>(clearColor.x());
@@ -814,6 +996,9 @@ namespace MobileGL::MG_Impl::GLImpl {
         case GL_MAX_COMPUTE_ATOMIC_COUNTER_BUFFERS:
             *params = kFrontendMaxComputeAtomicCounterBuffers;
             return;
+        case GL_MAX_COMPUTE_SHARED_MEMORY_SIZE:
+            *params = kFrontendMaxComputeSharedMemorySize;
+            return;
         case GL_DISPATCH_INDIRECT_BUFFER_BINDING: {
             auto& obj = MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::DispatchIndirect).GetBoundObject();
             *params = obj ? static_cast<GLint>(obj->GetExternalIndex()) : 0;
@@ -822,12 +1007,16 @@ namespace MobileGL::MG_Impl::GLImpl {
         case GL_MAX_DEBUG_GROUP_STACK_DEPTH:
             *params = 0; // debug-group entrypoints are stubbed
             return;
+        case GL_MAX_DEBUG_MESSAGE_LENGTH:
+            *params = 1024; // debug-message entrypoints are stubbed, but KHR_debug requires a valid limit
+            return;
         case GL_DEBUG_GROUP_STACK_DEPTH:
             *params = 0; // debug-group entrypoints are stubbed
             return;
-        case GL_CONTEXT_FLAGS:
-            *params = 0; // contexts are created without debug/robust/forward-compatible flags
+        case GL_CONTEXT_FLAGS: {
+            *params = MG_State::pEGLContext ? MG_State::pEGLContext->GetCurrentContextFlags() : 0;
             return;
+        }
         case GL_CULL_FACE:
             *params = MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::CullFace) ? GL_TRUE : GL_FALSE;
             return;
@@ -932,7 +1121,7 @@ namespace MobileGL::MG_Impl::GLImpl {
             return;
         }
         case GL_FRAGMENT_SHADER_DERIVATIVE_HINT:
-            *params = GL_DONT_CARE;
+            *params = static_cast<GLint>(MG_State::pGLContext->GetHint(pname));
             return;
         case GL_IMPLEMENTATION_COLOR_READ_FORMAT: {
             GLint format = 0;
@@ -950,7 +1139,7 @@ namespace MobileGL::MG_Impl::GLImpl {
             *params = MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::LineSmooth) ? GL_TRUE : GL_FALSE;
             return;
         case GL_LINE_SMOOTH_HINT:
-            *params = GL_DONT_CARE;
+            *params = static_cast<GLint>(MG_State::pGLContext->GetHint(pname));
             return;
         case GL_LINE_WIDTH:
             *params = static_cast<GLint>(MG_State::pGLContext->GetLineWidth());
@@ -985,6 +1174,12 @@ namespace MobileGL::MG_Impl::GLImpl {
         case GL_MAX_FRAGMENT_INPUT_COMPONENTS:
             *params = kFrontendMaxFragmentInputComponents;
             return;
+        case GL_MAX_FRAGMENT_IMAGE_UNIFORMS:
+            // TODO: Track per-stage image uniform limits separately instead of reusing the compute/backend stage cap.
+            *params = MG_Backend::pActiveBackendObject
+                          ? MG_Backend::pActiveBackendObject->GetDynamicParameters().MaxComputeImageUniforms
+                          : MG_Backend::DynamicBackendParameters{}.MaxComputeImageUniforms;
+            return;
         case GL_MAX_FRAGMENT_UNIFORM_COMPONENTS:
             *params = kFrontendMaxFragmentUniformComponents;
             return;
@@ -1006,8 +1201,17 @@ namespace MobileGL::MG_Impl::GLImpl {
         case GL_MAX_GEOMETRY_OUTPUT_COMPONENTS:
             *params = kFrontendMaxGeometryOutputComponents;
             return;
+        case GL_MAX_GEOMETRY_OUTPUT_VERTICES:
+            *params = kFrontendMaxGeometryOutputVertices;
+            return;
         case GL_MAX_GEOMETRY_TEXTURE_IMAGE_UNITS:
             *params = kFrontendMaxGeometryTextureImageUnits;
+            return;
+        case GL_MAX_GEOMETRY_IMAGE_UNIFORMS:
+            *params = 0;
+            return;
+        case GL_MAX_GEOMETRY_TOTAL_OUTPUT_COMPONENTS:
+            *params = kFrontendMaxGeometryTotalOutputComponents;
             return;
         case GL_MAX_GEOMETRY_UNIFORM_BLOCKS:
             *params = kFrontendMaxGeometryUniformBlocks;
@@ -1045,6 +1249,12 @@ namespace MobileGL::MG_Impl::GLImpl {
         case GL_MAX_TESS_EVALUATION_ATOMIC_COUNTERS:
             *params = kFrontendMaxTessEvaluationAtomicCounters;
             return;
+        case GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS:
+            *params = 0;
+            return;
+        case GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS:
+            *params = 0;
+            return;
         case GL_MAX_TESS_CONTROL_SHADER_STORAGE_BLOCKS:
             *params = 16; // TODO
             return;
@@ -1065,6 +1275,9 @@ namespace MobileGL::MG_Impl::GLImpl {
             return;
         case GL_MAX_VERTEX_ATOMIC_COUNTERS:
             *params = kFrontendMaxVertexAtomicCounters;
+            return;
+        case GL_MAX_VERTEX_IMAGE_UNIFORMS:
+            *params = 0;
             return;
         case GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS:
             *params = 16; // TODO
@@ -1135,14 +1348,17 @@ namespace MobileGL::MG_Impl::GLImpl {
             return;
         }
         case GL_POINT_FADE_THRESHOLD_SIZE:
-            *params = 1;
+            *params = static_cast<GLint>(std::lround(MG_State::pGLContext->GetPointFadeThresholdSize()));
+            return;
+        case GL_POINT_SPRITE_COORD_ORIGIN:
+            *params = static_cast<GLint>(MG_State::pGLContext->GetPointSpriteCoordOrigin());
             return;
         case GL_PRIMITIVE_RESTART:
             *params = MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::PrimitiveRestart) ? GL_TRUE
                                                                                                     : GL_FALSE;
             return;
         case GL_PRIMITIVE_RESTART_INDEX:
-            *params = 0; // fixed default; PrimitiveRestartIndex entrypoints are stubbed
+            *params = static_cast<GLint>(MG_State::pGLContext->GetPrimitiveRestartIndex());
             return;
         case GL_PROGRAM_BINARY_FORMATS:
             *params = 0; // program-binary entrypoints are stubbed
@@ -1161,8 +1377,8 @@ namespace MobileGL::MG_Impl::GLImpl {
             *params = static_cast<GLint>(MG_State::pGLContext->GetPointSize());
             return;
         case GL_POLYGON_MODE:
-            params[0] = GL_FILL;
-            params[1] = GL_FILL;
+            params[0] = static_cast<GLint>(MG_State::pGLContext->GetPolygonModeFront());
+            params[1] = static_cast<GLint>(MG_State::pGLContext->GetPolygonModeBack());
             return;
         case GL_POLYGON_OFFSET_FACTOR:
             *params = static_cast<GLint>(MG_State::pGLContext->GetPolygonOffsetFactor());
@@ -1186,7 +1402,7 @@ namespace MobileGL::MG_Impl::GLImpl {
             *params = MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::PolygonSmooth) ? GL_TRUE : GL_FALSE;
             return;
         case GL_POLYGON_SMOOTH_HINT:
-            *params = GL_DONT_CARE;
+            *params = static_cast<GLint>(MG_State::pGLContext->GetHint(pname));
             return;
         case GL_READ_BUFFER:
             if (const auto& fbo = MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Read)
@@ -1416,14 +1632,22 @@ namespace MobileGL::MG_Impl::GLImpl {
             return;
         }
         case GL_TEXTURE_COMPRESSION_HINT:
-            *params = GL_DONT_CARE;
+            *params = static_cast<GLint>(MG_State::pGLContext->GetHint(pname));
             return;
         case GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT:
             *params = 0; // texture-buffer range entrypoints are stubbed
             return;
-        case GL_TIMESTAMP:
-            *params = 0; // timer-query entrypoints are stubbed
+        case GL_TIMESTAMP: {
+            Int64 timestamp = 0;
+            if (!MG_Config::Features.DisableTimerQuery) {
+                if (const auto getGpuTimestampNs = MG_Backend::gBackendFunctionsTable.GL.GetGpuTimestampNs) {
+                    timestamp = getGpuTimestampNs();
+                }
+            }
+            // 32-bit query: clamp per the GL state-query conversion rules.
+            *params = timestamp > static_cast<Int64>(INT_MAX) ? INT_MAX : static_cast<GLint>(timestamp);
             return;
+        }
         case GL_TRANSFORM_FEEDBACK_BUFFER_BINDING:
             if (const auto& obj =
                     MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::TransformFeedback).GetBoundObject()) {
@@ -1510,7 +1734,11 @@ namespace MobileGL::MG_Impl::GLImpl {
             *params = 1024 * 1024; // TODO
             return;
         case GL_CONTEXT_PROFILE_MASK:
-            *params = GL_CONTEXT_CORE_PROFILE_BIT;
+            // Reports the requested context profile (EGL defaults 3.x contexts to core);
+            // MOBILEGL_RELAXED_SEMANTICS loosens behavior without changing the identity.
+            *params = MG_State::pEGLContext && MG_State::pEGLContext->IsCurrentContextOpenGLCompatibilityProfile()
+                          ? GL_CONTEXT_COMPATIBILITY_PROFILE_BIT
+                          : GL_CONTEXT_CORE_PROFILE_BIT;
             return;
         default:
             break;
@@ -1564,7 +1792,8 @@ namespace MobileGL::MG_Impl::GLImpl {
                                                       dynamicParameters.MaxUniformBlockSize);
             break;
         case GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS:
-            *params = dynamicParameters.MaxComputeWorkGroupInvocations;
+            *params = std::max(dynamicParameters.MaxComputeWorkGroupInvocations,
+                               kFrontendMaxComputeWorkGroupInvocations);
             break;
         case GL_MAX_COMPUTE_WORK_GROUP_COUNT:
             GetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT, 0, &params[0]);
@@ -1600,6 +1829,12 @@ namespace MobileGL::MG_Impl::GLImpl {
             *params = GetMaxCombinedUniformComponents(kFrontendMaxGeometryUniformComponents,
                                                       kFrontendMaxGeometryUniformBlocks,
                                                       dynamicParameters.MaxUniformBlockSize);
+            break;
+        case GL_MAX_GEOMETRY_OUTPUT_VERTICES:
+            *params = kFrontendMaxGeometryOutputVertices;
+            break;
+        case GL_MAX_GEOMETRY_TOTAL_OUTPUT_COMPONENTS:
+            *params = kFrontendMaxGeometryTotalOutputComponents;
             break;
         case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS:
             *params = dynamicParameters.MaxCombinedTextureImageUnits;
@@ -1649,10 +1884,19 @@ namespace MobileGL::MG_Impl::GLImpl {
             *params = dynamicParameters.MaxSampleMaskWords;
             break;
         case GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS:
-            *params = dynamicParameters.MaxShaderStorageBufferBindings;
+            *params = static_cast<GLint>(GetIndexedBufferQueryPointCount(BufferTarget::ShaderStorage));
             break;
         case GL_MAX_TEXTURE_BUFFER_SIZE:
             *params = dynamicParameters.MaxTextureBufferSize;
+            break;
+        case GL_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS:
+            *params = kFrontendMaxTransformFeedbackInterleavedComponents;
+            break;
+        case GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS:
+            *params = kFrontendMaxTransformFeedbackSeparateAttribs;
+            break;
+        case GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS:
+            *params = kFrontendMaxTransformFeedbackSeparateComponents;
             break;
         case GL_MAX_TEXTURE_IMAGE_UNITS:
             *params = dynamicParameters.MaxTextureImageUnits;
@@ -1661,13 +1905,22 @@ namespace MobileGL::MG_Impl::GLImpl {
             *params = dynamicParameters.MaxTextureSize;
             break;
         case GL_MAX_UNIFORM_BUFFER_BINDINGS:
-            *params = dynamicParameters.MaxUniformBufferBindings;
+            // Never advertise more bindings than the state layer's indexed-binding array can track
+            // (BufferState::BufferBindingPointCount): glBindBufferBase rejects indices past that
+            // capacity, and the GL CTS per-case state reset calls glBindBufferBase on every
+            // advertised index and expects no error. The floor equals the GL 3.3 core minimum
+            // (36), so the clamp never under-advertises.
+            *params = std::clamp(dynamicParameters.MaxUniformBufferBindings, kFrontendMinUniformBufferBindings,
+                                 static_cast<GLint>(MG_State::GLState::BufferBindingPointCount));
             break;
         case GL_MAX_UNIFORM_BLOCK_SIZE:
             *params = dynamicParameters.MaxUniformBlockSize;
             break;
         case GL_MAX_VERTEX_ATTRIBS:
-            *params = dynamicParameters.MaxVertexAttribs;
+            // Single source of truth with the validators: the value reported here is exactly the bound
+            // glVertexAttrib*/glGetVertexAttrib*/glBindAttribLocation enforce, and it never exceeds the
+            // state layer's current-value storage capacity.
+            *params = static_cast<GLint>(VertexArrayImpl::GetMaxVertexAttribs());
             break;
         case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS:
             *params = dynamicParameters.MaxVertexTextureImageUnits;
@@ -1699,7 +1952,7 @@ namespace MobileGL::MG_Impl::GLImpl {
             *params = static_cast<GLint>(dynamicParameters.SmoothLineWidthGranularity);
             break;
         case GL_SUBPIXEL_BITS:
-            *params = dynamicParameters.ViewportSubpixelBits;
+            *params = std::max(dynamicParameters.ViewportSubpixelBits, kFrontendSubpixelBits);
             break;
         case GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT:
             *params = static_cast<Int>(dynamicParameters.UniformBufferOffsetAlignment);
@@ -1709,7 +1962,7 @@ namespace MobileGL::MG_Impl::GLImpl {
             params[1] = static_cast<GLint>(dynamicParameters.ViewportBoundsRangeMax);
             break;
         case GL_VIEWPORT_SUBPIXEL_BITS:
-            *params = dynamicParameters.ViewportSubpixelBits;
+            *params = std::max(dynamicParameters.ViewportSubpixelBits, kFrontendSubpixelBits);
             break;
         case GL_MAX_COLOR_ATTACHMENTS:
         case GL_MAX_DRAW_BUFFERS:
@@ -1717,7 +1970,11 @@ namespace MobileGL::MG_Impl::GLImpl {
                                                         : dynamicParameters.MaxDrawBuffers;
             break;
         case GL_MAX_SAMPLES:
-            *params = dynamicParameters.MaxSamples;
+            *params = std::max(dynamicParameters.MaxSamples, kFrontendMaxSamples);
+            break;
+        case GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT:
+            // Float state (see GetFloatv); rounded to nearest for the integer query per GL 3.3 6.1.2.
+            *params = static_cast<GLint>(std::lround(dynamicParameters.MaxTextureMaxAnisotropy));
             break;
         default:
             MGLOG_E("glGetIntegerv: Invalid enum %s (0x%X)", MG_Util::ConvertGLEnumToString(pname).c_str(), pname);

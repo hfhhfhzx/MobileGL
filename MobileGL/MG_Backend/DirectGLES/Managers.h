@@ -8,14 +8,18 @@
 
 #pragma once
 #include <Includes.h>
+#include <atomic>
+#include <mutex>
 #include "DirectGLES.h"
 #include "MG_State/GLState/SamplerState/SamplerObject.h"
 #include "MG_State/GLState/TextureState/TextureEnum.h"
 #include <MG_State/GLState/TextureState/TextureObject.h>
 #include <MG_State/GLState/Core.h>
+#include <MG_Util/Converters/MGToGL/TextureEnumConverter.h>
 
 namespace MobileGL::MG_Backend::DirectGLES {
     String EmulateBaseInstanceInVertexShader(String source, GLenum shaderType);
+    String PromoteDrawParameterGlobalsToUniforms(String source, GLenum shaderType);
 
     template <typename StateObject, typename BackendObject>
     class StateBackendObjectRegistry {
@@ -52,6 +56,8 @@ namespace MobileGL::MG_Backend::DirectGLES {
             return const_cast<StateBackendObjectRegistry*>(this)->find(stateObj);
         }
 
+        iterator begin() { return m_backendObjects.begin(); }
+        const_iterator begin() const { return m_backendObjects.begin(); }
         iterator end() { return m_backendObjects.end(); }
         const_iterator end() const { return m_backendObjects.end(); }
 
@@ -113,26 +119,114 @@ namespace MobileGL::MG_Backend::DirectGLES {
 
     namespace BufferImpl {
         const GLenum TempBufferTarget = GL_ARRAY_BUFFER;
-        class BackendBufferObject {
+
+        // The DirectGLES storage behind one frontend buffer. Owned (refcounted) by
+        // the frontend BufferObject; immediate BufferBackendOps keep it current, so
+        // draw-time "sync" reduces to ensuring the storage exists.
+        class GLESBufferResource : public MG_State::GLState::BackendBufferResource {
         public:
-            BackendBufferObject();
-            void SyncToBackend(const SharedPtr<MG_State::GLState::BufferObject>& stateBufferObject);
-            Uint GetBackendBufferId() const { return m_backendBufferId; }
-            void Bind(GLenum target = TempBufferTarget);
+            ~GLESBufferResource() override = default;
 
-        private:
-            void SyncToBackend_glBufferData(const SharedPtr<MG_State::GLState::BufferObject>& stateBufferObject);
-            void SyncToBackend_glBufferSubData(const SharedPtr<MG_State::GLState::BufferObject>& stateBufferObject);
-            void SyncToBackend_glMapBufferRange(const SharedPtr<MG_State::GLState::BufferObject>& stateBufferObject,
-                                                Bool invalidate = true, Bool unsynchronized = true);
-
-            Uint m_backendBufferId = 0;
-            SizeT m_prevBufferSize = 0;
-            Bool m_isInitialized = false;
+            Uint id = 0;
+            SizeT storageSize = 0;
+            Bool storageInitialized = false;
+            // ES context generation this resource's id belongs to; ids from a
+            // destroyed context are invalid and must not be deleted or reused.
+            Uint contextGeneration = 0;
+            // Frontend change serial the backend storage reflects. When immediate
+            // ops cannot run (ops unregistered, no current context), this lags and
+            // EnsureBufferResource falls back to a full re-upload. Atomic: read on
+            // the context-owning thread while ops on other threads may update it.
+            std::atomic<Uint64> syncedChangeSerial{0};
+            // Ops that arrived while no ES context was current on the calling thread
+            // (or before storage existed); replayed by EnsureBufferResource. The ES
+            // context migrates between app threads, so deferring ops can race with
+            // the owning thread replaying them: guard both fields with pendingMutex.
+            Bool pendingRespecify = false;
+            VecRange1D pendingRanges;
+            std::mutex pendingMutex;
+            // Zero-copy coherent persistent map (EXT_buffer_storage): the GL store is
+            // immutable, persistently+coherently mapped, and persistentPtr is what the app
+            // (and the frontend PipeResource) write into directly. While set, draw-time
+            // sync is a no-op and no per-draw glBufferSubData is issued. Cleared on ES
+            // context loss.
+            Bool persistentMapped = false;
+            void* persistentPtr = nullptr;
         };
 
-        extern BackendBufferObject* g_boundVertexBufferObject;
-        extern StateBackendObjectRegistry<MG_State::GLState::BufferObject, BackendBufferObject> g_backendBufferObjects;
+        // Registered as the frontend's BufferBackendOps at backend init and on
+        // every MakeCurrent (the ES context can be destroyed and recreated, e.g.
+        // by the trace replayer's probe context).
+        void RegisterBufferBackendOps();
+        void UnregisterBufferBackendOps();
+        // The ES context died: unregister ops, invalidate all outstanding GL ids
+        // (they belonged to the dead context) and drop deferred deletes.
+        void OnBackendContextDestroyed();
+
+        // Get-or-create the backend resource and bring its storage up to date
+        // (creates the GL buffer, replays pending ops, pushes persistent-mapped
+        // ranges). Requires the ES context to be current. Returns nullptr only
+        // for null input.
+        GLESBufferResource* EnsureBufferResource(const SharedPtr<MG_State::GLState::BufferObject>& bufferObject);
+        // Existing resource or nullptr; performs no GL calls.
+        GLESBufferResource* GetBufferResource(MG_State::GLState::BufferObject* bufferObject);
+
+        // Deletes GL buffers whose owning frontend objects died (possibly on a
+        // thread without a current ES context). Called from draw-time sync.
+        void ProcessDeferredBufferReleases();
+
+        // glBindBuffer with a redundant-bind cache for GL_ARRAY_BUFFER.
+        void BindBufferId(GLenum target, Uint id);
+        void InvalidateArrayBufferBindingCache();
+        // Redundant-bind cache for INDEXED buffer bindings (glBindBufferBase/Range on
+        // GL_UNIFORM_BUFFER / GL_SHADER_STORAGE_BUFFER): skips the GL call when the
+        // (id, range) already at that index matches, like the array-buffer/texture/
+        // sampler caches already do. Invalidated on MakeCurrent (context may reset).
+        void BindBufferBaseCached(GLenum glTarget, Uint index, Uint id);
+        void BindBufferRangeCached(GLenum glTarget, Uint index, Uint id, GLintptr offset, GLsizeiptr size);
+        void InvalidateIndexedBufferBindingCache();
+        // Buffer-storage pool maintenance. TrimBufferPool evicts over-budget entries
+        // (called once per frame from Present); ClearBufferPool drops all pooled ids
+        // without glDeleteBuffers (called when the ES context is going away).
+        void TrimBufferPool();
+        void ClearBufferPool();
+
+        // --- Global-UBO ring ------------------------------------------------------
+        // One persistently+coherently mapped buffer (EXT_buffer_storage) shared by
+        // every program's lowered default-uniform block. Each content change is
+        // bump-allocated into a fresh slot and bound with glBindBufferRange, so the
+        // CPU never rewrites bytes the GPU may still be reading — the per-draw
+        // glBufferSubData into one static UBO forced Adreno to resolve that
+        // write-after-read hazard on every uniform-dirtying draw (MC dirties
+        // uniforms every draw). Reclamation rides the Present() frame-fence
+        // watermark; no ring bytes are recycled before their frame's GPU work
+        // completed.
+        //
+        // A program's cached slot, reusable within one frame while the frontend UBO
+        // content version is unchanged. Cross-frame reuse is intentionally not
+        // attempted: later same-frame allocations may recycle bytes of completed
+        // frames, so re-referencing them would need per-bind pinning — rewriting
+        // GetUBOSize() bytes once per program per frame is far cheaper.
+        struct UboRingAllocation {
+            Uint32 contentVersion = ~0u; // frontend UBO content version held at `offset`
+            Uint32 ringGeneration = 0;   // ring identity the slot lives in (0 = never valid)
+            Uint64 frameSerial = ~Uint64{0}; // frame the slot was written in
+            SizeT offset = 0;
+        };
+        // False when the feature is disabled, EXT_buffer_storage / fences are
+        // missing, the ES context is not current, or ring creation already failed
+        // under this context (callers then take the legacy glBufferSubData path).
+        Bool UboRingAvailable();
+        // Bump-allocate `size` bytes aligned to GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT.
+        // Grows the ring (new GL store, generation bump) when the in-flight span
+        // would be overrun. Returns false when storage (re)creation fails.
+        Bool UboRingAllocate(SizeT size, SizeT& outOffset);
+        void* UboRingMappedPtr();
+        Uint UboRingBufferId();
+        Uint32 UboRingGeneration();
+        // Present()-time upkeep: records the frame's high-water mark for reclamation
+        // and deletes grown-away ring stores once the GPU is done with them.
+        void UboRingOnPresent();
     } // namespace BufferImpl
 
     namespace VertexArrayImpl {
@@ -161,10 +255,48 @@ namespace MobileGL::MG_Backend::DirectGLES {
 
     namespace TextureImpl {
         inline Bool IsSupportedTextureTarget(TextureTarget target) {
-            if (target == TextureTarget::Texture1D || target == TextureTarget::TextureRectangle ||
-                target == TextureTarget::Texture1DArray || target == TextureTarget::Texture2DArray)
-                return false;
-            return true;
+            // Rectangle textures need non-normalized sampling ES cannot express; everything else is
+            // either native or emulated (1D -> 2D with height 1, 1D array -> 2D array, see
+            // MapToBackendTextureTarget). SPIRV-Cross already emits the matching ESSL samplers and
+            // coordinate padding for 1D/1D-array shaders.
+            return target != TextureTarget::TextureRectangle;
+        }
+
+        // ES has no 1D targets: 1D textures are stored as 2D (height 1) and 1D arrays as 2D arrays
+        // (height 1, layers in depth). Must match SPIRV-Cross's ES 1D-as-2D shader emulation.
+        inline TextureTarget MapToBackendTextureTarget(TextureTarget target) {
+            switch (target) {
+            case TextureTarget::Texture1D:
+                return TextureTarget::Texture2D;
+            case TextureTarget::Texture1DArray:
+                return TextureTarget::Texture2DArray;
+            default:
+                return target;
+            }
+        }
+
+        inline GLenum ConvertTextureTargetToBackendGLEnum(TextureTarget target) {
+            return MG_Util::ConvertTextureTargetToGLEnum(MapToBackendTextureTarget(target));
+        }
+
+        inline GLenum ConvertTextureUploadTargetToBackendGLEnum(TextureUploadTarget uploadTarget) {
+            switch (uploadTarget) {
+            case TextureUploadTarget::Texture1D:
+                return GL_TEXTURE_2D;
+            case TextureUploadTarget::Texture1DArray:
+                return GL_TEXTURE_2D_ARRAY;
+            default:
+                return MG_Util::ConvertTextureUploadTargetToGLEnum(uploadTarget);
+            }
+        }
+
+        // 1D arrays store layers in the state-side height; the ES 2D-array image keeps height 1 and
+        // moves the layer count into depth.
+        inline IntVec3 GetBackendUploadSize(TextureTarget stateTarget, const IntVec3& texelSize) {
+            if (stateTarget == TextureTarget::Texture1DArray) {
+                return {texelSize.x(), 1, texelSize.y()};
+            }
+            return texelSize;
         }
 
         inline Bool IsMultisampleTextureTarget(TextureTarget target) {
@@ -203,12 +335,17 @@ namespace MobileGL::MG_Backend::DirectGLES {
             void SyncMipmapsToBackend(const SharedPtr<MG_State::GLState::ITextureObject>& stateTextureObject);
             void SyncBuiltinSamplerToBackend(const SharedPtr<MG_State::GLState::ITextureObject>& stateTextureObject);
             void SyncTextureParamsToBackend(const SharedPtr<MG_State::GLState::ITextureObject>& stateTextureObject);
+            void RequireImageBindableStorage();
             void Bind(GLenum target, Uint unit = TempTextureUnit);
             Uint GetBackendTextureId() const;
 
         private:
+            void RecreateBackendTexture();
+
             Uint m_backendTextureId = 0;
             Bool m_isInitialized = false;
+            Bool m_imageBindableStorageRequired = false;
+            Bool m_backendStorageImmutable = false;
             StateTextureBasicInfo m_prevTextureInfo;
             SamplerParameters m_cacheSamplerParameters;
             UintVec2 m_cacheLodRange = {0, 1000};
@@ -223,6 +360,9 @@ namespace MobileGL::MG_Backend::DirectGLES {
         void UnbindTexture(Uint unit, GLenum target);
         extern StateBackendObjectRegistry<MG_State::GLState::ITextureObject, BackendTextureObject>
             g_backendTextureObjects;
+        SharedPtr<BackendTextureObject>& SyncTextureObjectToBackend(
+            const SharedPtr<MG_State::GLState::ITextureObject>& textureObject,
+            Bool imageBindableStorageRequired = false);
         extern Array<Array<BackendTextureObject*, (SizeT)TextureTarget::TextureTargetCount>,
                      MG_State::GLState::TextureState::MAX_TEXTURE_IMAGE_UNITS>
             g_boundTexturesCache;
@@ -268,26 +408,109 @@ namespace MobileGL::MG_Backend::DirectGLES {
         extern StateBackendObjectRegistry<MG_State::GLState::FramebufferObject, BackendFramebufferObject>
             g_backendFramebufferObjects;
         extern Array<Uint16, SizeT(FramebufferTarget::FramebufferTargetCount)> g_fboBindVersions;
+        // Tracks the bound FBO's object version (bumped on any attachment/drawbuffer change)
+        // per target: re-attaching textures or changing draw buffers on an already-bound FBO
+        // must re-sync it even when the binding-slot version has not moved.
+        extern Array<Uint16, SizeT(FramebufferTarget::FramebufferTargetCount)> g_fboSyncedObjectVersions;
+        extern Array<MG_State::GLState::FramebufferObject*, SizeT(FramebufferTarget::FramebufferTargetCount)>
+            g_fboSyncedObjects;
     } // namespace FramebufferImpl
+
+    // Image uniforms take their unit from the layout(binding=N) qualifier baked into
+    // the transpiled ESSL; unlike samplers they must not (and in ES cannot) be
+    // assigned through glUniform1i.
+    inline Bool IsImageUniformType(GLenum type) {
+        switch (type) {
+        case 0x904D: /*GL_IMAGE_2D*/
+        case 0x904E: /*GL_IMAGE_3D*/
+        case 0x9050: /*GL_IMAGE_CUBE*/
+        case 0x9051: /*GL_IMAGE_BUFFER*/
+        case 0x9053: /*GL_IMAGE_2D_ARRAY*/
+        case 0x9058: /*GL_INT_IMAGE_2D*/
+        case 0x9059: /*GL_INT_IMAGE_3D*/
+        case 0x905B: /*GL_INT_IMAGE_CUBE*/
+        case 0x905C: /*GL_INT_IMAGE_BUFFER*/
+        case 0x905E: /*GL_INT_IMAGE_2D_ARRAY*/
+        case 0x9063: /*GL_UNSIGNED_INT_IMAGE_2D*/
+        case 0x9064: /*GL_UNSIGNED_INT_IMAGE_3D*/
+        case 0x9066: /*GL_UNSIGNED_INT_IMAGE_CUBE*/
+        case 0x9067: /*GL_UNSIGNED_INT_IMAGE_BUFFER*/
+        case 0x9069: /*GL_UNSIGNED_INT_IMAGE_2D_ARRAY*/
+            return true;
+        default:
+            return false;
+        }
+    }
 
     namespace PrgramImpl {
         class BackendProgramObjectImpl {
         public:
+            // Per-link cache of a sampler-style uniform's backend location: built once in
+            // SyncToBackend so draws stop issuing glGetUniformLocation string queries.
+            // lastAssignedUnit mirrors the program-state value set through glUniform1i
+            // (program state persists across binds, so caching per program is exact).
+            struct SamplerUniformBinding {
+                Uint frontendLocation = 0;
+                Int backendLocation = -1;
+                GLenum uniformType = 0;
+                Int lastAssignedUnit = -1;
+            };
+
             BackendProgramObjectImpl();
             ~BackendProgramObjectImpl();
             void SyncToBackend(const SharedPtr<MG_State::GLState::ProgramObject>& stateProgramObject);
             void Use() const;
             void SetBaseInstance(Uint32 baseInstance) const;
+            void SetBaseInstanceWordIndex(Int32 wordIndex) const;
+            void SetDrawID(Uint32 drawId) const;
+            Int GetIndirectParamsBinding() const { return m_indirectParamsBinding; }
             Uint GetBackendProgramId() const { return m_backendProgramId; }
             Uint GetBackendGlobalUBOId() const { return m_backendGlobalUBOId; }
+            Uint32 GetSnormFallbackClampOutputMask() const { return m_snormFallbackClampOutputMask; }
+            Uint32 GetUnormFallbackClampOutputMask() const { return m_unormFallbackClampOutputMask; }
+
+            Bool HasGlobalUboBlock() const { return m_globalUboBackendBlockIndex >= 0; }
+            const Vector<Int>& GetUniformBlockBackendIndices() const { return m_uniformBlockBackendIndices; }
+            Vector<SamplerUniformBinding>& GetSamplerUniformBindings() { return m_samplerUniformBindings; }
+            Uint32 GetLastUploadedGlobalUboVersion() const { return m_lastUploadedGlobalUboVersion; }
+            void SetLastUploadedGlobalUboVersion(Uint32 version) { m_lastUploadedGlobalUboVersion = version; }
+            // Backend-reported GL_UNIFORM_BLOCK_DATA_SIZE of the global block; ring
+            // bindings must span at least this much (may exceed the frontend's
+            // reflected size when the transpiled block pads differently).
+            Int GetGlobalUboBackendBlockSize() const { return m_globalUboBackendBlockSize; }
+            BufferImpl::UboRingAllocation& GetGlobalUboRingAllocation() { return m_globalUboRingAllocation; }
+            // Frontend link version this backend program (and its resource caches) was
+            // built from; a mismatch means every link-derived cache here is stale.
+            Uint32 GetSyncedLinkVersion() const { return m_syncedLinkVersion; }
 
         private:
+            void CacheResourceLocations(const SharedPtr<MG_State::GLState::ProgramObject>& stateProgramObject);
+
             Uint m_backendProgramId = 0;
             Uint m_backendGlobalUBOId = 0;
             Int m_baseInstanceUniformLocation = -1;
+            Int m_drawIdUniformLocation = -1;
+            Int m_baseInstanceWordIndexUniformLocation = -1;
+            Int m_indirectParamsBinding = -1;
+            Uint32 m_snormFallbackClampOutputMask = 0;
+            Uint32 m_unormFallbackClampOutputMask = 0;
             Bool m_isInitialized = false;
+
+            Int m_globalUboBackendBlockIndex = -1;
+            Int m_globalUboBackendBlockSize = 0;
+            Vector<Int> m_uniformBlockBackendIndices; // frontend block index -> backend index (-1 = absent)
+            Vector<SamplerUniformBinding> m_samplerUniformBindings;
+            Uint32 m_lastUploadedGlobalUboVersion = ~0u;
+            BufferImpl::UboRingAllocation m_globalUboRingAllocation;
+            Uint32 m_syncedLinkVersion = ~0u;
         };
 
+        extern Uint32 g_snormFallbackClampOutputMask;
+        extern Uint32 g_unormFallbackClampOutputMask;
+        // Backend id of the last glUseProgram issued through this backend; lets Use()
+        // skip redundant rebinds. Reset to 0 wherever glUseProgram(0) is issued or the
+        // ES context is recreated.
+        extern Uint g_lastUsedBackendProgramId;
         extern StateBackendObjectRegistry<MG_State::GLState::ProgramObject, BackendProgramObjectImpl>
             g_backendProgramObjects;
     } // namespace PrgramImpl

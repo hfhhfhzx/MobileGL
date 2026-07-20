@@ -8,14 +8,41 @@
 
 #include "DirectVulkan.h"
 #include "DirectVulkanResourceState.h"
+#include "MG_Backend/BackendObjects.h"
 #include "MG_State/GLState/Core.h"
+#include "MG_State/GLState/ErrorState/ErrorInfo.h"
 #include "MG_Impl/GLImpl/Framebuffer/GL_Framebuffer.h"
+#include "MG_Util/Converters/GLToMG/TextureEnumConverter.h"
+#include "MG_Util/Metrics/TextureMetrics.h"
 #include "MG_Util/Miscellany/IndexGenerator.h"
+#include <atomic>
 #include <cstring>
 #include <spirv_reflect.h>
 
 namespace MobileGL::MG_Backend::DirectVulkan {
     UniquePtr<VulkanRenderer> pVulkanRenderer = nullptr;
+
+    namespace {
+        // Generation of the live VulkanRenderer instance, mirroring
+        // DirectGLES's g_syncContextGeneration. BackendObject_DirectVulkan
+        // bumps it (BumpRendererGeneration) wherever pVulkanRenderer is reset
+        // or recreated. Fence and timer-query handles are stamped with the
+        // generation they were created under: a stale stamp means the frame
+        // serials and query-pool slots the handle refers to belong to a
+        // destroyed renderer and must never be dereferenced against the
+        // current one (a new renderer restarts its frame-serial counter and
+        // reuses pool indices). Atomic because handles may be polled from a
+        // thread other than the EGL thread that recreates the renderer.
+        std::atomic<Uint64> g_rendererGeneration{1};
+    } // namespace
+
+    Uint64 GetRendererGeneration() {
+        return g_rendererGeneration.load(std::memory_order_acquire);
+    }
+
+    void BumpRendererGeneration() {
+        g_rendererGeneration.fetch_add(1, std::memory_order_acq_rel);
+    }
 
     namespace {
         struct BufferVariableResource {
@@ -55,6 +82,19 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         };
 
         UnorderedMap<GLuint, ProgramResourceCache> g_programResourceCaches;
+
+        void ClearReadPixelsOutput(GLsizei width, GLsizei height, GLenum format, GLenum type, void* pixels) {
+            if (!pixels || width <= 0 || height <= 0) {
+                return;
+            }
+            const auto inputFormat = MG_Util::ConvertGLEnumToTextureInputFormat(format);
+            const auto inputType = MG_Util::ConvertGLEnumToTexturePixelDataType(type);
+            const SizeT size = MG_Util::CalculateInputTextureImageSize(inputFormat, inputType,
+                                                                       IntVec3(width, height, 1));
+            if (size > 0) {
+                std::memset(pixels, 0, size);
+            }
+        }
 
         String NormalizeDescriptorName(const SpvReflectDescriptorBinding& binding) {
             const char* rawName = binding.name;
@@ -190,7 +230,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
 
         MG_State::GLState::ProgramObject* TryGetDirectVulkanProgram(GLuint program) {
-            if (!MG_State::pGLContext || !MG_State::pGLContext->ValidateProgramName(program)) {
+            if (!MG_State::pGLContext->ValidateProgramName(program)) {
                 return nullptr;
             }
             auto& programObject = MG_State::pGLContext->GetProgramObject(program);
@@ -212,14 +252,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         const Uint8* ResolveIndirectCommandBytes(const void* indirect, SizeT requiredBytes, const char* label) {
             auto drawBuffer = MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::DrawIndirect).GetBoundObject();
             if (drawBuffer) {
-                drawBuffer->MarkPersistentMappedRangeDirty();
-                const auto drawData = drawBuffer->GetDataReadOnly();
+                drawBuffer->SyncPersistentMappedRange();
                 const SizeT commandOffset = reinterpret_cast<SizeT>(indirect);
-                if (!drawData || commandOffset + requiredBytes > drawData->size()) {
+                if (drawBuffer->MappedData() == nullptr || commandOffset + requiredBytes > drawBuffer->GetSize()) {
                     MGLOG_E("%s skipped: invalid GL_DRAW_INDIRECT_BUFFER binding or range", label);
                     return nullptr;
                 }
-                return drawData->data() + commandOffset;
+                return drawBuffer->MappedData() + commandOffset;
             }
 
             if (!indirect) {
@@ -384,7 +423,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     void MultiDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect, GLsizei drawcount, GLsizei stride) {
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::MultiDrawElementsIndirect called with null VulkanRenderer");
         MOBILEGL_ASSERT(MG_State::pGLContext, "DirectVulkan::MultiDrawElementsIndirect called with null GL context");
-        pVulkanRenderer->MultiDrawElementsIndirectCount(mode, type, indirect, 0, drawcount, stride);
+        pVulkanRenderer->MultiDrawElementsIndirect(mode, type, indirect, drawcount, stride);
     }
     void MultiDrawArraysIndirect(GLenum mode, const void* indirect, GLsizei drawcount, GLsizei stride) {
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::MultiDrawArraysIndirect called with null VulkanRenderer");
@@ -393,6 +432,15 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         if (drawcount <= 0) {
             return;
         }
+
+        // With a bound GL_DRAW_INDIRECT_BUFFER the command parameters may be GPU-written
+        // (e.g. by a compute shader), so consume them natively on the GPU.
+        auto drawBuffer = MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::DrawIndirect).GetBoundObject();
+        if (drawBuffer) {
+            pVulkanRenderer->MultiDrawArraysIndirect(mode, indirect, drawcount, stride);
+            return;
+        }
+
         if (stride == 0) {
             stride = sizeof(DrawArraysIndirectCommand);
         }
@@ -402,6 +450,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             return;
         }
 
+        // No indirect buffer bound: the pointer refers to client memory.
         const auto* commandBytes = ResolveIndirectCommandBytes(
             indirect,
             static_cast<SizeT>(stride) * static_cast<SizeT>(drawcount - 1) + sizeof(DrawArraysIndirectCommand),
@@ -455,15 +504,14 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             return;
         }
 
-        parameterBuffer->MarkPersistentMappedRangeDirty();
-        const auto parameterData = parameterBuffer->GetDataReadOnly();
-        if (!parameterData) {
+        parameterBuffer->SyncPersistentMappedRange();
+        if (parameterBuffer->MappedData() == nullptr) {
             MGLOG_E("MultiDrawArraysIndirectCount skipped: CPU fallback cannot read parameter buffer");
             return;
         }
 
         Uint32 actualDrawCount = 0;
-        std::memcpy(&actualDrawCount, parameterData->data() + drawcount, sizeof(actualDrawCount));
+        std::memcpy(&actualDrawCount, parameterBuffer->MappedData() + drawcount, sizeof(actualDrawCount));
         actualDrawCount = std::min<Uint32>(actualDrawCount, static_cast<Uint32>(maxdrawcount));
         MultiDrawArraysIndirect(mode, indirect, static_cast<GLsizei>(actualDrawCount), stride);
     }
@@ -516,6 +564,15 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             return;
         }
 
+        // With a bound GL_DRAW_INDIRECT_BUFFER the command parameters may be GPU-written
+        // (e.g. by a compute shader), so consume them natively on the GPU.
+        auto drawBuffer = MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::DrawIndirect).GetBoundObject();
+        if (drawBuffer) {
+            pVulkanRenderer->MultiDrawElementsIndirect(mode, type, indirect, 1, 0);
+            return;
+        }
+
+        // No indirect buffer bound: the pointer refers to client memory.
         const auto* commandBytes =
             ResolveIndirectCommandBytes(indirect, sizeof(DrawElementsIndirectCommand), "DrawElementsIndirect");
         if (!commandBytes) {
@@ -560,6 +617,15 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::DrawArraysIndirect called with null VulkanRenderer");
         MOBILEGL_ASSERT(MG_State::pGLContext, "DirectVulkan::DrawArraysIndirect called with null GL context");
 
+        // With a bound GL_DRAW_INDIRECT_BUFFER the command parameters may be GPU-written
+        // (e.g. by a compute shader), so consume them natively on the GPU.
+        auto drawBuffer = MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::DrawIndirect).GetBoundObject();
+        if (drawBuffer) {
+            pVulkanRenderer->MultiDrawArraysIndirect(mode, indirect, 1, 0);
+            return;
+        }
+
+        // No indirect buffer bound: the pointer refers to client memory.
         const auto* commandBytes =
             ResolveIndirectCommandBytes(indirect, sizeof(DrawArraysIndirectCommand), "DrawArraysIndirect");
         if (!commandBytes) {
@@ -592,6 +658,17 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         MOBILEGL_ASSERT(MG_State::pGLContext, "DirectVulkan::CopyTexSubImage2D called with null GL context");
         pVulkanRenderer->CopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height);
     }
+    void CopyImageSubData(const SharedPtr<MG_State::GLState::ITextureObject>& srcTexture,
+                          GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ,
+                          const SharedPtr<MG_State::GLState::ITextureObject>& dstTexture,
+                          GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ,
+                          GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth) {
+        MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::CopyImageSubData called with null VulkanRenderer");
+        MOBILEGL_ASSERT(MG_State::pGLContext, "DirectVulkan::CopyImageSubData called with null GL context");
+        pVulkanRenderer->CopyImageSubData(srcTexture, srcTarget, srcLevel, srcX, srcY, srcZ,
+                                          dstTexture, dstTarget, dstLevel, dstX, dstY, dstZ,
+                                          srcWidth, srcHeight, srcDepth);
+    }
     void GenerateMipmap(GLenum target) {
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::GenerateMipmap called with null VulkanRenderer");
         MOBILEGL_ASSERT(MG_State::pGLContext, "DirectVulkan::GenerateMipmap called with null GL context");
@@ -612,6 +689,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
     void MemoryBarrier(GLbitfield barriers) {
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::MemoryBarrier called with null VulkanRenderer");
+        MOBILEGL_ASSERT(MG_State::pGLContext, "DirectVulkan::MemoryBarrier called with null GL context");
         pVulkanRenderer->MemoryBarrier(barriers);
     }
 
@@ -632,9 +710,10 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
     void GetIntegeri_v(GLenum target, GLuint index, GLint* data) {
         if (!data) return;
+        MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::GetIntegeri_v called with null VulkanRenderer");
         switch (target) {
         case GL_MAX_COMPUTE_WORK_GROUP_COUNT:
-            if (!pVulkanRenderer || index >= 3) {
+            if (index >= 3) {
                 *data = 0;
                 return;
             }
@@ -642,7 +721,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 pVulkanRenderer->GetPhysicalDevice().properties.limits.maxComputeWorkGroupCount[index]);
             return;
         case GL_MAX_COMPUTE_WORK_GROUP_SIZE:
-            if (!pVulkanRenderer || index >= 3) {
+            if (index >= 3) {
                 *data = 0;
                 return;
             }
@@ -1104,7 +1183,19 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         auto* programObject = TryGetDirectVulkanProgram(program);
         if (!programObject) return;
         auto& cache = GetProgramResourceCache(*programObject);
+        const Int maxBindings = pActiveBackendObject
+            ? pActiveBackendObject->GetDynamicParameters().MaxShaderStorageBufferBindings
+            : 0;
+        if (storageBlockBinding >= static_cast<GLuint>(maxBindings)) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("DirectVulkan", __func__, "Shader storage binding is out of range."));
+            return;
+        }
         if (storageBlockIndex >= cache.storageBlocks.size()) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("DirectVulkan", __func__, "Shader storage block index is not active."));
             return;
         }
         cache.storageBlocks[storageBlockIndex].binding = storageBlockBinding;
@@ -1157,6 +1248,33 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         payload.params.instanceCount = 1;
 
         pVulkanRenderer->DrawElements(payload);
+    }
+
+    void MultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount) {
+        MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::MultiDrawArrays called with null VulkanRenderer");
+        MOBILEGL_ASSERT(MG_State::pGLContext, "DirectVulkan::MultiDrawArrays called with null GL context");
+        if (drawcount <= 0) {
+            return;
+        }
+
+        MultiDrawCmd payload{};
+        payload.mode = mode;
+
+        // TODO: allocate draw cmd buf elsewhere
+        static Vector<DrawCmdParam> params;
+        params.clear();
+        params.resize(drawcount);
+
+        for (GLsizei i = 0; i < drawcount; ++i) {
+            auto& param = params[i];
+            param.vertexCount = count[i] > 0 ? static_cast<Uint32>(count[i]) : 0;
+            param.instanceCount = 1;
+            param.firstVertex = first[i] > 0 ? static_cast<Uint32>(first[i]) : 0;
+            param.firstInstance = 0;
+        }
+        payload.drawCount = static_cast<Uint32>(drawcount);
+        payload.pParams = params.data();
+        pVulkanRenderer->MultiDrawArrays(payload);
     }
 
     void MultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const GLvoid* const* indices,
@@ -1254,6 +1372,219 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::BlitNamedFramebuffer called with null VulkanRenderer");
         pVulkanRenderer->BlitNamedFramebuffer(readFramebuffer, drawFramebuffer, srcX0, srcY0, srcX1, srcY1, dstX0,
                                               dstY0, dstX1, dstY1, mask, filter);
+    }
+
+    namespace {
+        // Backend fence handle: the queue-submission index captured at fence
+        // creation (see VulkanRenderer::GetSyncPointSubmitIndex). The fence is
+        // signaled once that submission's VkFence has been observed signaled,
+        // so completion tracks the GPU itself rather than the frame-count
+        // inference; MC 1.21.5's fence-paced ring buffers depend on this to
+        // recycle their space instead of growing without bound.
+        struct VulkanSyncObject {
+            Uint64 submitIndex = 0;
+            // Renderer generation the index was issued under (see
+            // g_rendererGeneration). A stale generation reports the fence
+            // signaled: renderer destruction waits for device idle, so the
+            // old renderer's GPU work is long complete, and the index must
+            // not be compared against the new renderer's restarted counter.
+            Uint64 rendererGeneration = 0;
+        };
+    } // namespace
+
+    BackendSyncHandle FenceSync() {
+        MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::FenceSync called with null VulkanRenderer");
+        return new VulkanSyncObject{pVulkanRenderer->GetSyncPointSubmitIndex(), GetRendererGeneration()};
+    }
+
+    GLenum ClientWaitSync(BackendSyncHandle handle, GLbitfield flags, GLuint64 timeout) {
+        const auto* sync = static_cast<VulkanSyncObject*>(handle);
+        MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::ClientWaitSync called with null VulkanRenderer");
+        if (sync == nullptr || sync->rendererGeneration != GetRendererGeneration()) {
+            return GL_ALREADY_SIGNALED;
+        }
+        if (pVulkanRenderer->IsSubmitIndexComplete(sync->submitIndex)) {
+            return GL_ALREADY_SIGNALED;
+        }
+        // GL_SYNC_FLUSH_COMMANDS_BIT: flush regardless of timeout, so a
+        // zero-timeout poll loop makes progress across calls - but only when
+        // the sync's batch is still unsubmitted; flushing for an already
+        // submitted fence cannot advance it and would split the frame's
+        // render pass on every poll.
+        if ((flags & GL_SYNC_FLUSH_COMMANDS_BIT) != 0) {
+            pVulkanRenderer->FlushForSyncPoint(sync->submitIndex);
+        }
+        if (timeout == 0) {
+            return pVulkanRenderer->IsSubmitIndexComplete(sync->submitIndex) ? GL_ALREADY_SIGNALED
+                                                                             : GL_TIMEOUT_EXPIRED;
+        }
+        // Blocking wait: flush even without the flush bit - the sync's batch
+        // can only be submitted from this thread, so waiting on an unflushed
+        // fence would otherwise burn the full timeout with no chance of
+        // success.
+        return pVulkanRenderer->WaitForSubmitIndex(sync->submitIndex, timeout, /*flushIfPending=*/true)
+                   ? GL_CONDITION_SATISFIED
+                   : GL_TIMEOUT_EXPIRED;
+    }
+
+    void WaitSync(BackendSyncHandle handle, GLbitfield flags, GLuint64 timeout) {
+        // Server-side waits are implicit: the single graphics queue executes
+        // submissions in order, so later GPU work already observes everything
+        // recorded before the fence.
+        (void)handle;
+        (void)flags;
+        (void)timeout;
+    }
+
+    void DeleteSync(BackendSyncHandle handle) {
+        delete static_cast<VulkanSyncObject*>(handle);
+    }
+
+    Bool GetSyncStatus(BackendSyncHandle handle) {
+        const auto* sync = static_cast<VulkanSyncObject*>(handle);
+        MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::GetSyncStatus called with null VulkanRenderer");
+        if (sync == nullptr || sync->rendererGeneration != GetRendererGeneration()) {
+            return true;
+        }
+        // Pure status read (glGetSynciv must not flush).
+        return pVulkanRenderer->IsSubmitIndexComplete(sync->submitIndex);
+    }
+
+    namespace {
+        // Backend timer-query handle: a TIME_ELAPSED span holds a begin and an
+        // end timestamp record; a GL_TIMESTAMP one-shot holds only `end`. The
+        // records are shared (SharedPtr) with the owning pool's pending list,
+        // so deleting the query while results are still in flight is safe.
+        struct VulkanTimerQuery {
+            SharedPtr<VkTimerQueryManager::TimestampRecord> begin;
+            SharedPtr<VkTimerQueryManager::TimestampRecord> end;
+            // Renderer generation the records were written under (see
+            // g_rendererGeneration). A stale generation resolves as available
+            // with a final zero result: the records' pool indices and frame
+            // serials refer to a destroyed renderer and must never be handed
+            // to the current one. DeleteBackendQuery only frees the wrapper
+            // (and, via the SharedPtrs, the records), never pool slots, so
+            // stale queries are always safe to delete.
+            Uint64 rendererGeneration = 0;
+        };
+    } // namespace
+
+    Bool IsTimerQuerySupported() {
+        MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::IsTimerQuerySupported called with null VulkanRenderer");
+        return pVulkanRenderer->IsTimerQuerySupported();
+    }
+
+    BackendQueryHandle BeginTimeElapsedQuery() {
+        MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::BeginTimeElapsedQuery called with null VulkanRenderer");
+        if (!pVulkanRenderer->IsTimerQuerySupported()) {
+            return nullptr;
+        }
+        auto begin = pVulkanRenderer->WriteTimerQueryTimestamp();
+        if (!begin) {
+            // Pool exhausted this frame; the frontend falls back on a null handle.
+            return nullptr;
+        }
+        auto* query = new VulkanTimerQuery{};
+        query->begin = std::move(begin);
+        query->rendererGeneration = GetRendererGeneration();
+        return query;
+    }
+
+    void EndTimeElapsedQuery(BackendQueryHandle handle) {
+        auto* query = static_cast<VulkanTimerQuery*>(handle);
+        MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::EndTimeElapsedQuery called with null VulkanRenderer");
+        if (query == nullptr) {
+            return;
+        }
+        if (query->rendererGeneration != GetRendererGeneration()) {
+            // The span began under a renderer that has since been destroyed;
+            // never write into the new renderer's pools on its behalf. The
+            // query resolves as available with a zero result.
+            return;
+        }
+        // May be null on pool exhaustion; the query then reads back as 0.
+        query->end = pVulkanRenderer->WriteTimerQueryTimestamp();
+    }
+
+    BackendQueryHandle QueryCounterTimestamp() {
+        MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::QueryCounterTimestamp called with null VulkanRenderer");
+        if (!pVulkanRenderer->IsTimerQuerySupported()) {
+            return nullptr;
+        }
+        auto record = pVulkanRenderer->WriteTimerQueryTimestamp();
+        if (!record) {
+            return nullptr;
+        }
+        auto* query = new VulkanTimerQuery{};
+        query->end = std::move(record);
+        query->rendererGeneration = GetRendererGeneration();
+        return query;
+    }
+
+    Bool IsQueryResultAvailable(BackendQueryHandle handle) {
+        auto* query = static_cast<VulkanTimerQuery*>(handle);
+        // Degraded/stale handles report available; GetQueryResult64 then
+        // resolves them with a final zero result.
+        MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::IsQueryResultAvailable called with null VulkanRenderer");
+        if (query == nullptr || query->rendererGeneration != GetRendererGeneration()) {
+            return true;
+        }
+        if (query->begin && !pVulkanRenderer->IsTimerQueryResultReady(*query->begin)) {
+            return false;
+        }
+        if (query->end && !pVulkanRenderer->IsTimerQueryResultReady(*query->end)) {
+            return false;
+        }
+        return true;
+    }
+
+    Bool GetQueryResult64(BackendQueryHandle handle, Bool wait, Uint64* outNanoseconds) {
+        *outNanoseconds = 0;
+        auto* query = static_cast<VulkanTimerQuery*>(handle);
+        MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::GetQueryResult64 called with null VulkanRenderer");
+        if (query == nullptr || query->rendererGeneration != GetRendererGeneration()) {
+            // The records belong to a destroyed renderer: no real value can
+            // ever be produced, so resolve with a final 0.
+            return true;
+        }
+        // With wait, mirrors ClientWaitSync: a query ended this frame cannot
+        // complete until Present submits the commands, so the wait refuses to
+        // block on the current unsubmitted serial. Returning false keeps the
+        // handle alive in the frontend; the query stays readable once a later
+        // Present submits the frame.
+        const auto ensureReady = [&](VkTimerQueryManager::TimestampRecord& record) {
+            return wait ? pVulkanRenderer->WaitForTimerQueryResult(record)
+                        : pVulkanRenderer->IsTimerQueryResultReady(record);
+        };
+        if (query->begin && query->end) {
+            if (!ensureReady(*query->begin) || !ensureReady(*query->end)) {
+                return false;
+            }
+            *outNanoseconds = pVulkanRenderer->GetTimerQueryElapsedNs(*query->begin, *query->end);
+            return true;
+        }
+        if (query->end) {
+            if (!ensureReady(*query->end)) {
+                return false;
+            }
+            *outNanoseconds = pVulkanRenderer->GetTimerQueryTimestampNs(*query->end);
+            return true;
+        }
+        // TIME_ELAPSED span that never got its end timestamp (pool
+        // exhaustion): nothing further can arrive, resolve with a final 0.
+        return true;
+    }
+
+    void DeleteBackendQuery(BackendQueryHandle handle) {
+        delete static_cast<VulkanTimerQuery*>(handle);
+    }
+
+    Int64 GetGpuTimestampNs() {
+        // Vulkan cannot synchronously sample the GPU clock: timestamps only
+        // exist as vkCmdWriteTimestamp results read back later, and
+        // VK_EXT_calibrated_timestamps is not wired up. Returning 0 tells the
+        // frontend GL_TIMESTAMP getter to fall back.
+        return 0;
     }
 
     void Present() {

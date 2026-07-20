@@ -8,6 +8,7 @@
 
 #include "GL_Buffer.h"
 #include "Validators.h"
+#include <Config.h>
 #include <MG_State/GLState/Core.h>
 #include <MG_State/GLState/ErrorState/Error.h>
 #include <MG_Util/Converters/GLToStr/GLEnumConverter.h>
@@ -206,6 +207,26 @@ namespace MobileGL::MG_Impl::GLImpl {
                                                  std::format("Buffer object {} does not exist.", buffer)));
             }
             return bufferObject;
+        }
+
+        // MOBILEGL_COHERENT_AS_FLUSH: rewrite a validated persistent FLUSH_EXPLICIT mapping
+        // request to coherent semantics: the map becomes coherent-persistent (eligible for
+        // the zero-copy backend map, otherwise synced wholesale at draw time), so its writes
+        // reach the GPU without glFlushMappedBufferRange; flush calls on rewritten maps are
+        // tolerated as no-ops by the FlushMappedBufferRange entry points. Non-persistent
+        // maps keep spec FLUSH_EXPLICIT behavior on purpose: the GPU cannot read them while
+        // mapped, so they gain nothing from the rewrite, and honoring only the app's flushed
+        // subranges avoids clobbering GPU-written bytes elsewhere in the mapped range.
+        // Runs after validation so the app's original access combination is what gets
+        // validated (Coherent is injected without requiring GL_MAP_COHERENT_BIT storage).
+        Flags<BufferMappingAccessBit> ApplyCoherentAsFlush(Flags<BufferMappingAccessBit> accessBits) {
+            if (!MG_Config::Features.CoherentAsFlush) return accessBits;
+            if (!(accessBits & BufferMappingAccessBit::FlushExplicit)) return accessBits;
+            if (!(accessBits & BufferMappingAccessBit::Persistent)) return accessBits;
+            accessBits = Flags<BufferMappingAccessBit>(
+                accessBits.GetRaw() & ~static_cast<Uint>(BufferMappingAccessBit::FlushExplicit));
+            accessBits |= BufferMappingAccessBit::Coherent;
+            return accessBits;
         }
 
         Bool ValidateStorageFlags(GLbitfield flags, BufferOp op) {
@@ -420,7 +441,10 @@ namespace MobileGL::MG_Impl::GLImpl {
         for (SizeT i = 0; i < static_cast<SizeT>(n); ++i) {
             Uint bufferName = buffers[i];
             if (bufferName == 0) continue;
-            if (!BufferImpl::ValidateBufferName(bufferName, true)) continue;
+            // GL 3.3 core 2.9: names that do not correspond to an existing buffer are silently
+            // ignored here, so probe with the non-recording query - the shared validator would
+            // record INVALID_OPERATION, which is only correct on the bind path.
+            if (!MG_State::pGLContext->ValidateBufferName(bufferName)) continue;
             MG_State::pGLContext->MarkBufferObjectForDeletion(bufferName);
         }
     }
@@ -465,6 +489,15 @@ namespace MobileGL::MG_Impl::GLImpl {
 
         auto mappingAccess = bufferObject->GetMappingAccess();
         if (!(mappingAccess & BufferMappingAccessBit::FlushExplicit)) {
+            // MOBILEGL_COHERENT_AS_FLUSH strips FLUSH_EXPLICIT from persistent maps at map
+            // time (leaving Persistent|Coherent), so honor the app's flush on such a map as
+            // a no-op: its writes reach the backend without explicit flushes. Other maps
+            // keep the spec error.
+            if (MG_Config::Features.CoherentAsFlush &&
+                (mappingAccess & BufferMappingAccessBit::Persistent) &&
+                (mappingAccess & BufferMappingAccessBit::Coherent)) {
+                return;
+            }
             MG_State::pGLContext->RecordError(
                 ErrorCode::InvalidOperation,
                 MakeUnique<GenericErrorInfo>(
@@ -605,7 +638,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
 
         void* result = bufferObject->AcquireMemoryRange(
-            {static_cast<SizeT>(offset), static_cast<SizeT>(offset + length)}, accessBits);
+            {static_cast<SizeT>(offset), static_cast<SizeT>(offset + length)}, ApplyCoherentAsFlush(accessBits));
         if (!result) {
             MG_State::pGLContext->RecordError(
                 ErrorCode::OutOfMemory,
@@ -799,6 +832,55 @@ namespace MobileGL::MG_Impl::GLImpl {
         bufferObject->UploadSubData({(void*)data, (SizeT)size}, offset);
     }
 
+    void GetBufferSubData_State(GLenum target, GLintptr offset, GLsizeiptr size, void* data) {
+        MGLOG_D("%s: target = %s, offset = %d, size = %d, data = %p", __func__,
+                MG_Util::ConvertGLEnumToString(target).c_str(), offset, size, data);
+        if (!data) {
+            // Match BufferSubData_State: a null pointer is a caller bug, not a GL-specified error.
+            return;
+        }
+
+        if (size < 0 || offset < 0) {
+            MG_State::pGLContext->RecordError(ErrorCode::InvalidValue,
+                                              MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "GetBufferSubData_State",
+                                                                           "Offset and size must be non-negative."));
+            return;
+        }
+
+        BufferTarget bufferTarget = MG_Util::ConvertGLEnumToBufferTarget(target);
+        if (!BufferImpl::ValidateBufferTarget(bufferTarget)) return;
+        auto& bindingSlot = GetBufferBindingSlot(bufferTarget);
+
+        auto& bufferObject = bindingSlot.GetBoundObject();
+        if (!bufferObject) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidOperation,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "GetBufferSubData_State",
+                                             "Buffer target is bound to no buffer object."));
+            return;
+        }
+
+        SizeT bufferSize = bufferObject->GetSize();
+        if (static_cast<SizeT>(offset) + static_cast<SizeT>(size) > bufferSize) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "GetBufferSubData_State",
+                                             "Offset and size exceed buffer size."));
+            return;
+        }
+
+        if (bufferObject->IsMapped() &&
+            !(bufferObject->GetMappingAccess() & BufferMappingAccessBit::Persistent)) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidOperation,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "GetBufferSubData_State",
+                                             "Cannot read from a buffer object mapped without GL_MAP_PERSISTENT_BIT."));
+            return;
+        }
+
+        bufferObject->DownloadSubData(data, static_cast<SizeT>(offset), static_cast<SizeT>(size));
+    }
+
     void BufferData_State(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
         MGLOG_D("%s: %s, size = %d, data = %p, usage = %s", __func__, MG_Util::ConvertGLEnumToString(target).c_str(),
                 size, data, MG_Util::ConvertGLEnumToString(usage).c_str());
@@ -834,10 +916,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
 
         bufferObject->SetUsage(bufferUsage);
-        bufferObject->Resize(size);
-        if (data) {
-            bufferObject->UploadData({(void*)data, (SizeT)size}, 0);
-        }
+        bufferObject->Respecify(size, data);
     }
 
     void BufferStorage_State(GLenum target, GLsizeiptr size, const void* data, GLbitfield flags) {
@@ -928,10 +1007,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
 
         bufferObject->SetUsage(bufferUsage);
-        bufferObject->Resize(size);
-        if (data) {
-            bufferObject->UploadData({(void*)data, (SizeT)size}, 0);
-        }
+        bufferObject->Respecify(size, data);
     }
 
     void NamedBufferSubData_State(GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data) {
@@ -1154,7 +1230,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
 
         return bufferObject->AcquireMemoryRange({static_cast<SizeT>(offset), static_cast<SizeT>(offset + length)},
-                                                accessBits);
+                                                ApplyCoherentAsFlush(accessBits));
     }
 
     GLboolean UnmapNamedBuffer_State(GLuint buffer) {
@@ -1196,7 +1272,15 @@ namespace MobileGL::MG_Impl::GLImpl {
                                              "Offset and length exceed mapped range."));
             return;
         }
-        if (!(bufferObject->GetMappingAccess() & BufferMappingAccessBit::FlushExplicit)) {
+        const auto namedMappingAccess = bufferObject->GetMappingAccess();
+        if (!(namedMappingAccess & BufferMappingAccessBit::FlushExplicit)) {
+            // See FlushMappedBufferRange_State: rewritten coherent-as-flush persistent maps
+            // tolerate app flushes as no-ops.
+            if (MG_Config::Features.CoherentAsFlush &&
+                (namedMappingAccess & BufferMappingAccessBit::Persistent) &&
+                (namedMappingAccess & BufferMappingAccessBit::Coherent)) {
+                return;
+            }
             MG_State::pGLContext->RecordError(
                 ErrorCode::InvalidOperation,
                 MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "FlushMappedNamedBufferRange_State",
@@ -1266,6 +1350,8 @@ namespace MobileGL::MG_Impl::GLImpl {
                 MG_Util::ConvertGLEnumToString(target).c_str(), pointIndex, buffer);
         BufferTarget bufferTarget = MG_Util::ConvertGLEnumToBufferTarget(target);
         if (!BufferImpl::ValidateBufferBindingPointTarget(bufferTarget)) return;
+        if (!BufferImpl::ValidateBufferBindingPointIndex(bufferTarget, pointIndex)) return;
+        MG_State::pGLContext->TouchBufferBindingPoint(bufferTarget, pointIndex);
 
         auto& point = MG_State::pGLContext->GetBufferBindingPoint(bufferTarget, pointIndex);
         SharedPtr<MG_State::GLState::BufferObject> bufferObject;
@@ -1275,6 +1361,8 @@ namespace MobileGL::MG_Impl::GLImpl {
             return;
         }
 
+        if (!BufferImpl::ValidateBufferName(buffer, true)) return;
+
         Bool doesBufferObjectCreated = MG_State::pGLContext->ValidateBufferObject(buffer);
         if (!doesBufferObjectCreated) {
             MG_State::pGLContext->CreateBufferObject(buffer);
@@ -1283,7 +1371,7 @@ namespace MobileGL::MG_Impl::GLImpl {
 
         point.Bind(bufferObject);
         if (bufferObject) {
-            point.SetRange(Range1D(0, bufferObject->GetSize()));
+            point.SetRange(Range1D(0, bufferObject->GetSize()), false);
             MGLOG_D("%s: set range (0, %d)", __func__, bufferObject->GetSize());
         } else {
             point.ClearRange();
@@ -1295,6 +1383,8 @@ namespace MobileGL::MG_Impl::GLImpl {
                 MG_Util::ConvertGLEnumToString(target).c_str(), index, buffer, offset, size);
         BufferTarget bufferTarget = MG_Util::ConvertGLEnumToBufferTarget(target);
         if (!BufferImpl::ValidateBufferBindingPointTarget(bufferTarget)) return;
+        if (!BufferImpl::ValidateBufferBindingPointIndex(bufferTarget, index)) return;
+        MG_State::pGLContext->TouchBufferBindingPoint(bufferTarget, index);
 
         auto& point = MG_State::pGLContext->GetBufferBindingPoint(bufferTarget, index);
         SharedPtr<MG_State::GLState::BufferObject> bufferObject;
@@ -1303,6 +1393,8 @@ namespace MobileGL::MG_Impl::GLImpl {
             point.SetRange(Range1D(0, 0));
             return;
         }
+
+        if (!BufferImpl::ValidateBufferName(buffer, true)) return;
 
         Bool doesBufferObjectCreated = MG_State::pGLContext->ValidateBufferObject(buffer);
         if (!doesBufferObjectCreated) {
@@ -1425,6 +1517,10 @@ namespace MobileGL::MG_Impl::GLImpl {
         BufferSubData_State(target, offset, size, data);
     }
 
+    void GetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void* data) {
+        GetBufferSubData_State(target, offset, size, data);
+    }
+
     void BufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
         BufferData_State(target, size, data, usage);
     }
@@ -1443,5 +1539,24 @@ namespace MobileGL::MG_Impl::GLImpl {
 
     void BindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
         BindBufferRange_State(target, index, buffer, offset, size);
+    }
+
+    // ARB_multi_bind: defined by the spec as equivalent to a loop over the single-bind entry
+    // points (with buffer 0 resetting the binding point).
+    void BindBuffersBase(GLenum target, GLuint first, GLsizei count, const GLuint* buffers) {
+        for (GLsizei i = 0; i < count; ++i) {
+            BindBufferBase_State(target, first + i, buffers ? buffers[i] : 0);
+        }
+    }
+
+    void BindBuffersRange(GLenum target, GLuint first, GLsizei count, const GLuint* buffers, const GLintptr* offsets,
+                          const GLsizeiptr* sizes) {
+        for (GLsizei i = 0; i < count; ++i) {
+            if (!buffers || buffers[i] == 0) {
+                BindBufferBase_State(target, first + i, 0);
+            } else {
+                BindBufferRange_State(target, first + i, buffers[i], offsets ? offsets[i] : 0, sizes ? sizes[i] : 0);
+            }
+        }
     }
 } // namespace MobileGL::MG_Impl::GLImpl

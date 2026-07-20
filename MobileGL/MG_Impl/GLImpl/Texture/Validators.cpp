@@ -7,6 +7,7 @@
 // End of Source File Header
 
 #include "Validators.h"
+#include <MG_Backend/BackendObjects.h>
 #include <MG_State/GLState/Core.h>
 #include <MG_State/GLState/ErrorState/Error.h>
 #include <MG_Util/Converters/GLToStr/GLEnumConverter.h>
@@ -83,8 +84,20 @@ namespace MobileGL::MG_Impl::GLImpl::TextureImpl {
             return false;
         }
 
-        // TODO: GL_INVALID_VALUE may be generated if level is greater than log2(max), where max is the returned
-        // value of GL_MAX_TEXTURE_SIZE.
+        Int maxTextureSize = MG_Backend::DynamicBackendParameters{}.MaxTextureSize;
+        if (MG_Backend::pActiveBackendObject) {
+            maxTextureSize = MG_Backend::pActiveBackendObject->GetDynamicParameters().MaxTextureSize;
+        }
+        Int maxLevel = 0;
+        for (Int size = std::max(maxTextureSize, 1); size > 1; size >>= 1) {
+            ++maxLevel;
+        }
+        if (level > maxLevel) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidValue, MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "ValidateTextureLevelNumber",
+                                                                      "Texture level exceeds GL_MAX_TEXTURE_SIZE"));
+            return false;
+        }
 
         return true;
     }
@@ -129,7 +142,7 @@ namespace MobileGL::MG_Impl::GLImpl::TextureImpl {
         return true;
     }
 
-    Bool ValidateTextureSizeRange(SizeT width, SizeT height, SizeT depth) {
+    Bool ValidateTextureSizeRange(Int width, Int height, Int depth) {
         if (width < 0 || height < 0 || depth < 0) {
             MG_State::pGLContext->RecordError(
                 ErrorCode::InvalidValue, MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "ValidateTextureSizeRange",
@@ -162,61 +175,153 @@ namespace MobileGL::MG_Impl::GLImpl::TextureImpl {
         return true;
     }
 
-    Bool ValidateTextureInternalFormatCompatibleWithInput(TextureInputFormat format,
-                                                          TextureInternalFormat internalFormat,
-                                                          TexturePixelDataType type) {
-        if (type == TexturePixelDataType::UnsignedByte332 || type == TexturePixelDataType::UnsignedByte233Rev ||
-            type == TexturePixelDataType::UnsignedShort565 || type == TexturePixelDataType::UnsignedShort565Rev ||
-            type == TexturePixelDataType::UnsignedInt101111Rev) {
-            if (format != TextureInputFormat::RGB) {
-                MG_State::pGLContext->RecordError(
-                    ErrorCode::InvalidOperation,
-                    MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "ValidateTextureInternalFormatCompatibleWithInput",
-                                                 "Invalid format for the given type"));
+    Bool IsIntegerColorInputFormat(TextureInputFormat format) {
+        return format == TextureInputFormat::RInteger || format == TextureInputFormat::RGInteger ||
+               format == TextureInputFormat::RGBInteger || format == TextureInputFormat::BGRInteger ||
+               format == TextureInputFormat::RGBAInteger || format == TextureInputFormat::BGRAInteger ||
+               format == TextureInputFormat::GreenInteger || format == TextureInputFormat::BlueInteger ||
+               format == TextureInputFormat::AlphaInteger;
+    }
+
+    Bool IsIntegerColorInternalFormat(TextureInternalFormat internalFormat) {
+        switch (internalFormat) {
+            case TextureInternalFormat::R8I:
+            case TextureInternalFormat::R8UI:
+            case TextureInternalFormat::R16I:
+            case TextureInternalFormat::R16UI:
+            case TextureInternalFormat::R32I:
+            case TextureInternalFormat::R32UI:
+            case TextureInternalFormat::RG8I:
+            case TextureInternalFormat::RG8UI:
+            case TextureInternalFormat::RG16I:
+            case TextureInternalFormat::RG16UI:
+            case TextureInternalFormat::RG32I:
+            case TextureInternalFormat::RG32UI:
+            case TextureInternalFormat::RGB8I:
+            case TextureInternalFormat::RGB8UI:
+            case TextureInternalFormat::RGB16I:
+            case TextureInternalFormat::RGB16UI:
+            case TextureInternalFormat::RGB32I:
+            case TextureInternalFormat::RGB32UI:
+            case TextureInternalFormat::RGBA8I:
+            case TextureInternalFormat::RGBA8UI:
+            case TextureInternalFormat::RGBA16I:
+            case TextureInternalFormat::RGBA16UI:
+            case TextureInternalFormat::RGBA32I:
+            case TextureInternalFormat::RGBA32UI:
+            case TextureInternalFormat::RGB10A2UI:
+                return true;
+            default:
                 return false;
+        }
+    }
+
+    static Bool IsDepthLikeInternalFormat(TextureInternalFormat internalFormat) {
+        switch (internalFormat) {
+            case TextureInternalFormat::DepthComponent:
+            case TextureInternalFormat::DepthComponent16:
+            case TextureInternalFormat::DepthComponent24:
+            case TextureInternalFormat::DepthComponent32: // not core, kept for Minecraft 1.21.5+
+            case TextureInternalFormat::DepthComponent32F:
+            case TextureInternalFormat::Depth24Stencil8:
+            case TextureInternalFormat::Depth32FStencil8:
+            case TextureInternalFormat::DepthStencil:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static Bool IsDepthLikeInputFormat(TextureInputFormat format) {
+        return format == TextureInputFormat::DepthComponent || format == TextureInputFormat::DepthStencil ||
+               format == TextureInputFormat::StencilIndex;
+    }
+
+    // Client-memory format<->type pairing rules shared by pixel uploads (TexImage*) and readbacks
+    // (ReadPixels, GetTexImage). Mirrors the desktop-GL validity matrix used by GL CTS packed_pixels
+    // (glcPackedPixelsTests isFormatValid): packed types constrain the formats they may pair with, and
+    // integer formats reject floating-point types; violations raise GL_INVALID_OPERATION.
+    Bool ValidateClientFormatTypePairing(TextureInputFormat format, TexturePixelDataType type) {
+        const auto recordInvalidOperation = [](const char* message) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidOperation,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "ValidateClientFormatTypePairing", message));
+            return false;
+        };
+
+        if (type == TexturePixelDataType::UnsignedByte332 || type == TexturePixelDataType::UnsignedByte233Rev ||
+            type == TexturePixelDataType::UnsignedShort565 || type == TexturePixelDataType::UnsignedShort565Rev) {
+            if (format != TextureInputFormat::RGB && format != TextureInputFormat::RGBInteger) {
+                return recordInvalidOperation("Packed RGB type requires RGB or RGB_INTEGER format");
+            }
+        }
+
+        if (type == TexturePixelDataType::UnsignedInt101111Rev || type == TexturePixelDataType::UnsignedInt5999Rev) {
+            if (format != TextureInputFormat::RGB) {
+                return recordInvalidOperation("Packed float RGB type requires RGB format");
             }
         }
 
         if (type == TexturePixelDataType::UnsignedShort4444 || type == TexturePixelDataType::UnsignedShort4444Rev ||
             type == TexturePixelDataType::UnsignedShort5551 || type == TexturePixelDataType::UnsignedShort1555Rev ||
             type == TexturePixelDataType::UnsignedInt8888 || type == TexturePixelDataType::UnsignedInt8888Rev ||
-            type == TexturePixelDataType::UnsignedInt1010102 || type == TexturePixelDataType::UnsignedInt2101010Rev ||
-            type == TexturePixelDataType::UnsignedInt5999Rev) {
-            if (format != TextureInputFormat::RGBA && format != TextureInputFormat::BGRA) {
-                MG_State::pGLContext->RecordError(
-                    ErrorCode::InvalidOperation,
-                    MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "ValidateTextureInternalFormatCompatibleWithInput",
-                                                 "Invalid format for the given type"));
-                return false;
+            type == TexturePixelDataType::UnsignedInt1010102 || type == TexturePixelDataType::UnsignedInt2101010Rev) {
+            if (format != TextureInputFormat::RGBA && format != TextureInputFormat::BGRA &&
+                format != TextureInputFormat::RGBAInteger && format != TextureInputFormat::BGRAInteger) {
+                return recordInvalidOperation("Packed RGBA type requires RGBA/BGRA (integer) format");
             }
         }
 
-        if (internalFormat == TextureInternalFormat::DepthComponent ||
-            internalFormat == TextureInternalFormat::DepthComponent16 ||
-            internalFormat == TextureInternalFormat::DepthComponent24 ||
-            internalFormat == TextureInternalFormat::DepthComponent32F) {
-            if (format != TextureInputFormat::DepthComponent) {
-                MG_State::pGLContext->RecordError(
-                    ErrorCode::InvalidOperation,
-                    MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "ValidateTextureInternalFormatCompatibleWithInput",
-                                                 "Invalid format for depth component internal format"));
-                return false;
+        if (type == TexturePixelDataType::UnsignedInt248 || type == TexturePixelDataType::Float32UnsignedInt248Rev) {
+            if (format != TextureInputFormat::DepthStencil) {
+                return recordInvalidOperation("Packed depth-stencil type requires DEPTH_STENCIL format");
             }
         }
 
-        if (format == TextureInputFormat::DepthComponent &&
-            (internalFormat != TextureInternalFormat::DepthComponent &&
-             internalFormat != TextureInternalFormat::DepthComponent16 &&
-             internalFormat != TextureInternalFormat::DepthComponent24 &&
-             internalFormat != TextureInternalFormat::DepthComponent32F &&
-             internalFormat != TextureInternalFormat::DepthComponent32 // workaround for Minecraft 1.21.5+
-             )) {
+        if (format == TextureInputFormat::DepthStencil && type != TexturePixelDataType::UnsignedInt248 &&
+            type != TexturePixelDataType::Float32UnsignedInt248Rev) {
+            return recordInvalidOperation("DEPTH_STENCIL format requires a packed depth-stencil type");
+        }
+
+        if (IsIntegerColorInputFormat(format) &&
+            (type == TexturePixelDataType::Float || type == TexturePixelDataType::HalfFloat)) {
+            return recordInvalidOperation("Integer format cannot be used with a floating-point type");
+        }
+
+        return true;
+    }
+
+    // Mirrors the desktop-GL validity matrix used by GL CTS packed_pixels (glcPackedPixelsTests
+    // isFormatValid, INPUT_TEXIMAGE): packed-type/format pairing, depth-vs-color mismatch, and
+    // integer-ness matching all raise GL_INVALID_OPERATION instead of reaching the upload path.
+    Bool ValidateTextureInternalFormatCompatibleWithInput(TextureInputFormat format,
+                                                          TextureInternalFormat internalFormat,
+                                                          TexturePixelDataType type) {
+        const auto recordInvalidOperation = [](const char* message) {
             MG_State::pGLContext->RecordError(
                 ErrorCode::InvalidOperation,
                 MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "ValidateTextureInternalFormatCompatibleWithInput",
-                                             "Invalid internal format for depth component format"));
+                                             message));
+            return false;
+        };
+
+        if (!ValidateClientFormatTypePairing(format, type)) {
             return false;
         }
+
+        // TexImage in core 3.3 has no stencil-only upload path (that arrived with GL 4.4).
+        if (format == TextureInputFormat::StencilIndex) {
+            return recordInvalidOperation("STENCIL_INDEX is not a valid texture upload format");
+        }
+
+        if (IsDepthLikeInputFormat(format) != IsDepthLikeInternalFormat(internalFormat)) {
+            return recordInvalidOperation("Depth/stencil-ness of format and internal format must match");
+        }
+
+        if (IsIntegerColorInputFormat(format) != IsIntegerColorInternalFormat(internalFormat)) {
+            return recordInvalidOperation("Integer-ness of format and internal format must match");
+        }
+
         return true;
     }
 
@@ -250,6 +355,19 @@ namespace MobileGL::MG_Impl::GLImpl::TextureImpl {
             MG_State::pGLContext->RecordError(
                 ErrorCode::InvalidOperation,
                 MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", "ValidateTextureObject", "Texture object is null"));
+            return false;
+        }
+        return true;
+    }
+
+    Bool ValidateTextureNotDefault(const SharedPtr<MG_State::GLState::ITextureObject>& textureObject,
+                                   const char* caller) {
+        if (textureObject && textureObject->GetExternalIndex() == 0) {
+            MG_State::pGLContext->RecordError(
+                ErrorCode::InvalidOperation,
+                MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", caller,
+                                             "This operation is not allowed on the default texture (zero is "
+                                             "bound to the target)."));
             return false;
         }
         return true;

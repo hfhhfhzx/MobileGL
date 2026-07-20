@@ -27,6 +27,12 @@ namespace MobileGL {
         OneMinusConstantColor,
         ConstantAlpha,
         OneMinusConstantAlpha,
+        // Dual-source blend factors (GL_SRC1_*, glBindFragDataLocationIndexed); require the
+        // dualSrcBlend device feature.
+        Src1Color,
+        OneMinusSrc1Color,
+        Src1Alpha,
+        OneMinusSrc1Alpha,
         BlendFactorCount,
         Unknown = -1
     };
@@ -230,8 +236,9 @@ namespace MobileGL {
         DepthTestFunc DepthFunc = DepthTestFunc::Less;
         Bool DepthMask = true;
 
-        // Color Mask
-        BoolVec4 ColorMask = BoolVec4(true, true, true, true);
+        // Color Mask. Per-draw-buffer state (glColorMaski); glColorMask broadcasts to all buffers.
+        // Every entry is initialized to all-true in RenderState's constructor.
+        Array<BoolVec4, MG_State::GLState::FramebufferObject::MAX_DRAW_BUFFERS> ColorMasks;
 
         // Clear State
         FloatVec4 ClearColor = FloatVec4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -249,6 +256,28 @@ namespace MobileGL {
         CullFaceMode CullFaceModeSetting = CullFaceMode::Back;
         FrontFaceMode FrontFaceModeSetting = FrontFaceMode::CounterClockwise;
         ProvokingVertexMode ProvokingVertexModeSetting = ProvokingVertexMode::LastVertex;
+
+        // Hints (glHint). All GL 3.3 core hint targets default to GL_DONT_CARE.
+        GLenum LineSmoothHint = GL_DONT_CARE;
+        GLenum PolygonSmoothHint = GL_DONT_CARE;
+        GLenum TextureCompressionHint = GL_DONT_CARE;
+        GLenum FragmentShaderDerivativeHint = GL_DONT_CARE;
+
+        // Point parameters (glPointParameter). Only the two GL 3.3 core pnames.
+        Float PointFadeThresholdSize = 1.0f;
+        GLenum PointSpriteCoordOrigin = GL_UPPER_LEFT;
+
+        // Color clamping (glClampColor). Core profile exposes only GL_CLAMP_READ_COLOR.
+        GLenum ClampReadColor = GL_FIXED_ONLY;
+
+        // Polygon rasterization mode (glPolygonMode). Core profile sets front and back together,
+        // but GL_POLYGON_MODE still reports both slots, so keep them separate for a faithful query.
+        GLenum PolygonModeFront = GL_FILL;
+        GLenum PolygonModeBack = GL_FILL;
+
+        // Primitive restart index (glPrimitiveRestartIndex); consumed when GL_PRIMITIVE_RESTART is
+        // enabled during an indexed draw. Default 0.
+        Uint32 PrimitiveRestartIndex = 0;
 
         // Scissor
         Bool ColorLogicOpEnabled = false;
@@ -293,6 +322,22 @@ namespace MobileGL {
                 void SetPolygonOffset(Float factor, Float units);
                 Float GetPolygonOffsetFactor() const;
                 Float GetPolygonOffsetUnits() const;
+                // Hints. target must be one of the 4 GL 3.3 core hint targets (validated by the caller).
+                void SetHint(GLenum target, GLenum mode);
+                GLenum GetHint(GLenum target) const;
+                void SetPointFadeThresholdSize(Float size);
+                Float GetPointFadeThresholdSize() const;
+                void SetPointSpriteCoordOrigin(GLenum origin);
+                GLenum GetPointSpriteCoordOrigin() const;
+                // Color clamping (glClampColor). Core profile has only GL_CLAMP_READ_COLOR.
+                void SetClampReadColor(GLenum clamp);
+                GLenum GetClampReadColor() const;
+                // Polygon mode (glPolygonMode). Core sets both faces together; the query reports both.
+                void SetPolygonMode(GLenum front, GLenum back);
+                GLenum GetPolygonModeFront() const;
+                GLenum GetPolygonModeBack() const;
+                void SetPrimitiveRestartIndex(Uint32 index);
+                Uint32 GetPrimitiveRestartIndex() const;
 
                 // Capabilities
                 void SetCapability(CapabilityInput cap, Bool enabled);
@@ -326,9 +371,13 @@ namespace MobileGL {
                                   StencilOperation depthPass);
                 const StencilFaceState& GetStencilState(StencilFace face) const;
 
-                // Color Mask
+                // Color Mask. SetColorMask broadcasts to every draw buffer and GetColorMask returns
+                // draw buffer 0; the indexed forms address a single draw buffer (glColorMaski). The
+                // caller is responsible for validating index against MAX_DRAW_BUFFERS.
                 void SetColorMask(BoolVec4 mask);
                 BoolVec4 GetColorMask() const;
+                void SetColorMaskIndexed(Uint index, BoolVec4 mask);
+                BoolVec4 GetColorMaskIndexed(Uint index) const;
 
                 // Clear State
                 void SetClearColor(FloatVec4 color);

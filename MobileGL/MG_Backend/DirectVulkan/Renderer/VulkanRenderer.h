@@ -20,6 +20,7 @@
 #include "VkRenderPassManager.h"
 #include "VkSamplerManager.h"
 #include "VkTextureManager.h"
+#include "VkTimerQueryManager.h"
 #include "MG_Util/Math/VectorTypes.h"
 #include <Includes.h>
 #include <vk_mem_alloc.h>
@@ -86,6 +87,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         DrawIndexedCmdParam* pParams = nullptr;
     };
 
+    struct MultiDrawCmd {
+        GLenum mode = GL_TRIANGLES;
+        Uint32 drawCount = 0;
+        DrawCmdParam* pParams = nullptr;
+    };
+
     struct QueueFamilyIndices {
         Int32 graphicsFamily = -1;
         Int32 presentFamily = -1;
@@ -101,7 +108,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
     };
 
-    class VulkanRenderer {
+    class VulkanRenderer : public IBufferCopyCommandProvider, public FrameContext::IRecordingObserver {
     public:
         VulkanRenderer(NativeWindowType window, const VulkanRendererConfig& cfg = {});
         ~VulkanRenderer();
@@ -109,11 +116,28 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         void Initialize();
         void Shutdown();
 
+        // IBufferCopyCommandProvider: recording command buffer, outside any
+        // render pass, for immediate staged buffer copies.
+        VkCommandBuffer AcquireBufferCopyCommandBuffer() override;
+
+        // FrameContext::IRecordingObserver: prepares the frame's timer-query
+        // pool (harvest + reset) right after the frame command buffer begins
+        // recording, before any render pass.
+        void OnFrameCommandRecordingBegan(VkCommandBuffer commandBuffer) override;
+
         Bool SetupDraw(FrameContext::FrameData& frame, GLenum mode, Flags<DrawSetupAspect> aspects,
                        const DrawCmdParam& drawParams,
                        const IndexBufferView* pIndexBufferView = nullptr);
         void ClearAttachmentsOnActiveRenderPass(VkCommandBuffer commandBuffer,
                                                 const RenderPassEntry& compatibleRenderPassEntry);
+
+        enum class ScissoredClearPrep {
+            NotNeeded,  // scissor covers the whole target — take the deferred whole-surface path instead
+            NoOp,       // nothing to clear (degenerate target or empty scissor rect)
+            Ready,      // a render pass is active; record vkCmdClearAttachments with the returned rect
+        };
+        ScissoredClearPrep PrepareScissoredClear(const MG_State::GLState::FramebufferObject& framebuffer,
+                                                 VkClearRect& outClearRect);
 
         void Clear(GLbitfield mask);
         void ClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil);
@@ -134,6 +158,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                   GLbitfield mask, GLenum filter);
         void CopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
                        GLint x, GLint y, GLsizei width, GLsizei height);
+        void CopyImageSubData(const SharedPtr<MG_State::GLState::ITextureObject>& srcTexture,
+                              GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ,
+                              const SharedPtr<MG_State::GLState::ITextureObject>& dstTexture,
+                              GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ,
+                              GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth);
         void GenerateMipmap(GLenum target);
         void ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void* pixels);
         void GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels);
@@ -146,7 +175,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         static VkMemoryBarrier BuildMemoryBarrierForGlBarriers(GLbitfield barriers);
         void DrawArrays(const DrawCmd& payload);
         void DrawElements(const DrawIndexedCmd& payload);
+        void MultiDrawArrays(const MultiDrawCmd& payload);
         void MultiDrawElements(const MultiDrawIndexedCmd& payloads);
+        void MultiDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect, GLsizei drawcount,
+                                       GLsizei stride);
+        void MultiDrawArraysIndirect(GLenum mode, const void* indirect, GLsizei drawcount, GLsizei stride);
         void MultiDrawElementsIndirectCount(GLenum mode, GLenum type, const void* indirect, GLintptr drawcount,
                                             GLsizei maxdrawcount, GLsizei stride);
         void Present();
@@ -155,6 +188,64 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         VkInstance GetInstance() const;
         Bool IsDrawIndirectCountExtensionEnabled() const;
 
+        // GL fence support, expressed in queue-submission indices backed by
+        // real VkFences. A GL fence captures GetSyncPointSubmitIndex() at
+        // creation: the index of the submission that will carry the commands
+        // recorded so far (m_submitCounter + 1 while work is pending, or
+        // m_submitCounter when nothing has been recorded since the last
+        // submit). It is signaled once that submission's fence is observed
+        // signaled - unlike the frame-serial heuristic, this makes fences
+        // signal as soon as the GPU actually finishes, which MC 1.21.5's
+        // fence-paced ring buffers rely on to recycle their space.
+        Uint64 GetSyncPointSubmitIndex() const;
+        // Non-blocking: polls outstanding submission fences and reports
+        // whether every submission up to `submitIndex` has completed.
+        Bool IsSubmitIndexComplete(Uint64 submitIndex);
+        // Submits the commands recorded so far without waiting (GL flush).
+        // Recording restarts lazily on a fresh command buffer; the submitted
+        // one is retired until the frame slot's fence is next waited. Returns
+        // true when a submission was made.
+        Bool FlushPendingCommands();
+        // Flush gated on usefulness: only flushes when `submitIndex` is still
+        // unsubmitted, so poll loops on already-submitted fences do not split
+        // the frame's render pass (a full tile load/store on TBDR GPUs).
+        Bool FlushForSyncPoint(Uint64 submitIndex);
+        // Blocking wait for a submission index with a nanosecond timeout.
+        // When the index is still unsubmitted and flushIfPending is set, the
+        // pending commands are flushed first so the wait can make progress.
+        Bool WaitForSubmitIndex(Uint64 submitIndex, Uint64 timeoutNs, Bool flushIfPending);
+
+        // Frame-serial completion, still used by the timer-query paths (their
+        // records are bucketed per frame slot).
+        Bool IsFrameSerialComplete(Uint64 serial) const;
+        // Blocking wait for a submitted serial. Returns false when the serial
+        // cannot complete without further submissions (it belongs to the
+        // current, not-yet-presented frame) or when the wait failed.
+        Bool WaitForFrameSerial(Uint64 serial, Uint64 timeoutNs);
+
+        // GPU timer queries, backing the GL_TIME_ELAPSED / GL_TIMESTAMP
+        // frontend. Timestamp support (queue timestampValidBits > 0 and a
+        // non-zero timestampPeriod) is cached at device creation.
+        Bool IsTimerQuerySupported() const;
+        // The samplerAnisotropy device feature was granted, so GL_TEXTURE_MAX_ANISOTROPY_EXT is
+        // honored rather than accepted-and-ignored.
+        Bool IsSamplerAnisotropySupported() const { return m_samplerAnisotropyFeatureEnabled; }
+        // Ensures the frame command buffer is recording (same lazy pattern as
+        // SetupDraw) and writes a bottom-of-pipe timestamp into the current
+        // frame's pool. Null when unsupported or the pool is exhausted.
+        SharedPtr<VkTimerQueryManager::TimestampRecord> WriteTimerQueryTimestamp();
+        // Non-blocking: true once the record's raw ticks are on the CPU
+        // (harvests the slot once its frame serial has completed).
+        Bool IsTimerQueryResultReady(VkTimerQueryManager::TimestampRecord& record);
+        // Blocking wait, mirroring ClientWaitSync's caveat: a record written
+        // this frame cannot complete until Present submits the commands, so
+        // this returns false (result reads as 0) instead of deadlocking.
+        Bool WaitForTimerQueryResult(VkTimerQueryManager::TimestampRecord& record);
+        Uint64 GetTimerQueryElapsedNs(const VkTimerQueryManager::TimestampRecord& begin,
+                                      const VkTimerQueryManager::TimestampRecord& end) const;
+        Uint64 GetTimerQueryTimestampNs(const VkTimerQueryManager::TimestampRecord& record) const;
+
+        void RequestSwapchainResize(Uint32 width, Uint32 height);
         void RecreateSwapchain();
 
     private:
@@ -195,12 +286,64 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         void QueueClearBufferPayloadForFramebuffer(const MG_State::GLState::FramebufferObject& framebuffer,
                                                   GLenum buffer, GLint drawbuffer,
                                                   const ClearAttachmentPayload& clearPayload);
+        void RecordScissoredClearBuffer(const MG_State::GLState::FramebufferObject& framebuffer,
+                                        GLenum buffer, GLint drawbuffer,
+                                        const ClearAttachmentPayload& clearPayload,
+                                        const VkClearRect& clearRect);
+
+        // ---- Submission fence tracking (GL sync objects) ----
+        // One record per vkQueueSubmit still in flight, in ascending submit
+        // order. Present/readback submissions reference the frame slot's
+        // fence (not pool-owned); mid-frame flushes use pooled fences that are
+        // recycled once their submission is observed complete.
+        // Not thread-safe: like the rest of the renderer, the tracker relies
+        // on GL calls being serialized (launchers migrate the context across
+        // threads, but calls never run concurrently), so sync-object polls
+        // may mutate it without locking.
+        struct SubmitRecord {
+            Uint64 submitIndex = 0;
+            // Buffer-manager frame serial the submission was made under; its
+            // completion raises the completed-serial floor (timer queries and
+            // buffer busy-tracking live in frame-serial space).
+            Uint64 frameSerial = 0;
+            VkFence fence = VK_NULL_HANDLE;
+            Bool pooledFence = false;
+        };
+        // Registers a submission that vkQueueSubmit just made with `fence`.
+        // Invariant: every graphics-queue submission that outlives its call
+        // site must be registered so GL fences observe it. Exempt are the
+        // texture-upload/preserve submits in VkTextureManager, which
+        // vkWaitForFences inline before returning.
+        void RegisterSubmit(VkFence fence, Bool pooledFence);
+        // Builds the submit packet for the frame's pending command buffer
+        // (consuming the acquire semaphore on the slot's first submission),
+        // submits it with `fence`, and registers the submission. On failure
+        // the frame state is left untouched. Shared by the mid-frame flush
+        // and the readback path so the semaphore-consumption invariant lives
+        // in one place.
+        Bool SubmitPendingCommandBuffer(FrameContext::FrameData& frame, VkFence fence, Bool pooledFence);
+        // Polls in-flight submission fences (prefix order) and advances the
+        // completed counter past every fence observed signaled.
+        void RefreshCompletedSubmits();
+        // All submissions up to `submitIndex` are known complete (their fence
+        // was waited or the device was idled); drops their records and
+        // recycles pooled fences.
+        void OnSubmitsCompletedUpTo(Uint64 submitIndex);
+        VkFence AcquirePooledSubmitFence();
+        void DestroySubmitFencePool();
+        Bool HasPendingRecordedWork() const;
+
+        Vector<SubmitRecord> m_inFlightSubmits;
+        Vector<VkFence> m_freeSubmitFences;
+        Uint64 m_submitCounter = 0;
+        Uint64 m_completedSubmitCounter = 0;
 
         NativeWindowType m_window = 0;
         void* m_platformDisplay = nullptr;
         void* m_platformLibrary = nullptr;
         void* m_platformCloseDisplay = nullptr;
         VulkanRendererConfig m_config;
+        Bool m_swapchainResizeRequested = false;
 
         // Vulkan objects
         Bool m_validationLayersEnabled = false;
@@ -218,6 +361,25 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         Bool m_drawIndirectCountExtensionEnabled = false;
         Bool m_indexTypeUint8ExtensionEnabled = false;
         Bool m_logicOpFeatureEnabled = false;
+        Bool m_multiDrawIndirectFeatureEnabled = false;
+        Bool m_samplerAnisotropyFeatureEnabled = false;
+        Bool m_shaderDrawParametersExtensionEnabled = false;
+        Bool m_shaderDrawParametersFeatureEnabled = false;
+        // fillModeNonSolid gates VK_POLYGON_MODE_LINE/_POINT (glPolygonMode); independentBlend gates
+        // per-draw-buffer color write masks (glColorMaski). Both are cached at device creation and
+        // drive a runtime fallback when the device lacks them.
+        Bool m_fillModeNonSolidFeatureEnabled = false;
+        Bool m_independentBlendFeatureEnabled = false;
+        // dualSrcBlend gates GL_SRC1_* blend factors (glBindFragDataLocationIndexed dual-source blend);
+        // primitiveTopologyListRestart gates primitive restart on *list* topologies (strip/fan restart
+        // needs no feature). Both cached at device creation and drive a hard-fail-at-draw when absent.
+        Bool m_dualSrcBlendFeatureEnabled = false;
+        Bool m_primitiveTopologyListRestartFeatureEnabled = false;
+        // Cached at device creation from the graphics queue family properties
+        // and device limits; drives timer-query support.
+        Uint32 m_timestampValidBits = 0;
+        Float m_timestampPeriodNs = 0.0f;
+        Bool m_timerQuerySupported = false;
         using PFNDrawIndexedIndirectCountFunc = void(VKAPI_PTR*)(VkCommandBuffer commandBuffer, VkBuffer buffer,
                                                                  VkDeviceSize offset, VkBuffer countBuffer,
                                                                  VkDeviceSize countBufferOffset, Uint32 maxDrawCount,
@@ -226,20 +388,24 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
         VkCommandPool m_commandPool = VK_NULL_HANDLE;
 
-        struct TransientBufferSliceCacheEntry {
-            BufferSlice slice;
-            Uint64 changeSerial = 0;
-            SizeT size = 0;
-        };
-
         VkBufferManager m_bufferManager;
-        UnorderedMap<const MG_State::GLState::BufferObject*, TransientBufferSliceCacheEntry>
-            m_transientVertexIndexBufferSlicesThisFrame;
 
         Uint m_imageIndexAcquired = 0;
         FrameContext m_frameContext;
 
         UniquePtr<PipelineFactory> m_pipelineFactory;
+        // Single-slot "last pipeline" memo: skip the per-draw GetOrCreatePipeline work (state
+        // gather + synthetic vertex-input rebuild + payload hash + lookup) when the full pipeline
+        // state is unchanged from the previous draw. The key provably covers every pipeline field.
+        // Reset per-frame and on pipeline destruction so the cached handle can never dangle.
+        Bool m_lastPipelineValid = false;
+        GLenum m_lastPipelineMode = 0;
+        Uint64 m_lastPipelineProgramHash = 0;
+        Uint64 m_lastPipelineVertexInputHash = 0;
+        Uint64 m_lastPipelineRenderPassHash = 0;
+        Uint m_lastPipelineRenderStateVersion = 0;
+        ProgramFactory::CompileOptionFlags m_lastPipelineTransformFlags = {};
+        VkPipeline m_lastPipelineResult = VK_NULL_HANDLE;
         UnorderedMap<ProgramFactory::HashType, VkPipeline> m_computePipelines;
         UniquePtr<ProgramFactory> m_programFactory;
         UniquePtr<UniformManager> m_uniformManager;
@@ -248,9 +414,32 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         UniquePtr<VkRenderPassManager> m_renderPassManager;
         UniquePtr<VkTextureManager> m_textureManager;
         UniquePtr<VkSamplerManager> m_samplerManager;
+        UniquePtr<VkTimerQueryManager> m_timerQueryManager;
         BlitResources m_blitResources;
         DepthMipmapResources m_depthMipmapResources;
         Vector<DeferredDepthMipmapCleanup> m_deferredDepthMipmapCleanup;
+
+        // Skip the per-draw CollectSampledTextures walk (~5% of the render thread) when the sampled
+        // texture SET is provably unchanged from the previous draw: same program (lifetime id +
+        // backend-state version, which covers sampler-uniform reassignment / relink) and transform
+        // flags, and no texture bind/unbind/delete since (GetTextureBindGeneration). On a hit,
+        // m_sampledTexturesScratch still holds the previous draw's list and steps 2-4 (feedback /
+        // layout probe / transition) re-run on it, so layout correctness is unaffected - only the GL
+        // walk is skipped. The program lifetime id (never reused, unlike the GL name) and the
+        // monotonic bind generation make the key ABA-proof; the per-command-buffer reset is a cheap
+        // belt-and-suspenders.
+        Bool m_lastSampledSetValid = false;
+        Uint64 m_lastSampledSetProgramLifetimeId = 0;
+        Uint32 m_lastSampledSetProgramVersion = 0;
+        ProgramFactory::CompileOptionFlags m_lastSampledSetTransformFlags = {};
+        Uint64 m_lastSampledSetBindGeneration = 0;
+
+        // Per-draw scratch buffers (clear keeps capacity) — these paths run for every
+        // draw call and must not allocate.
+        Vector<MG_State::GLState::ITextureObject*> m_sampledTexturesScratch;
+        Vector<VkBuffer> m_vertexBuffersScratch;
+        Vector<VkDeviceSize> m_vertexOffsetsScratch;
+        Vector<VkVertexInputAttributeDescription> m_patchedAttributesScratch;
 
         void CreateInstance();
         VkResult SetupDebugMessenger();
@@ -275,6 +464,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         void DestroyComputePipelines();
 
         Bool UploadAndBindVertexBuffers(VkCommandBuffer commandBuffer, const MG_State::GLState::VertexArrayObject& vao,
+                                        const ProgramFactory::VkProgramObject& programObj,
                                         const DrawCmdParam& drawParams);
         Bool UploadAndBindIndexBuffer(FrameContext::FrameData& frame,
                                      const MG_State::GLState::VertexArrayObject& vao,

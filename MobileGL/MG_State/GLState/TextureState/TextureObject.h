@@ -32,6 +32,10 @@ namespace MobileGL::MG_State::GLState {
         virtual Uint GetExternalIndex() const = 0;
         virtual const FloatVec4& GetBorderColor() const = 0;
         virtual void SetBorderColor(const FloatVec4& color) = 0;
+        virtual const IntVec4& GetBorderColorI() const = 0;
+        virtual void SetBorderColorI(const IntVec4& color) = 0;
+        virtual const UintVec4& GetBorderColorUI() const = 0;
+        virtual void SetBorderColorUI(const UintVec4& color) = 0;
         virtual TextureSwizzleParam GetSwizzleParam(TextureSwizzleParam param) const = 0;
         virtual void SetSwizzleParam(TextureSwizzleParam param, TextureSwizzleParam value) = 0;
         virtual void SetSwizzleParamRGBA(const Vec4<TextureSwizzleParam>& values) = 0;
@@ -39,7 +43,14 @@ namespace MobileGL::MG_State::GLState {
         virtual const UintVec2& GetLevelRange() const = 0;
         virtual void SetBaseLevel(Uint baseLevel) = 0;
         virtual void SetMaxLevel(Uint maxLevel) = 0;
+        virtual Bool IsImmutable() const = 0;
+        virtual Uint GetImmutableLevels() const = 0;
+        virtual void SetImmutableLevels(Uint levels) = 0;
         virtual Uint16 GetTextureParamsVersion() const = 0;
+        // Monotonic counter bumped on every CPU-side pixel mutation (see MarkStorageDirty).
+        // Backends compare it against a per-resource snapshot to skip re-syncing unchanged
+        // textures across draws (e.g. the block atlas bound across a whole terrain batch).
+        virtual Uint64 GetContentVersion() const = 0;
         virtual Int GetSamples() const = 0;
         virtual void SetSamples(Int samples) = 0;
         virtual Bool HasFixedSampleLocations() const = 0;
@@ -64,6 +75,10 @@ namespace MobileGL::MG_State::GLState {
         Uint GetExternalIndex() const override;
         const FloatVec4& GetBorderColor() const override;
         void SetBorderColor(const FloatVec4& color) override;
+        const IntVec4& GetBorderColorI() const override;
+        void SetBorderColorI(const IntVec4& color) override;
+        const UintVec4& GetBorderColorUI() const override;
+        void SetBorderColorUI(const UintVec4& color) override;
         TextureSwizzleParam GetSwizzleParam(TextureSwizzleParam param) const override;
         const Vec4<TextureSwizzleParam>& GetAllSwizzleParams() const override;
         void SetSwizzleParam(TextureSwizzleParam param, TextureSwizzleParam value) override;
@@ -71,7 +86,15 @@ namespace MobileGL::MG_State::GLState {
         const UintVec2& GetLevelRange() const override;
         void SetBaseLevel(Uint baseLevel) override;
         void SetMaxLevel(Uint maxLevel) override;
+        Bool IsImmutable() const override;
+        Uint GetImmutableLevels() const override;
+        void SetImmutableLevels(Uint levels) override;
         Uint16 GetTextureParamsVersion() const override;
+        Uint64 GetContentVersion() const override;
+        // Bumps the content version without touching per-level storage-dirty flags. Used when the
+        // set of defined mip levels grows via GPU-side mip generation (glGenerateMipmap): the level
+        // set changed (so a cached sampled view's level range is stale) but no CPU data is dirty.
+        void BumpContentVersion();
         Int GetSamples() const override;
         void SetSamples(Int samples) override;
         Bool HasFixedSampleLocations() const override;
@@ -87,10 +110,16 @@ namespace MobileGL::MG_State::GLState {
         TextureInternalFormat m_internalFormat = TextureInternalFormat::Unknown;
         SharedPtr<SamplerObject> m_sampler = nullptr;
         FloatVec4 m_borderColor = {0.0f, 0.0f, 0.0f, 0.0f};
+        IntVec4 m_borderColorI = {0, 0, 0, 0};
+        UintVec4 m_borderColorUI = {0, 0, 0, 0};
         Vec4<TextureSwizzleParam> m_swizzleParams = {TextureSwizzleParam::Red, TextureSwizzleParam::Green,
                                                      TextureSwizzleParam::Blue, TextureSwizzleParam::Alpha};
         UintVec2 m_levelRange = {0, 1000};
+        Uint m_immutableLevels = 0;
         Uint16 m_textureParamsVersion = 0;
+        // Starts at 1 so a freshly-created backend resource (snapshot 0) never spuriously
+        // matches before its first sync. Bumped only on dirty=true in MarkStorageDirty.
+        Uint64 m_contentVersion = 1;
         Int m_samples = 0;
         Bool m_fixedSampleLocations = true;
     };
@@ -110,6 +139,31 @@ namespace MobileGL::MG_State::GLState {
         virtual void MarkStorageDirty(TextureUploadTarget uploadTarget, Uint mipmapLevel, Bool dirty = true) = 0;
         virtual Bool IsStorageDirty(TextureUploadTarget uploadTarget, Uint mipmapLevel) const = 0;
     };
+
+    // Cheap replacement for dynamic_cast on the hot path: TextureObjectMipmap is the
+    // only hierarchy branch whose storage type reports Mipmap, so the tag check makes
+    // the static_cast safe.
+    inline TextureObjectMipmap* AsMipmapTexture(ITextureObject* texture) {
+        return (texture && texture->GetStorageType() == TextureStorageType::Mipmap)
+                   ? static_cast<TextureObjectMipmap*>(texture)
+                   : nullptr;
+    }
+    inline const TextureObjectMipmap* AsMipmapTexture(const ITextureObject* texture) {
+        return (texture && texture->GetStorageType() == TextureStorageType::Mipmap)
+                   ? static_cast<const TextureObjectMipmap*>(texture)
+                   : nullptr;
+    }
+
+    // The per-target default texture objects (name 0) sit permanently in every texture unit's
+    // binding slots, so "nothing useful bound" is no longer a null slot. While a default texture
+    // has never been given an image (its internal format is still Unknown) it can contribute
+    // nothing to sampling; backends treat such a binding exactly like the old empty slot and
+    // skip per-draw sync/bind work for it. Once an application defines an image on a default
+    // texture it loses this shortcut and is synced like any other texture.
+    inline Bool IsUndefinedDefaultTexture(const ITextureObject* texture) {
+        return texture != nullptr && texture->GetExternalIndex() == 0 &&
+               texture->GetFormat() == TextureInternalFormat::Unknown;
+    }
 
     class TextureObjectWithOneMipmap : public TextureObjectMipmap {
     public:

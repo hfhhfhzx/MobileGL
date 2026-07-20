@@ -58,6 +58,9 @@ namespace MobileGL {
                                   EGLint* value) const;
                 Bool ValidateContext(EGLContextHandle context) const;
                 Bool ValidateContextOnDisplay(EGLDisplayHandle display, EGLContextHandle context) const;
+                Bool IsCurrentContextOpenGLCoreProfile() const;
+                Bool IsCurrentContextOpenGLCompatibilityProfile() const;
+                EGLint GetCurrentContextFlags() const;
 
                 // Surface
                 EGLSurfaceHandle CreateWindowSurface(EGLDisplayHandle display, EGLConfigHandle config,
@@ -74,6 +77,7 @@ namespace MobileGL {
                 EGLSurfaceHandle CreatePlatformPixmapSurface(EGLDisplayHandle display, EGLConfigHandle config,
                                                              void* nativePixmap, const EGLAttrib* attribList);
                 Bool DestroySurface(EGLDisplayHandle display, EGLSurfaceHandle surface);
+                Bool ResizeSurface(EGLDisplayHandle display, EGLSurfaceHandle surface, EGLint width, EGLint height);
                 Bool QuerySurface(EGLDisplayHandle display, EGLSurfaceHandle surface, EGLint attribute,
                                   EGLint* value) const;
                 Bool ValidateSurface(EGLSurfaceHandle surface) const;
@@ -157,12 +161,16 @@ namespace MobileGL {
                     EGLint ClientVersion = 1;
                     EGLint MajorVersion = 1;
                     EGLint MinorVersion = 0;
+                    EGLint OpenGLProfileMask = 0;
+                    EGLint EGLContextFlags = 0;
+                    EGLint OpenGLContextFlags = 0;
                 };
 
                 struct SurfaceObject {
                     EGLDisplayHandle Display = EGL_NO_DISPLAY;
                     EGLConfigHandle Config = nullptr;
                     SurfaceType Type = SurfaceType::Window;
+                    Bool DestroyPending = false;
                     Uint64 NativeHandleKey = 0;
                     EGLClientBuffer ClientBuffer = nullptr;
                     EGLenum BufferType = EGL_NONE;
@@ -226,6 +234,8 @@ namespace MobileGL {
 
                 void ReleaseDisplayObjects(EGLDisplayHandle display);
                 void ReleaseThreadUnlocked(const std::thread::id& threadKey);
+                Bool IsSurfaceCurrentUnlocked(EGLSurfaceHandle surface) const;
+                void DestroyPendingSurfaceIfUnused(EGLSurfaceHandle surface);
 
             private:
                 mutable std::recursive_mutex m_mutex;

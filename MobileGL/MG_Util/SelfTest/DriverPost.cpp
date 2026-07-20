@@ -1,0 +1,1293 @@
+// MobileGL - MobileGL/MG_Util/SelfTest/DriverPost.cpp
+// Copyright (c) 2025-2026 MobileGL-Dev
+// Licensed under the GNU Lesser General Public License v3.0:
+//   https://www.gnu.org/licenses/gpl-3.0.txt
+//   https://www.gnu.org/licenses/lgpl-3.0.txt
+// SPDX-License-Identifier: LGPL-3.0-only
+// End of Source File Header
+
+#include "DriverPost.h"
+#include "MG_Util/BackendLoaders/OpenGL/Loader.h"
+#include <Config.h>
+#include <MGGitHash.h>
+#include <MG_Backend/DirectGLES/BackendObject_DirectGLES.h>
+#include <MG_Backend/DirectVulkan/BackendObject_DirectVulkan.h>
+// Only for the compile-time MAX_VERTEX_ATTRIBS constant asserted below. The POST still executes no
+// MG_State code: it runs standalone, before MG_State::Init().
+#include <MG_State/GLState/VertexArrayState/VertexArrayObject.h>
+#include <MG_Util/Converters/MGToStr/GLExtensionConverter.h>
+#include <chrono>
+#include <thread>
+
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
+
+namespace MobileGL::MG_Util::SelfTest {
+    namespace {
+        // Display ranks for PostCheck::displayRank: within one backend section, FAIL
+        // rows render first, then WARN, PASS, INFO, then the device-driver identity
+        // strings, and always last (regardless of status) the strings MobileGL itself
+        // reports to applications. Rows are stable-sorted, so relative order within a
+        // rank is preserved. Purely cosmetic: the verdict computation is unaffected.
+        enum DisplayRank : Int {
+            RankFail = 0,
+            RankWarn = 1,
+            RankPass = 2,
+            RankInfo = 3,
+            RankDriverReported = 4,
+            RankMobileGLReported = 5,
+        };
+
+        struct ReportBuilder {
+            BackendPostReport report;
+            Bool fatalFailed = false;
+            Bool warnUnmet = false;
+
+            void Pass(String name, String detail) {
+                report.checks.push_back({Move(name), "PASS", Move(detail), RankPass});
+            }
+
+            void Fail(String name, String detail) {
+                fatalFailed = true;
+                report.checks.push_back({Move(name), "FAIL", Move(detail), RankFail});
+            }
+
+            void Warn(String name, String detail) {
+                warnUnmet = true;
+                report.checks.push_back({Move(name), "WARN", Move(detail), RankWarn});
+            }
+
+            void Info(String name, String detail) {
+                report.checks.push_back({Move(name), "INFO", Move(detail), RankInfo});
+            }
+
+            // A "Backend driver reported ..." identity string straight from the device
+            // driver; rendered after the regular rows.
+            void DriverReported(String name, String detail) {
+                report.checks.push_back({Move(name), "INFO", Move(detail), RankDriverReported});
+            }
+
+            // A "MobileGL reported ..." string: what MobileGL itself reports to
+            // applications on this backend; always rendered at the very bottom.
+            void MobileGLReported(String name, String detail) {
+                report.checks.push_back({Move(name), "INFO", Move(detail), RankMobileGLReported});
+            }
+
+            void Finalize() {
+                report.verdict = fatalFailed ? "UNSUPPORTED" : (warnUnmet ? "DEGRADED" : "OK");
+                std::stable_sort(report.checks.begin(), report.checks.end(),
+                                 [](const PostCheck& a, const PostCheck& b) { return a.displayRank < b.displayRank; });
+            }
+        };
+
+        // ---- "MobileGL reported ..." row assembly -------------------------------
+        // The vendor/version/renderer strings mirror GL_Getter.cpp's GL_VENDOR /
+        // GL_VERSION / GL_RENDERER cases; the backend API version string and the
+        // extension list come from the per-backend single-source-of-truth helpers
+        // (GetRendererIdentity / FormatBackendAPIVersionString /
+        // BuildAdvertisedExtensions) shared with the real backends.
+
+        // Mirrors GL_Getter.cpp's GL_VENDOR case.
+        String BuildReportedGLVendor(const RendererInfo& identity) {
+            if (identity.ExtraVendor.has_value()) {
+                return format("{}{}", MG_Config::CoreVendor, identity.ExtraVendor.value());
+            }
+            return MG_Config::CoreVendor;
+        }
+
+        // Mirrors GL_Getter.cpp's GL_VERSION case.
+        String BuildReportedGLVersion(const RendererInfo& identity) {
+            return format("{} {} {}, {} Backend, GIT@" GIT_COMMIT_HASH_SHORT,
+                          identity.RendererGLInfo.TargetGLVersion.toString(), MG_Config::ProjectName,
+                          MG_Config::CoreVersion.toFormattedString(MG_Config::DefaultVersionStringFormatAttrib),
+                          identity.BackendName);
+        }
+
+        // Mirrors GL_Getter.cpp's GL_RENDERER case.
+        String BuildReportedGLRenderer(const RendererInfo& identity, const String& backendApiVersionString) {
+            return format("{} ({}) ({})", identity.RendererName, MG_Config::CoreName, backendApiVersionString);
+        }
+
+        // Mirrors GL_Getter.cpp's GL_EXTENSIONS case (space-separated).
+        String JoinAdvertisedExtensions(const Vector<GLExtension>& extensions) {
+            String result;
+            for (const auto& extension : extensions) {
+                if (!result.empty()) {
+                    result += " ";
+                }
+                result += ConvertGLExtToString(extension);
+            }
+            return result;
+        }
+
+        // Appends the four "MobileGL reported ..." rows for one backend section.
+        // GL_VENDOR and GL_VERSION only depend on the backend's static identity, so
+        // they are always concrete; GL_RENDERER and GL_EXTENSIONS need data from the
+        // device probe and degrade to an explanatory detail when it failed.
+        void AppendMobileGLReportedRows(ReportBuilder& builder, const RendererInfo& identity,
+                                        const Optional<String>& backendApiVersionString,
+                                        const Optional<String>& advertisedExtensions) {
+            static const String Unavailable = "unavailable (backend probe failed)";
+            builder.MobileGLReported("MobileGL reported GL_VENDOR", BuildReportedGLVendor(identity));
+            builder.MobileGLReported("MobileGL reported GL_VERSION", BuildReportedGLVersion(identity));
+            builder.MobileGLReported("MobileGL reported GL_RENDERER",
+                                     backendApiVersionString.has_value()
+                                         ? BuildReportedGLRenderer(identity, backendApiVersionString.value())
+                                         : Unavailable);
+            builder.MobileGLReported("MobileGL reported GL_EXTENSIONS",
+                                     advertisedExtensions.has_value() ? advertisedExtensions.value() : Unavailable);
+        }
+
+        // Runs a callable when the enclosing scope exits, so driver teardown still happens
+        // even if a String/format allocation throws while report rows are being built.
+        template <typename Callable>
+        struct ScopeGuard {
+            explicit ScopeGuard(Callable callable) : onExit(Move(callable)) {}
+            ScopeGuard(const ScopeGuard&) = delete;
+            ScopeGuard& operator=(const ScopeGuard&) = delete;
+            ~ScopeGuard() { onExit(); }
+
+        private:
+            Callable onExit;
+        };
+
+        String EGLErrorSuffix(const MG_External::EGLFunctionsTable& eglFuncs) {
+            if (!eglFuncs.eglGetError) {
+                return "";
+            }
+            return format(" (EGL error 0x{:x})", eglFuncs.eglGetError());
+        }
+
+        // Suffix folded into each backend's single "Timer queries" row when the user
+        // disabled timer queries; the note rides along with whatever combined verdict
+        // the row carries instead of being a standalone INFO row, and spells out the
+        // cause (the environment variable) and its consequence explicitly.
+        String TimerQueryDisabledNote() {
+            return MG_Config::Features.DisableTimerQuery
+                       ? "; environment variable MOBILEGL_DISABLE_TIMERQUERY is set, disabling timer "
+                         "queries as a result"
+                       : "";
+        }
+
+        // ---- Vertex attribute limit --------------------------------------------
+        // GL 3.3 Core mandates GL_MAX_VERTEX_ATTRIBS >= 16 (spec table 6.32); a driver below
+        // that cannot back a conformant core context at all.
+        constexpr Int kGL33MinVertexAttribs = 16;
+
+        // The capacity of the per-context current-vertex-attribute array, which is also the width of
+        // the Uint32 attribute masks the backends pass around. Pinned to the state layer's constant so
+        // the two can never drift: a mismatch between them is precisely the defect this row guards.
+        constexpr Int kMobileGLMaxVertexAttribs = MG_State::GLState::VertexArrayObject::MAX_VERTEX_ATTRIBS;
+        static_assert(kMobileGLMaxVertexAttribs <= 32, "Vertex attribute masks are Uint32");
+        static_assert(kMobileGLMaxVertexAttribs >= kGL33MinVertexAttribs,
+                      "MobileGL cannot advertise a conformant GL 3.3 Core GL_MAX_VERTEX_ATTRIBS");
+
+        // Both backends index a fixed-size, per-context array of current generic vertex attribute
+        // values by shader input location, and both clamp the GL_MAX_VERTEX_ATTRIBS they advertise
+        // to that array's capacity. A driver reporting more attributes than the array can hold used
+        // to make the DirectVulkan draw path walk locations past the end of it -- an out-of-bounds
+        // read in release builds, and a MOBILEGL_ASSERT abort in debug builds -- as soon as a shader
+        // declared a vertex input at a high location whose array was disabled. The clamp closes that
+        // hole, so this row exists to make the underlying driver/host mismatch visible rather than
+        // silently swallowed.
+        void EvaluateVertexAttribLimit(ReportBuilder& builder, Int deviceLimit, const char* rowName,
+                                       const char* driverLimitName) {
+            if (deviceLimit < kGL33MinVertexAttribs) {
+                builder.Fail(rowName,
+                             format("{} = {} (< {}); OpenGL 3.3 Core requires at least {} generic vertex "
+                                    "attributes, so this driver cannot back a conformant core context",
+                                    driverLimitName, deviceLimit, kGL33MinVertexAttribs, kGL33MinVertexAttribs));
+                return;
+            }
+            if (deviceLimit > kMobileGLMaxVertexAttribs) {
+                builder.Warn(rowName,
+                             format("{} = {} (> {}); MobileGL clamps GL_MAX_VERTEX_ATTRIBS to {} because its "
+                                    "current-vertex-attribute storage and its Uint32 attribute masks hold {} "
+                                    "locations, so the driver's extra attributes stay unusable",
+                                    driverLimitName, deviceLimit, kMobileGLMaxVertexAttribs,
+                                    kMobileGLMaxVertexAttribs, kMobileGLMaxVertexAttribs));
+                return;
+            }
+            builder.Pass(rowName, format("{} = {}; MobileGL advertises GL_MAX_VERTEX_ATTRIBS = {}",
+                                         driverLimitName, deviceLimit, deviceLimit));
+        }
+
+        void EvaluateGlesChecklist(ReportBuilder& builder, const MG_External::GLESCapabilities& caps,
+                                   const MG_External::GLESFunctionsTable& glesFuncs) {
+            const Int major = caps.GLESVersion.Major;
+            const Int minor = caps.GLESVersion.Minor;
+            const Bool es31 = major > 3 || (major == 3 && minor >= 1);
+            const Bool es32 = major > 3 || (major == 3 && minor >= 2);
+            const String versionLabel = format("OpenGL ES {}.{}", major, minor);
+            if (es32) {
+                builder.Pass("OpenGL ES version", versionLabel + " (>= 3.2, full native feature set)");
+            } else if (es31) {
+                builder.Warn("OpenGL ES version",
+                             versionLabel +
+                                 " (compute shaders and native indirect draws available; ES 3.2 is recommended)");
+            } else {
+                builder.Fail("OpenGL ES version",
+                             versionLabel + " (< 3.1: no compute shaders or native indirect draws)");
+            }
+
+            EvaluateVertexAttribLimit(builder, caps.MaxVertexAttribs, "Vertex attributes",
+                                      "GL_MAX_VERTEX_ATTRIBS");
+
+            if (caps.SupportsPolygonMode) {
+                builder.Pass("Polygon mode",
+                             "glPolygonMode GL_LINE/GL_POINT available via GL_NV/ANGLE_polygon_mode");
+            } else {
+                builder.Warn("Polygon mode",
+                             "no GL_NV/ANGLE_polygon_mode; glPolygonMode GL_LINE/GL_POINT falls back to GL_FILL");
+            }
+            if (caps.SupportsIndexedColorMask) {
+                builder.Pass("Indexed color mask",
+                             "per-draw-buffer glColorMaski available (ES 3.2 core or draw_buffers_indexed)");
+            } else {
+                builder.Warn("Indexed color mask",
+                             "no indexed glColorMaski; per-draw-buffer color masks fall back to draw buffer 0");
+            }
+            if (caps.SupportsDualSourceBlend) {
+                builder.Pass("Dual-source blend",
+                             "GL_SRC1_* dual-source blend factors available via GL_EXT_blend_func_extended");
+            } else {
+                builder.Warn("Dual-source blend",
+                             "no GL_EXT_blend_func_extended; GL_SRC1_* dual-source blend factors hard-fail at draw");
+            }
+
+            if (es31) {
+                GLint maxVertexSsboBlocks = 0;
+                glesFuncs.glGetIntegerv(GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS, &maxVertexSsboBlocks);
+                while (glesFuncs.glGetError && glesFuncs.glGetError() != GL_NO_ERROR) {
+                }
+                if (maxVertexSsboBlocks >= 1) {
+                    builder.Pass("Vertex shader storage blocks",
+                                 format("GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS = {}", maxVertexSsboBlocks));
+                } else {
+                    builder.Warn("Vertex shader storage blocks",
+                                 format("GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS = {}; the Flywheel/Create indirect draw "
+                                        "machinery cannot read indirect command buffers from the vertex stage",
+                                        maxVertexSsboBlocks));
+                }
+
+                if (caps.MaxShaderStorageBufferBindings >= 8) {
+                    builder.Pass("Shader storage buffer bindings",
+                                 format("GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS = {} (the last binding is reserved "
+                                        "for mg_IndirectParams)",
+                                        caps.MaxShaderStorageBufferBindings));
+                } else {
+                    builder.Warn("Shader storage buffer bindings",
+                                 format("GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS = {} (< 8); reserving the last "
+                                        "binding for mg_IndirectParams leaves little room for app SSBOs",
+                                        caps.MaxShaderStorageBufferBindings));
+                }
+            }
+
+            if (caps.SupportsPersistentMapping) {
+                builder.Pass("GL_EXT_buffer_storage", "supported (persistent buffer mapping)");
+            } else {
+                builder.Info("GL_EXT_buffer_storage",
+                             "not supported; no impact today: the frontend fully emulates persistent "
+                             "mapping regardless of this extension");
+            }
+            if (caps.SupportsBaseInstance) {
+                builder.Pass("GL_EXT_base_instance", "supported (native baseInstance draws)");
+            } else {
+                builder.Info("GL_EXT_base_instance",
+                             "not supported; no impact: the native indirect path deliberately does not "
+                             "rely on it (shader-side emulation handles baseInstance semantics)");
+            }
+            if (caps.SupportsNorm16Texture) {
+                builder.Pass("GL_EXT_texture_norm16", "supported");
+            } else {
+                builder.Warn("GL_EXT_texture_norm16",
+                             "not supported; 16-bit normalized texture formats need emulation");
+            }
+
+            builder.Info("Indirect gl_InstanceID semantics",
+                         caps.IndirectDrawInstanceIdIncludesBaseInstance
+                             ? "includes baseInstance (ANGLE-style; MobileGL's shader rewrite keeps gl_InstanceID "
+                               "zero-based)"
+                             : "conforming (zero-based)");
+
+            builder.DriverReported("Backend driver reported GL_VENDOR", caps.GLESVendorString);
+            builder.DriverReported("Backend driver reported GL_RENDERER", caps.GLESRendererString);
+            builder.DriverReported("Backend driver reported GL_VERSION", caps.GLESVersionString);
+        }
+
+        // Single "Timer queries" row: GL_EXT_disjoint_timer_query presence and a real
+        // GL_TIME_ELAPSED_EXT span around a trivial workload on the probe context fold
+        // into one combined verdict (WARN when absent, PASS when the probe works, FAIL
+        // naming the step that broke). Requires the probe context to still be current.
+        void ProbeGlesTimerQuery(ReportBuilder& builder, const MG_External::GLESCapabilities& caps,
+                                 const MG_External::GLESFunctionsTable& glesFuncs) {
+            const String disabledNote = TimerQueryDisabledNote();
+            if (!caps.SupportsDisjointTimerQuery) {
+                builder.Warn("Timer queries",
+                             "GL_EXT_disjoint_timer_query not supported; timer queries unavailable; "
+                             "Minecraft F3 GPU% will not show" +
+                                 disabledNote);
+                return;
+            }
+            // Every emit carries the extension-presence fact the old standalone
+            // GL_EXT_disjoint_timer_query row showed, plus the probe outcome.
+            const String extensionPresent = "GL_EXT_disjoint_timer_query extension present";
+            const auto fail = [&](const String& detail) {
+                builder.Fail("Timer queries", extensionPresent + "; but " + detail + disabledNote);
+            };
+
+            if (!glesFuncs.glGenQueries || !glesFuncs.glDeleteQueries || !glesFuncs.glBeginQuery ||
+                !glesFuncs.glEndQuery || !glesFuncs.glGetQueryObjectuiv || !glesFuncs.glGetQueryObjectui64vEXT ||
+                !glesFuncs.glClearColor || !glesFuncs.glClear || !glesFuncs.glFlush || !glesFuncs.glFinish ||
+                !glesFuncs.glGetError) {
+                fail("the query entry points did not resolve through eglGetProcAddress");
+                return;
+            }
+
+            // Drain stale errors so probe failures are attributable to the probe itself.
+            while (glesFuncs.glGetError() != GL_NO_ERROR) {
+            }
+
+            GLuint queryId = 0;
+            glesFuncs.glGenQueries(1, &queryId);
+            if (queryId == 0) {
+                fail("glGenQueries did not return a query object");
+                return;
+            }
+            const ScopeGuard deleteQuery([&]() { glesFuncs.glDeleteQueries(1, &queryId); });
+
+            glesFuncs.glBeginQuery(GL_TIME_ELAPSED_EXT, queryId);
+            // Trivial workload inside the span: clear the 1x1 probe pbuffer and flush.
+            glesFuncs.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glesFuncs.glClear(GL_COLOR_BUFFER_BIT);
+            glesFuncs.glFlush();
+            glesFuncs.glEndQuery(GL_TIME_ELAPSED_EXT);
+            glesFuncs.glFinish();
+
+            const GLenum spanError = glesFuncs.glGetError();
+            if (spanError != GL_NO_ERROR) {
+                fail(format("GL error 0x{:x} while recording the GL_TIME_ELAPSED_EXT span", spanError));
+                return;
+            }
+
+            // glFinish already drained the GPU, so a conforming driver reports the
+            // result available immediately; the bounded loop only covers drivers
+            // that latch availability lazily. Paced at ~100us per poll to match
+            // the runtime GetQueryResult64 wait loop, bounding the worst case
+            // at ~100ms so a broken driver cannot stall the POST.
+            GLuint available = 0;
+            for (Int attempt = 0; attempt < 1000 && available == 0; ++attempt) {
+                glesFuncs.glGetQueryObjectuiv(queryId, GL_QUERY_RESULT_AVAILABLE, &available);
+                if (available == 0) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+            }
+            if (available == 0) {
+                fail("GL_QUERY_RESULT_AVAILABLE never became true after glFinish "
+                     "(1000 polls over ~100ms)");
+                return;
+            }
+
+            GLuint64 elapsedNs = 0;
+            glesFuncs.glGetQueryObjectui64vEXT(queryId, GL_QUERY_RESULT, &elapsedNs);
+            const GLenum resultError = glesFuncs.glGetError();
+            if (resultError != GL_NO_ERROR) {
+                fail(format("GL error 0x{:x} while reading GL_QUERY_RESULT", resultError));
+                return;
+            }
+            builder.Pass("Timer queries",
+                         extensionPresent + format("; timer query functional (probe observed {} ns)", elapsedNs) +
+                             disabledNote);
+        }
+
+        // Everything the "MobileGL reported ..." rows need from the GLES device probe.
+        struct GlesProbeSummary {
+            Bool capsValid = false;
+            MG_External::GLESCapabilities caps{};
+        };
+    } // namespace
+
+    // The GLES device probe proper. Split out of RunGlesDriverPost so that the
+    // "MobileGL reported ..." rows are appended on every path (including early
+    // probe failures) before the report is finalized.
+    //
+    // The whole EGL bring-up chain (library load, display init, API bind, config,
+    // pbuffer surface, context) is one "ES3 context" row. The detail accumulates one
+    // completed-stage description per stage so no sub-fact of the old per-stage rows
+    // is lost: PASS enumerates every stage's result, FAIL lists the stages that
+    // completed and then names the exact stage that broke with its detail string.
+    static void ProbeGlesDriver(ReportBuilder& builder, GlesProbeSummary& summary) {
+        String chain;
+        const auto stageDone = [&](const String& description) {
+            if (!chain.empty()) {
+                chain += "; ";
+            }
+            chain += description;
+        };
+        const auto failStage = [&](const String& stage, const String& detail) {
+            builder.Fail("ES3 context", (chain.empty() ? "" : chain + "; but ") + stage + ": " + detail);
+        };
+
+        MG_External::EGLFunctionsTable eglFuncs{};
+        BackendLoader::AcquireEGLFunctions(eglFuncs);
+        const Bool eglLoaded = eglFuncs.eglGetDisplay && eglFuncs.eglInitialize && eglFuncs.eglBindAPI &&
+                               eglFuncs.eglChooseConfig && eglFuncs.eglCreatePbufferSurface &&
+                               eglFuncs.eglCreateContext && eglFuncs.eglMakeCurrent && eglFuncs.eglDestroySurface &&
+                               eglFuncs.eglDestroyContext && eglFuncs.eglTerminate && eglFuncs.eglGetProcAddress;
+        if (!eglLoaded) {
+            failStage("EGL library", "libEGL.so or one of its required entry points is missing");
+            return;
+        }
+        stageDone("libEGL.so loaded with all required entry points");
+
+        EGLDisplay display = eglFuncs.eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        if (display == EGL_NO_DISPLAY) {
+            failStage("EGL display", "eglGetDisplay returned EGL_NO_DISPLAY");
+            return;
+        }
+        EGLint eglMajor = 0;
+        EGLint eglMinor = 0;
+        if (!eglFuncs.eglInitialize(display, &eglMajor, &eglMinor)) {
+            failStage("EGL display", "eglInitialize failed on the default display" + EGLErrorSuffix(eglFuncs));
+            return;
+        }
+        stageDone(format("EGL {}.{} initialized on the default display", eglMajor, eglMinor));
+        builder.report.available = true;
+
+        EGLSurface surface = EGL_NO_SURFACE;
+        EGLContext context = EGL_NO_CONTEXT;
+        const ScopeGuard eglTeardown([&]() {
+            eglFuncs.eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            if (surface != EGL_NO_SURFACE) {
+                eglFuncs.eglDestroySurface(display, surface);
+            }
+            if (context != EGL_NO_CONTEXT) {
+                eglFuncs.eglDestroyContext(display, context);
+            }
+            // eglTerminate is deliberately not called: the probe shares EGL_DEFAULT_DISPLAY with
+            // the process UI renderer (HWUI), and terminating it can invalidate the UI's EGL
+            // objects on pre-refcounting Android builds. Unbinding and destroying our own
+            // surface/context is sufficient cleanup.
+        });
+        do {
+            if (!eglFuncs.eglBindAPI(EGL_OPENGL_ES_API)) {
+                failStage("OpenGL ES API bind", "eglBindAPI(EGL_OPENGL_ES_API) failed" + EGLErrorSuffix(eglFuncs));
+                break;
+            }
+            stageDone("eglBindAPI(EGL_OPENGL_ES_API) succeeded");
+
+            const EGLint configAttribs[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+                                            EGL_RED_SIZE,     8,               EGL_GREEN_SIZE,      8,
+                                            EGL_BLUE_SIZE,    8,               EGL_ALPHA_SIZE,      8,
+                                            EGL_NONE};
+            EGLConfig config = nullptr;
+            EGLint numConfigs = 0;
+            if (!eglFuncs.eglChooseConfig(display, configAttribs, &config, 1, &numConfigs)) {
+                failStage("ES3 RGBA8888 pbuffer config", "eglChooseConfig failed" + EGLErrorSuffix(eglFuncs));
+                break;
+            }
+            if (numConfigs < 1) {
+                // No EGL error suffix here: eglChooseConfig succeeded, so it would read EGL_SUCCESS.
+                failStage("ES3 RGBA8888 pbuffer config", "no ES3-capable RGBA8888 pbuffer config");
+                break;
+            }
+            stageDone("ES3-renderable RGBA8888 pbuffer config found");
+
+            const EGLint surfaceAttribs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+            surface = eglFuncs.eglCreatePbufferSurface(display, config, surfaceAttribs);
+            if (surface == EGL_NO_SURFACE) {
+                failStage("1x1 pbuffer surface", "eglCreatePbufferSurface failed" + EGLErrorSuffix(eglFuncs));
+                break;
+            }
+            stageDone("1x1 probe surface created");
+
+            const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+            context = eglFuncs.eglCreateContext(display, config, EGL_NO_CONTEXT, contextAttribs);
+            if (context == EGL_NO_CONTEXT) {
+                failStage("OpenGL ES 3 context", "eglCreateContext failed" + EGLErrorSuffix(eglFuncs));
+                break;
+            }
+            if (!eglFuncs.eglMakeCurrent(display, surface, surface, context)) {
+                failStage("OpenGL ES 3 context", "eglMakeCurrent failed" + EGLErrorSuffix(eglFuncs));
+                break;
+            }
+            stageDone("ES 3 context created and made current");
+            builder.Pass("ES3 context", chain);
+
+            MG_External::GLESFunctionsTable glesFuncs{};
+            BackendLoader::AcquireGLESFunctions(glesFuncs, eglFuncs.eglGetProcAddress);
+            if (!BackendLoader::FillInGLESCapabilities(summary.caps, glesFuncs)) {
+                builder.Fail("GLES capability query",
+                             "required GLES entry points could not be resolved through eglGetProcAddress");
+                break;
+            }
+            summary.capsValid = true;
+            const MG_External::GLESCapabilities& caps = summary.caps;
+            builder.report.rendererInfo = format("{} ({})", caps.GLESRendererString, caps.GLESVersionString);
+            EvaluateGlesChecklist(builder, caps, glesFuncs);
+            ProbeGlesTimerQuery(builder, caps, glesFuncs);
+            builder.report.formatCapabilities.emplace();
+            MG_Backend::DirectGLES::PopulateFormatCapabilities(
+                glesFuncs, caps, builder.report.formatCapabilities.value());
+        } while (false);
+    }
+
+    BackendPostReport RunGlesDriverPost() {
+        MGLOG_I("Driver POST: probing the device GLES driver");
+        ReportBuilder builder;
+        GlesProbeSummary summary;
+        ProbeGlesDriver(builder, summary);
+
+        // "MobileGL reported ..." rows: what applications running on the DirectGLES
+        // backend (Espryt) would see. The backend API version string and the extension
+        // list are built from the probe's own capability data through the same helpers
+        // the real backend uses, so they cannot drift.
+        Optional<String> backendApiVersionString;
+        Optional<String> advertisedExtensions;
+        if (summary.capsValid) {
+            backendApiVersionString = MG_Backend::DirectGLES::FormatBackendAPIVersionString(
+                summary.caps.GLESRendererString, summary.caps.GLESVersion.Major, summary.caps.GLESVersion.Minor);
+            advertisedExtensions = JoinAdvertisedExtensions(MG_Backend::DirectGLES::BuildAdvertisedExtensions(
+                summary.caps.SupportsDisjointTimerQuery, summary.caps.SupportsTextureFilterAnisotropy));
+        }
+        AppendMobileGLReportedRows(builder, MG_Backend::DirectGLES::GetRendererIdentity(), backendApiVersionString,
+                                   advertisedExtensions);
+
+        builder.Finalize();
+        MGLOG_I("Driver POST: GLES verdict = %s", builder.report.verdict.c_str());
+        return builder.report;
+    }
+
+    namespace {
+        // The Vulkan loader is bootstrapped through dlopen + vkGetInstanceProcAddr instead of
+        // static linking so the POST also works in build configurations that do not link a
+        // Vulkan loader (and degrades gracefully when the device ships none). The library
+        // handle is intentionally never closed: Android Vulkan ICDs may register threads and
+        // state that do not survive unloading, and the loader stays resident for the real
+        // backend anyway.
+        void* OpenVulkanLoaderLibrary() {
+#if defined(_WIN32)
+            return reinterpret_cast<void*>(LoadLibraryA("vulkan-1.dll"));
+#else
+            static const char* const LoaderNames[] = {
+#if defined(__APPLE__)
+                "libvulkan.dylib",
+                "libvulkan.1.dylib",
+                "libMoltenVK.dylib",
+#else
+                "libvulkan.so.1",
+                "libvulkan.so",
+#endif
+            };
+            for (const char* name : LoaderNames) {
+                if (void* library = dlopen(name, RTLD_LOCAL | RTLD_NOW)) {
+                    MGLOG_I("Driver POST: loaded Vulkan loader library: %s", name);
+                    return library;
+                }
+            }
+            return nullptr;
+#endif
+        }
+
+        void* VulkanLoaderSymbol(void* library, const char* name) {
+#if defined(_WIN32)
+            return reinterpret_cast<void*>(GetProcAddress(reinterpret_cast<HMODULE>(library), name));
+#else
+            return dlsym(library, name);
+#endif
+        }
+
+        Bool HasVkExtension(const Vector<VkExtensionProperties>& extensions, const char* name) {
+            return std::any_of(extensions.begin(), extensions.end(), [name](const VkExtensionProperties& extension) {
+                return std::strcmp(extension.extensionName, name) == 0;
+            });
+        }
+
+        String VkApiVersionToString(Uint32 version) {
+            return format("{}.{}.{}", VK_VERSION_MAJOR(version), VK_VERSION_MINOR(version),
+                          VK_VERSION_PATCH(version));
+        }
+
+        // Real timestamp-query probe, emitting the backend's single "Timer queries" row:
+        // a throwaway logical device records two vkCmdWriteTimestamp(BOTTOM_OF_PIPE)
+        // queries and reads them back. Both outcomes state the validBits and period
+        // values (the facts of the old standalone rows): PASS adds the observed span,
+        // FAIL names the step (and VkResult) that broke. Every created object is torn
+        // down from a scope guard before the caller's instance guard runs.
+        void ProbeVulkanTimerQuery(ReportBuilder& builder, PFN_vkGetInstanceProcAddr getInstanceProcAddr,
+                                   VkInstance instance, VkPhysicalDevice physicalDevice,
+                                   Uint32 graphicsQueueFamilyIndex, Uint32 timestampValidBits,
+                                   Float timestampPeriod) {
+            const String disabledNote = TimerQueryDisabledNote();
+            const String timestampFacts =
+                format("timestampValidBits = {} on the graphics queue family; timestampPeriod = {} ns per tick",
+                       timestampValidBits, timestampPeriod);
+            const auto fail = [&](const String& detail) {
+                builder.Fail("Timer queries", timestampFacts + "; but " + detail + disabledNote);
+            };
+            const auto vkCreateDeviceFn =
+                reinterpret_cast<PFN_vkCreateDevice>(getInstanceProcAddr(instance, "vkCreateDevice"));
+            const auto vkDestroyDeviceFn =
+                reinterpret_cast<PFN_vkDestroyDevice>(getInstanceProcAddr(instance, "vkDestroyDevice"));
+            const auto vkGetDeviceQueueFn =
+                reinterpret_cast<PFN_vkGetDeviceQueue>(getInstanceProcAddr(instance, "vkGetDeviceQueue"));
+            const auto vkCreateCommandPoolFn =
+                reinterpret_cast<PFN_vkCreateCommandPool>(getInstanceProcAddr(instance, "vkCreateCommandPool"));
+            const auto vkDestroyCommandPoolFn =
+                reinterpret_cast<PFN_vkDestroyCommandPool>(getInstanceProcAddr(instance, "vkDestroyCommandPool"));
+            const auto vkAllocateCommandBuffersFn = reinterpret_cast<PFN_vkAllocateCommandBuffers>(
+                getInstanceProcAddr(instance, "vkAllocateCommandBuffers"));
+            const auto vkBeginCommandBufferFn =
+                reinterpret_cast<PFN_vkBeginCommandBuffer>(getInstanceProcAddr(instance, "vkBeginCommandBuffer"));
+            const auto vkEndCommandBufferFn =
+                reinterpret_cast<PFN_vkEndCommandBuffer>(getInstanceProcAddr(instance, "vkEndCommandBuffer"));
+            const auto vkCreateQueryPoolFn =
+                reinterpret_cast<PFN_vkCreateQueryPool>(getInstanceProcAddr(instance, "vkCreateQueryPool"));
+            const auto vkDestroyQueryPoolFn =
+                reinterpret_cast<PFN_vkDestroyQueryPool>(getInstanceProcAddr(instance, "vkDestroyQueryPool"));
+            const auto vkCmdResetQueryPoolFn =
+                reinterpret_cast<PFN_vkCmdResetQueryPool>(getInstanceProcAddr(instance, "vkCmdResetQueryPool"));
+            const auto vkCmdWriteTimestampFn =
+                reinterpret_cast<PFN_vkCmdWriteTimestamp>(getInstanceProcAddr(instance, "vkCmdWriteTimestamp"));
+            const auto vkCreateFenceFn =
+                reinterpret_cast<PFN_vkCreateFence>(getInstanceProcAddr(instance, "vkCreateFence"));
+            const auto vkDestroyFenceFn =
+                reinterpret_cast<PFN_vkDestroyFence>(getInstanceProcAddr(instance, "vkDestroyFence"));
+            const auto vkWaitForFencesFn =
+                reinterpret_cast<PFN_vkWaitForFences>(getInstanceProcAddr(instance, "vkWaitForFences"));
+            const auto vkQueueSubmitFn =
+                reinterpret_cast<PFN_vkQueueSubmit>(getInstanceProcAddr(instance, "vkQueueSubmit"));
+            const auto vkGetQueryPoolResultsFn = reinterpret_cast<PFN_vkGetQueryPoolResults>(
+                getInstanceProcAddr(instance, "vkGetQueryPoolResults"));
+            const auto vkDeviceWaitIdleFn =
+                reinterpret_cast<PFN_vkDeviceWaitIdle>(getInstanceProcAddr(instance, "vkDeviceWaitIdle"));
+
+            if (vkCreateDeviceFn == nullptr || vkDestroyDeviceFn == nullptr || vkGetDeviceQueueFn == nullptr ||
+                vkCreateCommandPoolFn == nullptr || vkDestroyCommandPoolFn == nullptr ||
+                vkAllocateCommandBuffersFn == nullptr || vkBeginCommandBufferFn == nullptr ||
+                vkEndCommandBufferFn == nullptr || vkCreateQueryPoolFn == nullptr ||
+                vkDestroyQueryPoolFn == nullptr || vkCmdResetQueryPoolFn == nullptr ||
+                vkCmdWriteTimestampFn == nullptr || vkCreateFenceFn == nullptr || vkDestroyFenceFn == nullptr ||
+                vkWaitForFencesFn == nullptr || vkQueueSubmitFn == nullptr || vkGetQueryPoolResultsFn == nullptr ||
+                vkDeviceWaitIdleFn == nullptr) {
+                fail("vkGetInstanceProcAddr could not resolve the entry points required for the "
+                     "timestamp probe");
+                return;
+            }
+
+            const Float queuePriority = 1.0f;
+            VkDeviceQueueCreateInfo queueInfo{};
+            queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            queueInfo.queueFamilyIndex = graphicsQueueFamilyIndex;
+            queueInfo.queueCount = 1;
+            queueInfo.pQueuePriorities = &queuePriority;
+
+            VkDeviceCreateInfo deviceInfo{};
+            deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+            deviceInfo.queueCreateInfoCount = 1;
+            deviceInfo.pQueueCreateInfos = &queueInfo;
+
+            VkDevice device = VK_NULL_HANDLE;
+            VkResult result = vkCreateDeviceFn(physicalDevice, &deviceInfo, nullptr, &device);
+            if (result != VK_SUCCESS || device == VK_NULL_HANDLE) {
+                fail(format("vkCreateDevice failed (VkResult = {})", static_cast<Int>(result)));
+                return;
+            }
+
+            VkCommandPool commandPool = VK_NULL_HANDLE;
+            VkQueryPool queryPool = VK_NULL_HANDLE;
+            VkFence fence = VK_NULL_HANDLE;
+            Bool fenceWaitTimedOut = false;
+            // Same teardown-on-every-path style as the caller's instance guard; runs
+            // before that guard, so device objects die before the instance does. The
+            // idle wait keeps an in-flight submission from racing object destruction.
+            const ScopeGuard destroyDeviceObjects([&]() {
+                if (fenceWaitTimedOut) {
+                    // The probe fence never signaled within its timeout, so the
+                    // submission may still be executing - or the GPU is hung.
+                    // vkDeviceWaitIdle could then block forever and destroying
+                    // in-flight objects is undefined, so the probe deliberately
+                    // leaks the device objects (device, pools, fence): a hung
+                    // GPU must not hang the POST.
+                    return;
+                }
+                vkDeviceWaitIdleFn(device);
+                if (fence != VK_NULL_HANDLE) {
+                    vkDestroyFenceFn(device, fence, nullptr);
+                }
+                if (queryPool != VK_NULL_HANDLE) {
+                    vkDestroyQueryPoolFn(device, queryPool, nullptr);
+                }
+                if (commandPool != VK_NULL_HANDLE) {
+                    vkDestroyCommandPoolFn(device, commandPool, nullptr);
+                }
+                vkDestroyDeviceFn(device, nullptr);
+            });
+
+            VkQueue queue = VK_NULL_HANDLE;
+            vkGetDeviceQueueFn(device, graphicsQueueFamilyIndex, 0, &queue);
+            if (queue == VK_NULL_HANDLE) {
+                fail("vkGetDeviceQueue returned a null graphics queue");
+                return;
+            }
+
+            VkCommandPoolCreateInfo poolInfo{};
+            poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            poolInfo.queueFamilyIndex = graphicsQueueFamilyIndex;
+            result = vkCreateCommandPoolFn(device, &poolInfo, nullptr, &commandPool);
+            if (result != VK_SUCCESS) {
+                fail(format("vkCreateCommandPool failed (VkResult = {})", static_cast<Int>(result)));
+                return;
+            }
+
+            VkCommandBufferAllocateInfo allocInfo{};
+            allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            allocInfo.commandPool = commandPool;
+            allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            allocInfo.commandBufferCount = 1;
+            VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+            result = vkAllocateCommandBuffersFn(device, &allocInfo, &commandBuffer);
+            if (result != VK_SUCCESS) {
+                fail(format("vkAllocateCommandBuffers failed (VkResult = {})", static_cast<Int>(result)));
+                return;
+            }
+
+            VkQueryPoolCreateInfo queryPoolInfo{};
+            queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            queryPoolInfo.queryCount = 2;
+            result = vkCreateQueryPoolFn(device, &queryPoolInfo, nullptr, &queryPool);
+            if (result != VK_SUCCESS) {
+                fail(format("vkCreateQueryPool failed (VkResult = {})", static_cast<Int>(result)));
+                return;
+            }
+
+            VkCommandBufferBeginInfo beginInfo{};
+            beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            result = vkBeginCommandBufferFn(commandBuffer, &beginInfo);
+            if (result != VK_SUCCESS) {
+                fail(format("vkBeginCommandBuffer failed (VkResult = {})", static_cast<Int>(result)));
+                return;
+            }
+            vkCmdResetQueryPoolFn(commandBuffer, queryPool, 0, 2);
+            vkCmdWriteTimestampFn(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, 0);
+            vkCmdWriteTimestampFn(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, 1);
+            result = vkEndCommandBufferFn(commandBuffer);
+            if (result != VK_SUCCESS) {
+                fail(format("vkEndCommandBuffer failed (VkResult = {})", static_cast<Int>(result)));
+                return;
+            }
+
+            VkFenceCreateInfo fenceInfo{};
+            fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            result = vkCreateFenceFn(device, &fenceInfo, nullptr, &fence);
+            if (result != VK_SUCCESS) {
+                fail(format("vkCreateFence failed (VkResult = {})", static_cast<Int>(result)));
+                return;
+            }
+
+            VkSubmitInfo submitInfo{};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &commandBuffer;
+            result = vkQueueSubmitFn(queue, 1, &submitInfo, fence);
+            if (result != VK_SUCCESS) {
+                fail(format("vkQueueSubmit failed (VkResult = {})", static_cast<Int>(result)));
+                return;
+            }
+
+            constexpr Uint64 FenceTimeoutNs = 5'000'000'000ull; // 5 s: a POST must never hang the launcher
+            result = vkWaitForFencesFn(device, 1, &fence, VK_TRUE, FenceTimeoutNs);
+            if (result != VK_SUCCESS) {
+                // Skip the teardown idle wait too (see the scope guard): the
+                // submission is still pending on a possibly-hung GPU.
+                fenceWaitTimedOut = true;
+                fail(format("vkWaitForFences did not signal within 5 s (VkResult = {})",
+                            static_cast<Int>(result)));
+                return;
+            }
+
+            Uint64 timestamps[2] = {0, 0};
+            result = vkGetQueryPoolResultsFn(device, queryPool, 0, 2, sizeof(timestamps), timestamps,
+                                             sizeof(Uint64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            if (result != VK_SUCCESS) {
+                fail(format("vkGetQueryPoolResults failed (VkResult = {})", static_cast<Int>(result)));
+                return;
+            }
+
+            const Uint64 validMask =
+                timestampValidBits >= 64 ? ~0ull : ((1ull << timestampValidBits) - 1ull);
+            const Uint64 t0 = timestamps[0] & validMask;
+            const Uint64 t1 = timestamps[1] & validMask;
+            if (t1 < t0) {
+                fail(format("timestamps are not monotonic (t0 = {}, t1 = {})", t0, t1));
+                return;
+            }
+            const Uint64 elapsedNs =
+                static_cast<Uint64>(static_cast<Double>(t1 - t0) * static_cast<Double>(timestampPeriod));
+            builder.Pass("Timer queries",
+                         timestampFacts +
+                             format("; timer query functional (t1 >= t0, probe observed {} ns)", elapsedNs) +
+                             disabledNote);
+        }
+
+        // Everything the "MobileGL reported ..." rows need from the Vulkan device probe.
+        struct VulkanProbeSummary {
+            Bool devicePropsValid = false;
+            String deviceName;
+            String apiVersionString;
+            String driverVersionString; // raw hex, vendor-encoded (see RunVulkanDriverPost)
+            Bool shaderSubgroupUsable = false;
+            Bool timerQueriesSupported = false;
+            Bool samplerAnisotropySupported = false;
+        };
+    } // namespace
+
+    // The Vulkan device probe proper. Split out of RunVulkanDriverPost so that the
+    // "MobileGL reported ..." rows are appended on every path (including early
+    // probe failures) before the report is finalized.
+    //
+    // The loader bring-up chain (dlopen, instance API version, vkCreateInstance) is one
+    // "Vulkan instance" row, and the two required surface instance extensions are one
+    // "Surface extensions" row. Details carry every sub-fact of the old per-stage rows:
+    // PASS enumerates each stage's result (and each extension's presence), FAIL lists
+    // the stages that completed and then names the exact stage that broke (or states
+    // per extension whether it is present or missing) with the stage detail strings.
+    static void ProbeVulkanDriver(ReportBuilder& builder, VulkanProbeSummary& summary) {
+        String instanceChain;
+        const auto instanceStageDone = [&](const String& description) {
+            if (!instanceChain.empty()) {
+                instanceChain += "; ";
+            }
+            instanceChain += description;
+        };
+        const auto failInstanceStage = [&](const String& stage, const String& detail) {
+            builder.Fail("Vulkan instance",
+                         (instanceChain.empty() ? "" : instanceChain + "; but ") + stage + ": " + detail);
+        };
+
+        void* loaderLibrary = OpenVulkanLoaderLibrary();
+        if (loaderLibrary == nullptr) {
+            failInstanceStage("Vulkan loader", "libvulkan.so could not be loaded; no Vulkan loader on this device");
+            return;
+        }
+        const auto getInstanceProcAddr =
+            reinterpret_cast<PFN_vkGetInstanceProcAddr>(VulkanLoaderSymbol(loaderLibrary, "vkGetInstanceProcAddr"));
+        if (getInstanceProcAddr == nullptr) {
+            failInstanceStage("Vulkan loader", "vkGetInstanceProcAddr is missing from the Vulkan loader library");
+            return;
+        }
+        instanceStageDone("Vulkan loader library loaded and vkGetInstanceProcAddr resolved");
+
+        const auto vkCreateInstanceFn =
+            reinterpret_cast<PFN_vkCreateInstance>(getInstanceProcAddr(nullptr, "vkCreateInstance"));
+        const auto vkEnumerateInstanceVersionFn = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
+            getInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion"));
+        const auto vkEnumerateInstanceExtensionPropertiesFn =
+            reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                getInstanceProcAddr(nullptr, "vkEnumerateInstanceExtensionProperties"));
+
+        Uint32 instanceApiVersion = VK_API_VERSION_1_0;
+        if (vkEnumerateInstanceVersionFn != nullptr) {
+            vkEnumerateInstanceVersionFn(&instanceApiVersion);
+        }
+        if (vkCreateInstanceFn == nullptr || vkEnumerateInstanceVersionFn == nullptr ||
+            instanceApiVersion < VK_API_VERSION_1_1) {
+            failInstanceStage("Instance API version",
+                              format("instance API {} (< 1.1); the DirectVulkan backend requires a Vulkan 1.1 "
+                                     "instance",
+                                     VkApiVersionToString(instanceApiVersion)));
+            return;
+        }
+        instanceStageDone(format("instance API {}", VkApiVersionToString(instanceApiVersion)));
+
+        Vector<VkExtensionProperties> instanceExtensions;
+        if (vkEnumerateInstanceExtensionPropertiesFn != nullptr) {
+            Uint32 extensionCount = 0;
+            if (vkEnumerateInstanceExtensionPropertiesFn(nullptr, &extensionCount, nullptr) == VK_SUCCESS &&
+                extensionCount > 0) {
+                instanceExtensions.resize(extensionCount);
+                if (vkEnumerateInstanceExtensionPropertiesFn(nullptr, &extensionCount, instanceExtensions.data()) ==
+                    VK_SUCCESS) {
+                    instanceExtensions.resize(extensionCount);
+                } else {
+                    instanceExtensions.clear();
+                }
+            }
+        }
+        // One row for the required surface instance extensions; the detail states each
+        // extension's presence individually, and a missing one carries the "required
+        // instance extension" fact plus its consequence from the old per-extension rows.
+        {
+            String surfaceDetail;
+            Bool anySurfaceExtensionMissing = false;
+            const auto recordExtension = [&](const char* name, const char* consequence) {
+                if (!surfaceDetail.empty()) {
+                    surfaceDetail += "; ";
+                }
+                if (HasVkExtension(instanceExtensions, name)) {
+                    surfaceDetail += format("{} instance extension present", name);
+                } else {
+                    anySurfaceExtensionMissing = true;
+                    surfaceDetail += format("{} missing (required instance extension; {})", name, consequence);
+                }
+            };
+            recordExtension(VK_KHR_SURFACE_EXTENSION_NAME, "on-screen rendering is impossible");
+#if defined(VK_USE_PLATFORM_ANDROID_KHR)
+            recordExtension(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME, "ANativeWindow surfaces cannot be created");
+#endif
+            if (anySurfaceExtensionMissing) {
+                builder.Fail("Surface extensions", surfaceDetail);
+            } else {
+                builder.Pass("Surface extensions", surfaceDetail);
+            }
+        }
+
+        // The probe never creates a surface, so the instance is created without extensions.
+        VkApplicationInfo appInfo{};
+        appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+        appInfo.pApplicationName = "MobileGL Driver POST";
+        appInfo.pEngineName = "MobileGL";
+        appInfo.apiVersion = VK_API_VERSION_1_1;
+
+        VkInstanceCreateInfo instanceInfo{};
+        instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        instanceInfo.pApplicationInfo = &appInfo;
+
+        VkInstance instance = VK_NULL_HANDLE;
+        const VkResult createResult = vkCreateInstanceFn(&instanceInfo, nullptr, &instance);
+        if (createResult != VK_SUCCESS || instance == VK_NULL_HANDLE) {
+            failInstanceStage("Vulkan instance creation",
+                              format("vkCreateInstance failed (VkResult = {})", static_cast<Int>(createResult)));
+            return;
+        }
+        instanceStageDone("Vulkan 1.1 instance created");
+        builder.Pass("Vulkan instance", instanceChain);
+
+        const auto vkDestroyInstanceFn =
+            reinterpret_cast<PFN_vkDestroyInstance>(getInstanceProcAddr(instance, "vkDestroyInstance"));
+        const auto vkEnumeratePhysicalDevicesFn = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+            getInstanceProcAddr(instance, "vkEnumeratePhysicalDevices"));
+        const auto vkGetPhysicalDevicePropertiesFn = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+            getInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties"));
+        const auto vkGetPhysicalDeviceQueueFamilyPropertiesFn =
+            reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+                getInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+        const auto vkGetPhysicalDeviceFeaturesFn = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(
+            getInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures"));
+        const auto vkEnumerateDeviceExtensionPropertiesFn =
+            reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+                getInstanceProcAddr(instance, "vkEnumerateDeviceExtensionProperties"));
+        const auto vkGetPhysicalDeviceFeatures2Fn = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+            getInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2"));
+        const auto vkGetPhysicalDeviceProperties2Fn = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            getInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties2"));
+        const auto vkGetPhysicalDeviceFormatPropertiesFn =
+            reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
+                getInstanceProcAddr(instance, "vkGetPhysicalDeviceFormatProperties"));
+
+        // The instance is destroyed from a scope guard so it is released on every early-return
+        // path and even if a String/format allocation throws while report rows are being built.
+        const ScopeGuard destroyInstance([&]() {
+            if (vkDestroyInstanceFn != nullptr) {
+                vkDestroyInstanceFn(instance, nullptr);
+            }
+        });
+
+        if (vkEnumeratePhysicalDevicesFn == nullptr || vkGetPhysicalDevicePropertiesFn == nullptr ||
+            vkGetPhysicalDeviceQueueFamilyPropertiesFn == nullptr || vkGetPhysicalDeviceFeaturesFn == nullptr ||
+            vkEnumerateDeviceExtensionPropertiesFn == nullptr) {
+            builder.Fail("Vulkan core entry points",
+                         "vkGetInstanceProcAddr could not resolve required Vulkan 1.0 functions");
+            return;
+        }
+
+        // Device discovery (physical device enumeration, graphics queue selection, device
+        // API version) is one "Graphics device" row; FAIL names the failing stage.
+        Uint32 deviceCount = 0;
+        const VkResult countResult = vkEnumeratePhysicalDevicesFn(instance, &deviceCount, nullptr);
+        if (countResult != VK_SUCCESS) {
+            builder.Fail("Graphics device", format("vkEnumeratePhysicalDevices failed (VkResult = {})",
+                                                   static_cast<Int>(countResult)));
+            return;
+        }
+        if (deviceCount == 0) {
+            builder.Fail("Graphics device", "no Vulkan physical devices found");
+            return;
+        }
+        builder.report.available = true;
+        Vector<VkPhysicalDevice> devices(deviceCount);
+        const VkResult enumerateResult = vkEnumeratePhysicalDevicesFn(instance, &deviceCount, devices.data());
+        if (enumerateResult != VK_SUCCESS) {
+            builder.Fail("Graphics device", format("vkEnumeratePhysicalDevices failed (VkResult = {})",
+                                                   static_cast<Int>(enumerateResult)));
+            return;
+        }
+        devices.resize(deviceCount);
+
+        VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+        Uint32 graphicsQueueFamilyIndex = 0;
+        Uint32 graphicsQueueTimestampValidBits = 0;
+        for (VkPhysicalDevice candidate : devices) {
+            Uint32 queueFamilyCount = 0;
+            vkGetPhysicalDeviceQueueFamilyPropertiesFn(candidate, &queueFamilyCount, nullptr);
+            Vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+            vkGetPhysicalDeviceQueueFamilyPropertiesFn(candidate, &queueFamilyCount, queueFamilies.data());
+            for (Uint32 familyIndex = 0; familyIndex < queueFamilyCount; ++familyIndex) {
+                const VkQueueFamilyProperties& family = queueFamilies[familyIndex];
+                if (family.queueCount > 0 && (family.queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+                    physicalDevice = candidate;
+                    graphicsQueueFamilyIndex = familyIndex;
+                    graphicsQueueTimestampValidBits = family.timestampValidBits;
+                    break;
+                }
+            }
+            if (physicalDevice != VK_NULL_HANDLE) {
+                break;
+            }
+        }
+        if (physicalDevice == VK_NULL_HANDLE) {
+            builder.Fail("Graphics device",
+                         format("none of the {} physical device(s) exposes a graphics queue family", deviceCount));
+            return;
+        }
+
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDevicePropertiesFn(physicalDevice, &properties);
+
+        // driverVersion is vendor-encoded (each vendor packs its own bit layout), so it is
+        // reported as raw hex instead of being decoded with the VK_VERSION_* macros.
+        const String driverVersionString = format("0x{:08x}", properties.driverVersion);
+        builder.report.rendererInfo = format("{} (Vulkan {}, driver {})", String(properties.deviceName),
+                                             VkApiVersionToString(properties.apiVersion), driverVersionString);
+        summary.devicePropsValid = true;
+        summary.deviceName = String(properties.deviceName);
+        summary.apiVersionString = VkApiVersionToString(properties.apiVersion);
+        summary.driverVersionString = driverVersionString;
+
+        // The chosen-device facts (name, enumeration count, graphics queue) ride along
+        // on both outcomes so the device API verdict never hides them.
+        const String deviceFacts =
+            format("{} ({} device(s) enumerated, picked the first with a graphics queue); "
+                   "graphics queue family present",
+                   String(properties.deviceName), deviceCount);
+        if (properties.apiVersion >= VK_API_VERSION_1_1) {
+            builder.Pass("Graphics device",
+                         deviceFacts +
+                             format("; device API Vulkan {}", VkApiVersionToString(properties.apiVersion)));
+        } else {
+            builder.Fail("Graphics device",
+                         deviceFacts + format("; but Device API version: Vulkan {} (< 1.1); the DirectVulkan "
+                                              "backend requires a Vulkan 1.1 device",
+                                              VkApiVersionToString(properties.apiVersion)));
+        }
+
+        EvaluateVertexAttribLimit(builder, static_cast<Int>(properties.limits.maxVertexInputAttributes),
+                                  "Vertex attributes", "maxVertexInputAttributes");
+
+        Vector<VkExtensionProperties> deviceExtensions;
+        Uint32 deviceExtensionCount = 0;
+        if (vkEnumerateDeviceExtensionPropertiesFn(physicalDevice, nullptr, &deviceExtensionCount, nullptr) ==
+                VK_SUCCESS &&
+            deviceExtensionCount > 0) {
+            deviceExtensions.resize(deviceExtensionCount);
+            if (vkEnumerateDeviceExtensionPropertiesFn(physicalDevice, nullptr, &deviceExtensionCount,
+                                                       deviceExtensions.data()) == VK_SUCCESS) {
+                deviceExtensions.resize(deviceExtensionCount);
+            } else {
+                deviceExtensions.clear();
+            }
+        }
+        if (HasVkExtension(deviceExtensions, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
+            builder.Pass("VK_KHR_swapchain", "device extension present");
+        } else {
+            builder.Fail("VK_KHR_swapchain", "required device extension missing; presentation is impossible");
+        }
+
+        VkPhysicalDeviceFeatures features{};
+        vkGetPhysicalDeviceFeaturesFn(physicalDevice, &features);
+        summary.samplerAnisotropySupported = features.samplerAnisotropy == VK_TRUE;
+        if (features.multiDrawIndirect == VK_TRUE) {
+            builder.Pass("multiDrawIndirect", "indirect multi-draw batches run as single native commands");
+        } else {
+            builder.Warn("multiDrawIndirect",
+                         "unsupported; indirect multi-draw batches fall back to one draw per command");
+        }
+        if (features.drawIndirectFirstInstance == VK_TRUE) {
+            builder.Pass("drawIndirectFirstInstance", "indirect commands may carry a non-zero firstInstance");
+        } else {
+            builder.Warn("drawIndirectFirstInstance",
+                         "unsupported; indirect commands with a non-zero baseInstance cannot run natively");
+        }
+        if (features.vertexPipelineStoresAndAtomics == VK_TRUE) {
+            builder.Pass("vertexPipelineStoresAndAtomics",
+                         "supported by driver (not currently enabled by the DirectVulkan backend)");
+        } else {
+            builder.Warn("vertexPipelineStoresAndAtomics",
+                         "unsupported; shaders that write storage buffers from the vertex stage will not work");
+        }
+        if (features.fillModeNonSolid == VK_TRUE) {
+            builder.Pass("fillModeNonSolid", "glPolygonMode GL_LINE/GL_POINT rasterization supported");
+        } else {
+            builder.Warn("fillModeNonSolid",
+                         "unsupported; glPolygonMode GL_LINE/GL_POINT falls back to GL_FILL (no wireframe/point "
+                         "rasterization)");
+        }
+        if (features.independentBlend == VK_TRUE) {
+            builder.Pass("independentBlend", "per-draw-buffer glColorMaski and indexed blend state supported");
+        } else {
+            builder.Warn("independentBlend",
+                         "unsupported; per-draw-buffer glColorMaski falls back to draw buffer 0 for all attachments");
+        }
+        if (features.dualSrcBlend == VK_TRUE) {
+            builder.Pass("dualSrcBlend", "GL_SRC1_* dual-source blend factors supported");
+        } else {
+            builder.Warn("dualSrcBlend", "unsupported; GL_SRC1_* dual-source blend factors hard-fail at draw");
+        }
+
+        Bool shaderDrawParameters = false;
+        if (vkGetPhysicalDeviceFeatures2Fn != nullptr && properties.apiVersion >= VK_API_VERSION_1_1) {
+            VkPhysicalDeviceShaderDrawParametersFeatures drawParametersFeatures{};
+            drawParametersFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES;
+            VkPhysicalDeviceFeatures2 features2{};
+            features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            features2.pNext = &drawParametersFeatures;
+            vkGetPhysicalDeviceFeatures2Fn(physicalDevice, &features2);
+            shaderDrawParameters = drawParametersFeatures.shaderDrawParameters == VK_TRUE;
+        } else if (HasVkExtension(deviceExtensions, VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME)) {
+            // Vulkan 1.0 device: the extension alone exposes the SPIR-V DrawParameters capability.
+            shaderDrawParameters = true;
+        }
+        if (shaderDrawParameters) {
+            builder.Pass("shaderDrawParameters", "gl_DrawID/gl_BaseVertex/gl_BaseInstance shaders supported");
+        } else {
+            builder.Warn("shaderDrawParameters",
+                         "unavailable; shaders using gl_DrawID/gl_BaseInstance will not work");
+        }
+
+        Bool primitiveTopologyListRestart = false;
+        if (vkGetPhysicalDeviceFeatures2Fn != nullptr &&
+            HasVkExtension(deviceExtensions, VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME)) {
+            VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT listRestartFeatures{};
+            listRestartFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT;
+            VkPhysicalDeviceFeatures2 features2{};
+            features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            features2.pNext = &listRestartFeatures;
+            vkGetPhysicalDeviceFeatures2Fn(physicalDevice, &features2);
+            primitiveTopologyListRestart = listRestartFeatures.primitiveTopologyListRestart == VK_TRUE;
+        }
+        if (primitiveTopologyListRestart) {
+            builder.Pass("primitiveTopologyListRestart",
+                         "primitive restart supported on list topologies (GL_PRIMITIVE_RESTART)");
+        } else {
+            builder.Warn("primitiveTopologyListRestart",
+                         "unsupported; primitive restart works on strip/fan topologies only, list-topology restart "
+                         "hard-fails at draw");
+        }
+
+        if (vkGetPhysicalDeviceProperties2Fn != nullptr && properties.apiVersion >= VK_API_VERSION_1_1) {
+            VkPhysicalDeviceSubgroupProperties subgroupProperties{};
+            subgroupProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+            VkPhysicalDeviceProperties2 properties2{};
+            properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            properties2.pNext = &subgroupProperties;
+            vkGetPhysicalDeviceProperties2Fn(physicalDevice, &properties2);
+            const Bool subgroupUsable = subgroupProperties.subgroupSize > 0 &&
+                                        (subgroupProperties.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+                                        (subgroupProperties.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) != 0;
+            // Same usability rule as the Vulkan capability loader's
+            // HasUsableShaderSubgroupSupport, which feeds the GL_KHR_shader_subgroup
+            // advertisement of the real backend.
+            summary.shaderSubgroupUsable = subgroupUsable;
+            if (subgroupUsable) {
+                builder.Pass("Compute shader subgroup",
+                             format("basic subgroup operations in compute, subgroup size {}",
+                                    subgroupProperties.subgroupSize));
+            } else {
+                builder.Warn("Compute shader subgroup",
+                             "basic subgroup operations are not usable from compute shaders");
+            }
+        } else {
+            builder.Warn("Compute shader subgroup", "subgroup properties could not be queried");
+        }
+
+        if (HasVkExtension(deviceExtensions, VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME)) {
+            builder.Pass("VK_KHR_draw_indirect_count",
+                         "supported (count-buffer indirect draws run as single native "
+                         "vkCmdDraw*IndirectCount commands)");
+        } else {
+            builder.Warn("VK_KHR_draw_indirect_count",
+                         "not supported; count-buffer indirect draws (glMultiDraw*IndirectCount) fall "
+                         "back to a CPU readback of the parameter buffer and one draw per command");
+        }
+        const Bool indexTypeUint8 = HasVkExtension(deviceExtensions, VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME) ||
+                                    HasVkExtension(deviceExtensions, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
+        if (indexTypeUint8) {
+            builder.Pass("Index type uint8", "supported (native GL_UNSIGNED_BYTE index buffers)");
+        } else {
+            builder.Warn("Index type uint8",
+                         "not supported; GL_UNSIGNED_BYTE index buffers cannot be drawn (the backend "
+                         "has no conversion fallback and asserts on uint8 index draws)");
+        }
+        builder.DriverReported("Backend driver reported device", String(properties.deviceName));
+        builder.DriverReported("Backend driver reported driver version", driverVersionString + " (vendor-encoded)");
+
+        // Single "Timer queries" row: timestampValidBits, timestampPeriod, and the
+        // functional timestamp probe fold into one combined verdict whose detail
+        // always states the validBits and period values; the
+        // MOBILEGL_DISABLE_TIMERQUERY note is appended to the same row.
+        const Float timestampPeriod = properties.limits.timestampPeriod;
+        // Same support rule as VulkanRenderer::CreateLogicalDeviceAndQueues
+        // (m_timerQuerySupported): usable timer queries need valid timestamp bits on
+        // the graphics queue family and a non-zero tick period.
+        summary.timerQueriesSupported = graphicsQueueTimestampValidBits > 0 && timestampPeriod > 0.0f;
+        if (graphicsQueueTimestampValidBits > 0) {
+            ProbeVulkanTimerQuery(builder, getInstanceProcAddr, instance, physicalDevice,
+                                  graphicsQueueFamilyIndex, graphicsQueueTimestampValidBits, timestampPeriod);
+        } else {
+            builder.Warn("Timer queries",
+                         format("timestampValidBits = 0 on the graphics queue family; timestampPeriod = {} ns "
+                                "per tick; timestamps unsupported on the graphics queue; timer queries "
+                                "unavailable",
+                                timestampPeriod) +
+                             TimerQueryDisabledNote());
+        }
+        if (vkGetPhysicalDeviceFormatPropertiesFn != nullptr) {
+            MG_External::VulkanCapabilities formatProbeCapabilities{};
+            BackendLoader::FillInVulkanCapabilities(formatProbeCapabilities, properties);
+            builder.report.formatCapabilities.emplace();
+            MG_Backend::DirectVulkan::PopulateFormatCapabilities(
+                physicalDevice, vkGetPhysicalDeviceFormatPropertiesFn, formatProbeCapabilities,
+                builder.report.formatCapabilities.value());
+        }
+    }
+
+    BackendPostReport RunVulkanDriverPost() {
+        MGLOG_I("Driver POST: probing the device Vulkan driver");
+        ReportBuilder builder;
+        VulkanProbeSummary summary;
+        ProbeVulkanDriver(builder, summary);
+
+        // "MobileGL reported ..." rows: what applications running on the DirectVulkan
+        // backend (Magma) would see. The backend API version string reuses the exact
+        // GetBackendAPIVersionString format, fed with the strings this probe collected
+        // (so the driver version appears in the probe's raw vendor-encoded hex form);
+        // the extension list is built by the same helper the real backend uses.
+        Optional<String> backendApiVersionString;
+        Optional<String> advertisedExtensions;
+        if (summary.devicePropsValid) {
+            backendApiVersionString = MG_Backend::DirectVulkan::FormatBackendAPIVersionString(
+                summary.deviceName, summary.apiVersionString, summary.driverVersionString);
+            advertisedExtensions = JoinAdvertisedExtensions(MG_Backend::DirectVulkan::BuildAdvertisedExtensions(
+                summary.shaderSubgroupUsable, summary.timerQueriesSupported, summary.samplerAnisotropySupported));
+        }
+        AppendMobileGLReportedRows(builder, MG_Backend::DirectVulkan::GetRendererIdentity(), backendApiVersionString,
+                                   advertisedExtensions);
+
+        builder.Finalize();
+        MGLOG_I("Driver POST: Vulkan verdict = %s", builder.report.verdict.c_str());
+        return builder.report;
+    }
+} // namespace MobileGL::MG_Util::SelfTest

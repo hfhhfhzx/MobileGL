@@ -7,6 +7,7 @@
 // End of Source File Header
 
 #include "Core.h"
+#include <EGL/eglext.h>
 
 namespace MobileGL {
     namespace MG_State {
@@ -223,6 +224,8 @@ namespace MobileGL {
                     return;
                 }
 
+                const EGLSurfaceHandle drawSurface = currentIt->second.DrawSurface;
+                const EGLSurfaceHandle readSurface = currentIt->second.ReadSurface;
                 const EGLContextHandle context = currentIt->second.Context;
                 if (context != nullptr) {
                     auto ownerIt = m_contextOwners.find(context);
@@ -231,6 +234,29 @@ namespace MobileGL {
                     }
                 }
                 m_threadCurrents.erase(currentIt);
+                DestroyPendingSurfaceIfUnused(drawSurface);
+                DestroyPendingSurfaceIfUnused(readSurface);
+            }
+
+            Bool EGLContext::IsSurfaceCurrentUnlocked(EGLSurfaceHandle surface) const {
+                if (surface == EGL_NO_SURFACE) {
+                    return false;
+                }
+                for (const auto& current : m_threadCurrents) {
+                    if (current.second.DrawSurface == surface || current.second.ReadSurface == surface) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            void EGLContext::DestroyPendingSurfaceIfUnused(EGLSurfaceHandle surface) {
+                auto surfaceIt = m_surfaces.find(surface);
+                if (surfaceIt == m_surfaces.end() || !surfaceIt->second.DestroyPending ||
+                    IsSurfaceCurrentUnlocked(surface)) {
+                    return;
+                }
+                m_surfaces.erase(surfaceIt);
             }
 
             void EGLContext::ReleaseDisplayObjects(EGLDisplayHandle display) {
@@ -608,6 +634,35 @@ namespace MobileGL {
                 if (auto value = ParseAttribValue(attribList, EGL_CONTEXT_MINOR_VERSION); value) {
                     contextObject.MinorVersion = *value;
                 }
+                if (auto value = ParseAttribValue(attribList, EGL_CONTEXT_OPENGL_PROFILE_MASK); value) {
+                    contextObject.OpenGLProfileMask = *value;
+                }
+                if (auto value = ParseAttribValue(attribList, EGL_CONTEXT_FLAGS_KHR); value) {
+                    contextObject.EGLContextFlags = *value;
+                    if (*value & EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR) {
+                        contextObject.OpenGLContextFlags |= GL_CONTEXT_FLAG_FORWARD_COMPATIBLE_BIT;
+                    }
+                    if (*value & EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR) {
+                        contextObject.OpenGLContextFlags |= GL_CONTEXT_FLAG_DEBUG_BIT;
+                    }
+                    if (*value & EGL_CONTEXT_OPENGL_ROBUST_ACCESS_BIT_KHR) {
+                        contextObject.OpenGLContextFlags |= GL_CONTEXT_FLAG_ROBUST_ACCESS_BIT;
+                    }
+                }
+                if (auto value = ParseAttribValue(attribList, EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE);
+                    value && *value == EGL_TRUE) {
+                    contextObject.EGLContextFlags |= EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR;
+                    contextObject.OpenGLContextFlags |= GL_CONTEXT_FLAG_FORWARD_COMPATIBLE_BIT;
+                }
+                if (auto value = ParseAttribValue(attribList, EGL_CONTEXT_OPENGL_DEBUG); value && *value == EGL_TRUE) {
+                    contextObject.EGLContextFlags |= EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR;
+                    contextObject.OpenGLContextFlags |= GL_CONTEXT_FLAG_DEBUG_BIT;
+                }
+                if (auto value = ParseAttribValue(attribList, EGL_CONTEXT_OPENGL_ROBUST_ACCESS);
+                    value && *value == EGL_TRUE) {
+                    contextObject.EGLContextFlags |= EGL_CONTEXT_OPENGL_ROBUST_ACCESS_BIT_KHR;
+                    contextObject.OpenGLContextFlags |= GL_CONTEXT_FLAG_ROBUST_ACCESS_BIT;
+                }
 
                 const auto context = EncodeHandle<EGLContextHandle>(m_nextContextHandle++);
                 m_contexts[context] = contextObject;
@@ -665,6 +720,9 @@ namespace MobileGL {
                 case EGL_CONTEXT_MINOR_VERSION:
                     *value = contextObject->MinorVersion;
                     return true;
+                case EGL_CONTEXT_FLAGS_KHR:
+                    *value = contextObject->EGLContextFlags;
+                    return true;
                 case EGL_CONFIG_ID: {
                     const auto* cfg = TryGetConfig(contextObject->Config);
                     if (!cfg) {
@@ -689,6 +747,45 @@ namespace MobileGL {
                 const std::lock_guard<std::recursive_mutex> lock(m_mutex);
                 const auto* ctx = TryGetContext(context);
                 return ctx && ctx->Display == display;
+            }
+
+            Bool EGLContext::IsCurrentContextOpenGLCoreProfile() const {
+                const std::lock_guard<std::recursive_mutex> lock(m_mutex);
+                auto currentIt = m_threadCurrents.find(CurrentThreadKey());
+                if (currentIt == m_threadCurrents.end()) {
+                    return false;
+                }
+                const auto* ctx = TryGetContext(currentIt->second.Context);
+                if (!ctx || ctx->ClientAPI != EGL_OPENGL_API ||
+                    (ctx->OpenGLProfileMask & EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT)) {
+                    return false;
+                }
+                return (ctx->OpenGLProfileMask & EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT) ||
+                       ctx->MajorVersion > 3 || (ctx->MajorVersion == 3 && ctx->MinorVersion >= 1);
+            }
+
+            Bool EGLContext::IsCurrentContextOpenGLCompatibilityProfile() const {
+                const std::lock_guard<std::recursive_mutex> lock(m_mutex);
+                auto currentIt = m_threadCurrents.find(CurrentThreadKey());
+                if (currentIt == m_threadCurrents.end()) {
+                    return false;
+                }
+                const auto* ctx = TryGetContext(currentIt->second.Context);
+                // Affirmative check: true only when the host explicitly requested the
+                // compatibility bit. Attrib-less contexts report false and thus read as core
+                // for GL_CONTEXT_PROFILE_MASK (EGL defaults 3.x contexts to the core profile).
+                return ctx && ctx->ClientAPI == EGL_OPENGL_API &&
+                       (ctx->OpenGLProfileMask & EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT);
+            }
+
+            EGLint EGLContext::GetCurrentContextFlags() const {
+                const std::lock_guard<std::recursive_mutex> lock(m_mutex);
+                auto currentIt = m_threadCurrents.find(CurrentThreadKey());
+                if (currentIt == m_threadCurrents.end()) {
+                    return 0;
+                }
+                const auto* ctx = TryGetContext(currentIt->second.Context);
+                return ctx ? ctx->OpenGLContextFlags : 0;
             }
 
             EGLContext::EGLSurfaceHandle EGLContext::CreateWindowSurface(EGLDisplayHandle display,
@@ -914,24 +1011,28 @@ namespace MobileGL {
                     return false;
                 }
 
-                for (auto currentIt = m_threadCurrents.begin(); currentIt != m_threadCurrents.end();) {
-                    if (currentIt->second.DrawSurface == surface) {
-                        currentIt->second.DrawSurface = EGL_NO_SURFACE;
-                    }
-                    if (currentIt->second.ReadSurface == surface) {
-                        currentIt->second.ReadSurface = EGL_NO_SURFACE;
-                    }
-
-                    const Bool emptyCurrent = currentIt->second.Context == nullptr &&
-                                              currentIt->second.DrawSurface == EGL_NO_SURFACE &&
-                                              currentIt->second.ReadSurface == EGL_NO_SURFACE;
-                    if (emptyCurrent) {
-                        currentIt = m_threadCurrents.erase(currentIt);
-                        continue;
-                    }
-                    ++currentIt;
+                if (IsSurfaceCurrentUnlocked(surface)) {
+                    surfaceIt->second.DestroyPending = true;
+                    return true;
                 }
                 m_surfaces.erase(surfaceIt);
+                return true;
+            }
+
+            Bool EGLContext::ResizeSurface(EGLDisplayHandle display, EGLSurfaceHandle surface,
+                                           EGLint width, EGLint height) {
+                const std::lock_guard<std::recursive_mutex> lock(m_mutex);
+                auto surfaceIt = m_surfaces.find(surface);
+                if (surfaceIt == m_surfaces.end()) {
+                    SetError(EGL_BAD_SURFACE);
+                    return false;
+                }
+                if (surfaceIt->second.Display != display) {
+                    SetError(EGL_BAD_MATCH);
+                    return false;
+                }
+                surfaceIt->second.Width = std::max<EGLint>(width, 1);
+                surfaceIt->second.Height = std::max<EGLint>(height, 1);
                 return true;
             }
 
@@ -1037,9 +1138,20 @@ namespace MobileGL {
                                          EGLContextHandle context) {
                 const std::lock_guard<std::recursive_mutex> lock(m_mutex);
                 const Bool releaseCurrentRequest =
-                    display == EGL_NO_DISPLAY && draw == EGL_NO_SURFACE && read == EGL_NO_SURFACE && context == nullptr;
+                    draw == EGL_NO_SURFACE && read == EGL_NO_SURFACE && context == nullptr;
                 const auto threadKey = CurrentThreadKey();
                 if (releaseCurrentRequest) {
+                    if (display != EGL_NO_DISPLAY) {
+                        auto* displayObject = TryGetDisplay(display);
+                        if (!displayObject) {
+                            SetError(EGL_BAD_DISPLAY);
+                            return false;
+                        }
+                        if (!displayObject->Initialized) {
+                            SetError(EGL_NOT_INITIALIZED);
+                            return false;
+                        }
+                    }
                     ReleaseThreadUnlocked(threadKey);
                     return true;
                 }

@@ -9,6 +9,7 @@
 #include "ProgramFactory.h"
 
 #include "MG_Backend/DirectVulkan/DirectVulkanResourceState.h"
+#include "MG_Util/ShaderTranspiler/ShaderCompiler.h"
 #include "MG_Util/ShaderTranspiler/SpvcSession.h"
 #include "MG_Util/ShaderTranspiler/Types.h"
 #include <cstring>
@@ -309,6 +310,34 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 }
             }
             return targetEnv;
+        }
+
+        // Cheap raw-word scan for an `OpDecorate <id> BuiltIn InstanceIndex` decoration. Used
+        // only to decide whether to warn when shaderDrawParameters is unavailable; a false
+        // negative merely suppresses a diagnostic.
+        Bool SpirvDeclaresInstanceIndexBuiltin(const Vector<Uint>& spirv) {
+            constexpr Uint32 kSpirvMagicNumber = 0x07230203u;
+            constexpr SizeT kHeaderWordCount = 5;
+            if (spirv.size() <= kHeaderWordCount || spirv[0] != kSpirvMagicNumber) {
+                return false;
+            }
+
+            SizeT wordIndex = kHeaderWordCount;
+            while (wordIndex < spirv.size()) {
+                const Uint32 firstWord = spirv[wordIndex];
+                const Uint32 wordCount = firstWord >> 16;
+                const auto opcode = static_cast<spv::Op>(firstWord & 0xffffu);
+                if (wordCount == 0 || wordIndex + wordCount > spirv.size()) {
+                    break;
+                }
+                if (opcode == spv::Op::OpDecorate && wordCount >= 4 &&
+                    static_cast<spv::Decoration>(spirv[wordIndex + 2]) == spv::Decoration::BuiltIn &&
+                    static_cast<spv::BuiltIn>(spirv[wordIndex + 3]) == spv::BuiltIn::InstanceIndex) {
+                    return true;
+                }
+                wordIndex += wordCount;
+            }
+            return false;
         }
 
         Bool IsInterfaceVariableStaticallyUsed(const Vector<Uint>& spirv, Uint32 spirvId) {
@@ -1637,7 +1666,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
     const ProgramFactory::VkProgramObject& ProgramFactory::GetOrCreateProgram(
         const MG_State::GLState::ProgramObject& program, CompileOptionFlags flags) {
-        const HashType hash = ComputeHash(program, flags);
+        // Hashing the full SPIR-V of every stage is far too expensive to repeat per draw;
+        // reuse the program's memoized hash while its backend state version is unchanged.
+        HashType hash = 0;
+        if (!program.GetBackendHashMemo(flags.GetRaw(), hash)) {
+            hash = ComputeHash(program, flags);
+            program.SetBackendHashMemo(flags.GetRaw(), hash);
+        }
         auto it = m_cache.find(hash);
         if (it != m_cache.end()) {
             return it->second;
@@ -1660,6 +1695,47 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 TransformSpirvForVulkanPositionFix(spv, moduleSpirvs[i], flags);
             } else {
                 moduleSpirvs[i] = spv;
+            }
+
+            // GL apps depend on cross-program position invariance for multi-pass equality
+            // depth tests (MC 26.3's OIT re-draws the cloud geometry with GEQUAL against the
+            // depth its own first pass wrote); decorate Position outputs Invariant so
+            // per-pipeline compilers cannot vary the position math between passes.
+            {
+                Vector<Uint> invariantSpirv;
+                if (MG_Util::ShaderTranspiler::ShaderCompiler::DecoratePositionInvariantForVulkan(
+                        moduleSpirvs[i], invariantSpirv)) {
+                    moduleSpirvs[i] = std::move(invariantSpirv);
+                } else {
+                    MGLOG_W("ProgramFactory: position-invariant decoration failed for program %u; "
+                            "keeping the original module",
+                            program.GetExternalIndex());
+                }
+            }
+
+            // glslang's relaxed-Vulkan mode aliases GL's zero-based gl_InstanceID to Vulkan's
+            // gl_InstanceIndex, which wrongly includes the draw's baseInstance. Rebase vertex-stage
+            // loads to (InstanceIndex - BaseInstance) so shaders observe GL semantics. Reflection
+            // below runs on the rebased words so the added BaseInstance builtin stays consistent.
+            if (shaders[i] && shaders[i]->GetShaderStage() == ShaderStage::Vertex) {
+                if (m_shaderDrawParametersEnabled) {
+                    Vector<Uint> rebasedSpirv;
+                    if (MG_Util::ShaderTranspiler::ShaderCompiler::RebaseInstanceIndexForVulkan(moduleSpirvs[i],
+                                                                                               rebasedSpirv)) {
+                        moduleSpirvs[i] = std::move(rebasedSpirv);
+                    } else {
+                        MGLOG_E("ProgramFactory: failed to rebase gl_InstanceID for program %u; "
+                                "instanced draws with a non-zero baseInstance may render incorrectly",
+                                program.GetExternalIndex());
+                    }
+                } else if (SpirvDeclaresInstanceIndexBuiltin(moduleSpirvs[i])) {
+                    static Bool s_warnedInstanceIndexUnsupported = false;
+                    if (!s_warnedInstanceIndexUnsupported) {
+                        s_warnedInstanceIndexUnsupported = true;
+                        MGLOG_W("ProgramFactory: shaderDrawParameters is unavailable; gl_InstanceID cannot be "
+                                "rebased and instanced draws with a non-zero baseInstance may render incorrectly");
+                    }
+                }
             }
         }
 

@@ -12,9 +12,18 @@
 namespace MobileGL {
     enum class PixelFormatNormalizeOptionBit : Uint {
         NoNorm16 = 1 << 0,
+        NoSnorm16 = 1 << 1,
+        NoRgb16 = 1 << 2,
+        NoSnorm8 = 1 << 3,
+        NoDepthComponent32 = 1 << 4,
+        NoRGBA8Snorm = 1 << 5,
+        NoRGB16Snorm = 1 << 6,
         None = 0,
     };
     namespace MG_Util::TextureFormatProcessor {
+        Flags<PixelFormatNormalizeOptionBit>
+        GetApplicablePixelFormatNormalizeOptions(GLenum internalFormat,
+                                                 Flags<PixelFormatNormalizeOptionBit> options);
         void NormalizePixelFormat(GLenum internalFormat, Flags<PixelFormatNormalizeOptionBit> options,
                                   GLenum* outInternalFormat, GLenum* outFormat, GLenum* outType);
     } // namespace MG_Util::TextureFormatProcessor

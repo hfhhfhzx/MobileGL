@@ -8,14 +8,67 @@
 
 #include "Loader.h"
 #include "MG_Util/Types.h"
+#include <Config.h>
+#if !defined(__WIN32) && !defined(_WIN32)
+#include <dlfcn.h>
+#endif
 
 namespace MobileGL::MG_Util::BackendLoader {
+    static Bool UseAngle() {
+        return MG_Config::Features.UseAngle;
+    }
+
+#if defined(MOBILEGL_TRACE_ANGLE_VARIANTS) && defined(__ANDROID__)
+    static Bool IsTraceAngleLibrary(const String& name) {
+        return name == "libGLESv2_angle.so" || name == "libEGL_angle.so";
+    }
+
+    static Bool IsAllowedTraceAngleVariant(const String& variant) {
+        return variant == "ec889e6ea831" || variant == "90a62123d794";
+    }
+
+    static Bool ResolveTraceAngleLibraryPath(const String& name, String& path) {
+        const String& variant = MG_Config::Features.TraceAngleVariant;
+        if (!IsAllowedTraceAngleVariant(variant)) {
+            MGLOG_F("Rejected trace ANGLE variant '%s'", variant.c_str());
+            return false;
+        }
+
+        Dl_info mobileGlInfo{};
+        if (dladdr(reinterpret_cast<const void*>(&ResolveTraceAngleLibraryPath), &mobileGlInfo) == 0 ||
+            mobileGlInfo.dli_fname == nullptr) {
+            MGLOG_F("Failed to resolve signed trace native library directory");
+            return false;
+        }
+
+        String nativeLibraryPath = mobileGlInfo.dli_fname;
+        const SizeT separator = nativeLibraryPath.find_last_of('/');
+        if (separator == String::npos) {
+            MGLOG_F("Invalid MobileGL library path: %s", nativeLibraryPath.c_str());
+            return false;
+        }
+
+        const SizeT extension = name.rfind(".so");
+        if (extension == String::npos) {
+            MGLOG_F("Invalid trace ANGLE library name: %s", name.c_str());
+            return false;
+        }
+        path = nativeLibraryPath.substr(0, separator + 1) + name.substr(0, extension) + "_" + variant + ".so";
+        return true;
+    }
+
+#endif
+
     static void* OpenLib(const Vector<String>& names) {
-#if !defined(__WIN32) && !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(__WIN32) && !defined(_WIN32) && (!defined(__APPLE__) || defined(MOBILEGL_IOS))
         static const String LibPathPrefixes[] = {
+#if defined(MOBILEGL_IOS)
+            "@rpath/", "@executable_path/Frameworks/", "@loader_path/Frameworks/",
+#else
             "/opt/vc/lib/", "/usr/local/lib/", "/usr/lib/", "/usr/lib/x86_64-linux-gnu/",
             "/usr/lib64/", "/lib64/",
-            "" // We should put this to the end of the list to avoid breaking `LD_LIBRARY_PATH` usage
+#endif
+            "" // Keep this last so the dynamic loader can use LD_LIBRARY_PATH.
         };
 
         void* lib = nullptr;
@@ -23,8 +76,25 @@ namespace MobileGL::MG_Util::BackendLoader {
         Int flags = RTLD_LOCAL | RTLD_NOW;
         for (const auto& prefix : LibPathPrefixes) {
             for (const auto& name : names) {
+#if defined(MOBILEGL_TRACE_ANGLE_VARIANTS) && defined(__ANDROID__)
+                if (UseAngle() && IsTraceAngleLibrary(name)) {
+                    String signedPath;
+                    if (!ResolveTraceAngleLibraryPath(name, signedPath)) {
+                        return nullptr;
+                    }
+                    lib = dlopen(signedPath.c_str(), flags);
+                    if (lib == nullptr) {
+                        MGLOG_F("Failed to open signed trace ANGLE library %s: %s",
+                                signedPath.c_str(), dlerror());
+                        return nullptr;
+                    }
+                    MGLOG_I("Loaded signed trace ANGLE library: %s", signedPath.c_str());
+                    return lib;
+                }
+#endif
                 String path_name = prefix + name;
                 if ((lib = dlopen(path_name.c_str(), flags))) {
+                    MGLOG_I("Loaded GL backend library: %s", path_name.c_str());
                     return lib;
                 }
             }
@@ -34,7 +104,7 @@ namespace MobileGL::MG_Util::BackendLoader {
     }
 
     inline void* ProcAddress(void* lib, const char* name) {
-#if !defined(__WIN32) && !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(__WIN32) && !defined(_WIN32) && (!defined(__APPLE__) || defined(MOBILEGL_IOS))
         return dlsym(lib, name);
 #else
         return nullptr;
@@ -54,6 +124,13 @@ namespace MobileGL::MG_Util::BackendLoader {
         if (!funcs.name) {                                                                                             \
             MGLOG_E("Failed to load GLES function: %s", #name);                                                        \
         }                                                                                                              \
+    } while (0);
+
+// Optional (extension-provided) entry points: a null pointer is expected on drivers that lack the
+// extension, so absence is not an error. The call site null-checks before use.
+#define INIT_GLES_FUNC_OPTIONAL(name)                                                                                  \
+    do {                                                                                                               \
+        funcs.name = (MG_External::GLES::name##_PTR)procAddress(#name);                                                \
     } while (0);
 
         {
@@ -424,8 +501,14 @@ namespace MobileGL::MG_Util::BackendLoader {
             INIT_GLES_FUNC(glBufferStorageEXT)
             INIT_GLES_FUNC(glGetQueryObjectivEXT)
             INIT_GLES_FUNC(glGetQueryObjecti64vEXT)
+            INIT_GLES_FUNC(glQueryCounterEXT)
+            INIT_GLES_FUNC(glGetQueryObjectui64vEXT)
             INIT_GLES_FUNC(glBindFragDataLocationEXT)
             INIT_GLES_FUNC(glMapBufferOES)
+            INIT_GLES_FUNC_OPTIONAL(glPolygonModeNV)
+            INIT_GLES_FUNC_OPTIONAL(glPolygonModeANGLE)
+            INIT_GLES_FUNC_OPTIONAL(glColorMaskiEXT)
+            INIT_GLES_FUNC_OPTIONAL(glColorMaskiOES)
             INIT_GLES_FUNC(glMultiDrawArraysIndirectEXT)
             INIT_GLES_FUNC(glMultiDrawElementsIndirectEXT)
             INIT_GLES_FUNC(glMultiDrawElementsBaseVertexEXT)
@@ -433,16 +516,53 @@ namespace MobileGL::MG_Util::BackendLoader {
     }
 
     void AcquireEGLFunctions(MG_External::EGLFunctionsTable& funcs) {
-        static const Vector<String> EGLLibNames = {"libEGL.so"};
-        void* eglLib = OpenLib(EGLLibNames);
+        void* eglLib = nullptr;
+#if defined(MOBILEGL_TRACE_ANGLE_VARIANTS) && defined(__ANDROID__)
+        void* angleGlesLib = nullptr;
+#endif
+        if (UseAngle()) {
+            void* glesLib = OpenLib({"libGLESv2_angle.so"});
+            if (!glesLib) {
+                MGLOG_E("Failed to open ANGLE libGLESv2_angle.so");
+                return;
+            }
+#if defined(MOBILEGL_TRACE_ANGLE_VARIANTS) && defined(__ANDROID__)
+            angleGlesLib = glesLib;
+#endif
+            eglLib = OpenLib({"libEGL_angle.so"});
+            if (!eglLib) {
+                MGLOG_E("Failed to open ANGLE libEGL_angle.so");
+                return;
+            }
+        } else {
+#if defined(MOBILEGL_IOS)
+            eglLib = OpenLib({"libtinygl4angle.dylib"});
+#else
+            eglLib = OpenLib({"libEGL.so"});
+#endif
+        }
+
         if (!eglLib) {
-            MGLOG_E("Failed to open libEGL.so");
+            MGLOG_E("Failed to open EGL library");
             return;
         }
 
+        auto resolveEGLProc = [&](const char* name) -> void* {
+#if defined(MOBILEGL_TRACE_ANGLE_VARIANTS) && defined(__ANDROID__)
+            if (UseAngle()) {
+                // Avoid the wrapper's canonical libGLESv2_angle.so lookup:
+                // resolve its forwarding target from the verified variant.
+                String target = "EGL_";
+                target += name + 3;
+                return ProcAddress(angleGlesLib, target.c_str());
+            }
+#endif
+            return ProcAddress(eglLib, name);
+        };
+
 #define INIT_EGL_FUNC(name)                                                                                            \
     do {                                                                                                               \
-        funcs.name = (MG_External::EGL::name##_PTR)ProcAddress(eglLib, #name);                                         \
+        funcs.name = (MG_External::EGL::name##_PTR)resolveEGLProc(#name);                                              \
         if (!funcs.name) {                                                                                             \
             MGLOG_E("Failed to load EGL function: %s", #name);                                                         \
         }                                                                                                              \
@@ -499,6 +619,155 @@ namespace MobileGL::MG_Util::BackendLoader {
         }
     }
 
+    // Detects whether indirect draws leak the command's baseInstance word ("reserved, must
+    // be zero" in unextended ES) into gl_InstanceID. Conforming ES drivers keep
+    // gl_InstanceID zero-based, but ANGLE's Vulkan backend forwards the command verbatim to
+    // vkCmdDraw*Indirect and compiles gl_InstanceID to SPIR-V InstanceIndex, which includes
+    // firstInstance. The DirectGLES native indirect-draw path uses this answer to keep
+    // gl_InstanceID zero-based in rewritten shaders (PromoteDrawParameterGlobalsToUniforms).
+    Bool ProbeIndirectInstanceIdIncludesBaseInstance(const MG_External::GLESCapabilities& caps,
+                                                     const MG_External::GLESFunctionsTable& f) {
+        const Bool esVersionOk =
+            caps.GLESVersion.Major > 3 || (caps.GLESVersion.Major == 3 && caps.GLESVersion.Minor >= 1);
+        if (!esVersionOk || !f.glDrawArraysIndirect || !f.glBindBufferBase || !f.glMapBufferRange ||
+            !f.glUnmapBuffer || !f.glMemoryBarrier || !f.glCreateShader || !f.glCreateProgram) {
+            return false;
+        }
+        GLint maxVertexSsboBlocks = 0;
+        f.glGetIntegerv(GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS, &maxVertexSsboBlocks);
+        if (maxVertexSsboBlocks < 1) {
+            // The native indirect machinery cannot read the command buffer from the vertex
+            // stage on this driver anyway; assume conforming zero-based gl_InstanceID.
+            MGLOG_I("baseInstance probe skipped: GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS = %d", maxVertexSsboBlocks);
+            return false;
+        }
+        while (f.glGetError() != GL_NO_ERROR) {
+        }
+
+        const char* vsSource = "#version 310 es\n"
+                               "layout(std430, binding = 0) buffer MgProbeResult { highp int mg_probeValue; };\n"
+                               "void main() {\n"
+                               "    mg_probeValue = gl_InstanceID;\n"
+                               "    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);\n"
+                               "    gl_PointSize = 1.0;\n"
+                               "}\n";
+        const char* fsSource = "#version 310 es\n"
+                               "void main() {}\n";
+        const auto compileShader = [&f](GLenum type, const char* src) -> GLuint {
+            const GLuint shader = f.glCreateShader(type);
+            if (shader == 0) {
+                return 0;
+            }
+            f.glShaderSource(shader, 1, &src, nullptr);
+            f.glCompileShader(shader);
+            GLint status = GL_FALSE;
+            f.glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+            if (status != GL_TRUE) {
+                f.glDeleteShader(shader);
+                return 0;
+            }
+            return shader;
+        };
+        const GLuint vs = compileShader(GL_VERTEX_SHADER, vsSource);
+        const GLuint fs = compileShader(GL_FRAGMENT_SHADER, fsSource);
+        GLuint program = 0;
+        if (vs != 0 && fs != 0) {
+            program = f.glCreateProgram();
+            if (program != 0) {
+                f.glAttachShader(program, vs);
+                f.glAttachShader(program, fs);
+                f.glLinkProgram(program);
+                GLint status = GL_FALSE;
+                f.glGetProgramiv(program, GL_LINK_STATUS, &status);
+                if (status != GL_TRUE) {
+                    f.glDeleteProgram(program);
+                    program = 0;
+                }
+            }
+        }
+        if (vs != 0) f.glDeleteShader(vs);
+        if (fs != 0) f.glDeleteShader(fs);
+        if (program == 0) {
+            MGLOG_I("baseInstance probe skipped: probe program failed to build (vs=%u fs=%u)", vs, fs);
+            while (f.glGetError() != GL_NO_ERROR) {
+            }
+            return false;
+        }
+
+        constexpr GLuint kProbeBaseInstance = 7;
+        struct {
+            GLuint count;
+            GLuint instanceCount;
+            GLuint first;
+            GLuint baseInstance;
+        } command = {1, 1, 0, kProbeBaseInstance};
+        const GLint sentinel = -1;
+        // ES makes indirect draws INVALID_OPERATION on the default vertex array object.
+        GLuint vao = 0;
+        f.glGenVertexArrays(1, &vao);
+        f.glBindVertexArray(vao);
+        GLuint buffers[2] = {0, 0}; // [0] = result SSBO, [1] = indirect command buffer
+        f.glGenBuffers(2, buffers);
+        f.glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers[0]);
+        f.glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(sentinel), &sentinel, GL_STATIC_DRAW);
+        f.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffers[0]);
+        f.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, buffers[1]);
+        f.glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof(command), &command, GL_STATIC_DRAW);
+
+        // The default framebuffer may be incomplete (e.g. surfaceless contexts) and draws
+        // are validated against completeness even under GL_RASTERIZER_DISCARD, so give the
+        // probe its own 1x1 target.
+        GLuint framebuffer = 0;
+        GLuint renderbuffer = 0;
+        f.glGenFramebuffers(1, &framebuffer);
+        f.glGenRenderbuffers(1, &renderbuffer);
+        f.glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
+        f.glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 1, 1);
+        f.glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        f.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, renderbuffer);
+
+        f.glUseProgram(program);
+        f.glEnable(GL_RASTERIZER_DISCARD);
+        f.glDrawArraysIndirect(GL_POINTS, nullptr);
+        f.glDisable(GL_RASTERIZER_DISCARD);
+        f.glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+        Bool includesBase = false;
+        const GLenum drawError = f.glGetError();
+        if (drawError == GL_NO_ERROR) {
+            f.glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers[0]);
+            const void* mapped = f.glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(GLint), GL_MAP_READ_BIT);
+            if (mapped != nullptr) {
+                GLint written = -1;
+                std::memcpy(&written, mapped, sizeof(written));
+                f.glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+                includesBase = written == static_cast<GLint>(kProbeBaseInstance);
+                MGLOG_I("baseInstance probe: shader observed gl_InstanceID = %d (baseInstance was %u)", written,
+                        kProbeBaseInstance);
+            } else {
+                MGLOG_I("baseInstance probe inconclusive: result map failed");
+            }
+        } else {
+            MGLOG_I("baseInstance probe inconclusive: draw raised GL error 0x%x", drawError);
+        }
+
+        f.glUseProgram(0);
+        f.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        f.glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        f.glDeleteFramebuffers(1, &framebuffer);
+        f.glDeleteRenderbuffers(1, &renderbuffer);
+        f.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0);
+        f.glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        f.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+        f.glBindVertexArray(0);
+        f.glDeleteVertexArrays(1, &vao);
+        f.glDeleteBuffers(2, buffers);
+        f.glDeleteProgram(program);
+        while (f.glGetError() != GL_NO_ERROR) {
+        }
+        return includesBase;
+    }
+
     Bool FillInGLESCapabilities(MG_External::GLESCapabilities& caps, const MG_External::GLESFunctionsTable& glesFuncs) {
         if (!glesFuncs.glGetString || !glesFuncs.glGetIntegerv) {
             MGLOG_E("Required GLES functions are not loaded, cannot query capabilities");
@@ -530,8 +799,32 @@ namespace MobileGL::MG_Util::BackendLoader {
                 if (std::strcmp(extension, "GL_EXT_texture_norm16") == 0) {
                     caps.SupportsNorm16Texture = true;
                 }
+                if (std::strcmp(extension, "GL_EXT_texture_filter_anisotropic") == 0) {
+                    caps.SupportsTextureFilterAnisotropy = true;
+                }
+                if (std::strcmp(extension, "GL_EXT_base_instance") == 0) {
+                    caps.SupportsBaseInstance = true;
+                }
+                if (std::strcmp(extension, "GL_EXT_disjoint_timer_query") == 0) {
+                    caps.SupportsDisjointTimerQuery = true;
+                }
+                if (std::strcmp(extension, "GL_EXT_blend_func_extended") == 0) {
+                    caps.SupportsDualSourceBlend = true;
+                }
             }
         }
+
+        // Detect optional raster/color-mask entry points by whether they loaded. glColorMaski is GLES
+        // 3.2 core (no extension string), so pointer presence is the reliable signal for all of these.
+        caps.SupportsPolygonMode =
+            glesFuncs.glPolygonModeNV != nullptr || glesFuncs.glPolygonModeANGLE != nullptr;
+        caps.SupportsIndexedColorMask = glesFuncs.glColorMaski != nullptr ||
+                                        glesFuncs.glColorMaskiEXT != nullptr ||
+                                        glesFuncs.glColorMaskiOES != nullptr;
+        MGLOG_I("    glPolygonMode (NV/ANGLE): %s", caps.SupportsPolygonMode ? "yes" : "no");
+        MGLOG_I("    indexed glColorMaski: %s", caps.SupportsIndexedColorMask ? "yes" : "no");
+        MGLOG_I("    dual-source blend (EXT_blend_func_extended): %s",
+                caps.SupportsDualSourceBlend ? "yes" : "no");
 
         MGLOG_I("OpenGL ES capabilities:");
         glesFuncs.glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &caps.UniformBufferOffsetAlignment);
@@ -618,6 +911,13 @@ namespace MobileGL::MG_Util::BackendLoader {
         glesFuncs.glGetIntegerv(GL_MAX_VIEWPORTS, &maxViewports);
         glesFuncs.glGetIntegerv(GL_MAX_VIEWPORT_DIMS, maxViewportDims);
         glesFuncs.glGetIntegerv(GL_VIEWPORT_SUBPIXEL_BITS, &viewportSubpixelBits);
+        // Only legal to query once the extension has been seen in the loop above, hence not batched
+        // with the unconditional probes: on a driver without it this raises GL_INVALID_ENUM.
+        if (caps.SupportsTextureFilterAnisotropy) {
+            GLfloat maxTextureMaxAnisotropy = 1.0f;
+            glesFuncs.glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxTextureMaxAnisotropy);
+            caps.MaxTextureMaxAnisotropy = std::max(maxTextureMaxAnisotropy, 1.0f);
+        }
         caps.AliasedLineWidthRangeMin = aliasedLineWidthRange[0];
         caps.AliasedLineWidthRangeMax = aliasedLineWidthRange[1];
         caps.SmoothLineWidthRangeMin = smoothLineWidthRange[0];
@@ -709,6 +1009,23 @@ namespace MobileGL::MG_Util::BackendLoader {
         MGLOG_I("    GL_VIEWPORT_BOUNDS_RANGE: [%.3f, %.3f]", caps.ViewportBoundsRangeMin,
                 caps.ViewportBoundsRangeMax);
         MGLOG_I("    GL_VIEWPORT_SUBPIXEL_BITS: %d", caps.ViewportSubpixelBits);
+
+        caps.IndirectDrawInstanceIdIncludesBaseInstance =
+            ProbeIndirectInstanceIdIncludesBaseInstance(caps, glesFuncs);
+        MGLOG_I("    Indirect draw gl_InstanceID includes baseInstance: %s",
+                caps.IndirectDrawInstanceIdIncludesBaseInstance ? "true" : "false");
+
+        caps.IsAngleRenderer = caps.GLESRendererString.find("ANGLE") != String::npos;
+        caps.IsAngleLlvmpipeRenderer =
+            caps.IsAngleRenderer && caps.GLESRendererString.find("llvmpipe") != String::npos;
+        caps.AvoidSamplerMipmapMinFilter =
+            caps.IsAngleLlvmpipeRenderer && MG_Config::Features.AvoidSamplerMipmapMinFilter;
+        MGLOG_I("    GL_EXT_disjoint_timer_query supported: %s",
+                caps.SupportsDisjointTimerQuery ? "true" : "false");
+        MGLOG_I("    ANGLE renderer: %s", caps.IsAngleRenderer ? "true" : "false");
+        MGLOG_I("    ANGLE llvmpipe renderer: %s", caps.IsAngleLlvmpipeRenderer ? "true" : "false");
+        MGLOG_I("    Avoid sampler mipmap min filter: %s",
+                caps.AvoidSamplerMipmapMinFilter ? "true" : "false");
 
         return true;
     }

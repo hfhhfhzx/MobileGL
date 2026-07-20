@@ -10,6 +10,8 @@
 #include "../GetProcAddress.h"
 #include <MG_Backend/BackendObjects.h>
 #include <MG_State/EGLState/Core.h>
+#include <mutex>
+#include <sstream>
 #include <type_traits>
 
 namespace MobileGL::MG_Impl::EGLImpl {
@@ -31,9 +33,22 @@ namespace MobileGL::MG_Impl::EGLImpl {
             return backendObject;
         }
 
+        std::recursive_mutex& EGLOperationMutex() {
+            static std::recursive_mutex mutex;
+            return mutex;
+        }
+
+        String CurrentThreadIdString() {
+            std::ostringstream stream;
+            stream << std::this_thread::get_id();
+            return stream.str();
+        }
+
         MG_Backend::WindowBackend DetectWindowBackend() {
 #if defined(ANDROID) || defined(__ANDROID__)
             return MG_Backend::WindowBackend::Android;
+#elif defined(__APPLE__)
+            return MG_Backend::WindowBackend::MetalLayer;
 #elif defined(__linux__)
             return MG_Backend::WindowBackend::X11;
 #else
@@ -48,6 +63,18 @@ namespace MobileGL::MG_Impl::EGLImpl {
             for (SizeT i = 0; attribList[i] != EGL_NONE; i += 2) {
                 if (attribList[i] == attrib) {
                     return attribList[i + 1];
+                }
+            }
+            return defaultValue;
+        }
+
+        EGLint GetAttribValueAttrib(const EGLAttrib* attribList, EGLint attrib, EGLint defaultValue) {
+            if (!attribList) {
+                return defaultValue;
+            }
+            for (SizeT i = 0; attribList[i] != EGL_NONE; i += 2) {
+                if (attribList[i] == attrib) {
+                    return static_cast<EGLint>(attribList[i + 1]);
                 }
             }
             return defaultValue;
@@ -91,25 +118,35 @@ namespace MobileGL::MG_Impl::EGLImpl {
             return EGL_NO_SURFACE;
         }
 
-        auto* backendObject = GetBackendObject(state);
-        if (!backendObject) {
-            MGLOG_E("activeBackendObject not initialized!");
-            return EGL_NO_SURFACE;
-        }
-
         const MG_Backend::WindowHandle windowHandle = {
             .Backend = DetectWindowBackend(),
             .Handle = ToVoidHandle(window),
+            .Width = static_cast<Uint32>(std::max<EGLint>(GetAttribValue(attrib_list, EGL_WIDTH, 0), 0)),
+            .Height = static_cast<Uint32>(std::max<EGLint>(GetAttribValue(attrib_list, EGL_HEIGHT, 0), 0)),
         };
-        if (!backendObject->CreateEGLWindowSurface(windowHandle)) {
+
+        EGLSurface surface = state->CreateWindowSurface(dpy, config, window, attrib_list);
+        if (surface == EGL_NO_SURFACE) {
+            return EGL_NO_SURFACE;
+        }
+
+        auto* backendObject = GetBackendObject(state);
+        if (!backendObject) {
+            MGLOG_E("activeBackendObject not initialized!");
+            state->DestroySurface(dpy, surface);
+            return EGL_NO_SURFACE;
+        }
+        if (!backendObject->CreateEGLWindowSurface(surface, windowHandle)) {
+            state->DestroySurface(dpy, surface);
             state->SetError(EGL_BAD_NATIVE_WINDOW);
             return EGL_NO_SURFACE;
         }
 
-        return state->CreateWindowSurface(dpy, config, window, attrib_list);
+        return surface;
     }
 
     EGLBoolean SwapBuffers(EGLDisplay dpy, EGLSurface draw) {
+        const std::lock_guard<std::recursive_mutex> operationLock(EGLOperationMutex());
         auto* state = GetState();
         if (!state) {
             return EGL_FALSE;
@@ -125,6 +162,7 @@ namespace MobileGL::MG_Impl::EGLImpl {
             return EGL_FALSE;
         }
         if (!backendObject->SwapEGLBuffers(dpy, draw)) {
+            MGLOG_E("eglSwapBuffers failed on thread=%s dpy=%p draw=%p", CurrentThreadIdString().c_str(), dpy, draw);
             state->SetError(EGL_BAD_SURFACE);
             return EGL_FALSE;
         }
@@ -186,6 +224,7 @@ namespace MobileGL::MG_Impl::EGLImpl {
     }
 
     EGLBoolean MakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
+        const std::lock_guard<std::recursive_mutex> operationLock(EGLOperationMutex());
         auto* state = GetState();
         if (!state) {
             return EGL_FALSE;
@@ -195,17 +234,30 @@ namespace MobileGL::MG_Impl::EGLImpl {
         const auto oldDraw = state->GetCurrentSurface(EGL_DRAW);
         const auto oldRead = state->GetCurrentSurface(EGL_READ);
         const auto oldContext = state->GetCurrentContext();
+        const String threadId = CurrentThreadIdString();
+
+        MGLOG_D("eglMakeCurrent begin thread=%s dpy=%p draw=%p read=%p ctx=%p oldDpy=%p oldDraw=%p oldRead=%p oldCtx=%p",
+                threadId.c_str(), dpy, draw, read, ctx, oldDisplay, oldDraw, oldRead, oldContext);
 
         if (!state->MakeCurrent(dpy, draw, read, ctx)) {
+            const EGLint error = state->ConsumeError();
+            MGLOG_D("eglMakeCurrent rejected by EGLState thread=%s error=0x%04x", threadId.c_str(), error);
+            state->SetError(error);
             return EGL_FALSE;
         }
 
         const Bool releaseCurrentRequest =
-            dpy == EGL_NO_DISPLAY && draw == EGL_NO_SURFACE && read == EGL_NO_SURFACE && ctx == EGL_NO_CONTEXT;
+            draw == EGL_NO_SURFACE && read == EGL_NO_SURFACE && ctx == EGL_NO_CONTEXT;
         if (releaseCurrentRequest) {
             if (auto* backendObject = MG_Backend::pActiveBackendObject.get()) {
-                (void)backendObject->MakeEGLCurrent(dpy, draw, read, ctx);
+                if (!backendObject->MakeEGLCurrent(dpy, draw, read, ctx)) {
+                    MGLOG_E("eglMakeCurrent release failed in backend thread=%s", threadId.c_str());
+                    state->MakeCurrent(oldDisplay, oldDraw, oldRead, oldContext);
+                    state->SetError(EGL_BAD_ACCESS);
+                    return EGL_FALSE;
+                }
             }
+            MGLOG_D("eglMakeCurrent release succeeded thread=%s", threadId.c_str());
             return EGL_TRUE;
         }
 
@@ -216,10 +268,14 @@ namespace MobileGL::MG_Impl::EGLImpl {
             return EGL_FALSE;
         }
         if (!backendObject->MakeEGLCurrent(dpy, draw, read, ctx)) {
+            MGLOG_E("eglMakeCurrent backend attach failed thread=%s dpy=%p draw=%p read=%p ctx=%p", threadId.c_str(),
+                    dpy, draw, read, ctx);
             state->SetError(EGL_BAD_ACCESS);
             state->MakeCurrent(oldDisplay, oldDraw, oldRead, oldContext);
             return EGL_FALSE;
         }
+        MGLOG_D("eglMakeCurrent attach succeeded thread=%s dpy=%p draw=%p read=%p ctx=%p", threadId.c_str(), dpy, draw,
+                read, ctx);
         return EGL_TRUE;
     }
 
@@ -232,11 +288,18 @@ namespace MobileGL::MG_Impl::EGLImpl {
     }
 
     EGLBoolean DestroySurface(EGLDisplay dpy, EGLSurface surface) {
+        const std::lock_guard<std::recursive_mutex> operationLock(EGLOperationMutex());
         auto* state = GetState();
         if (!state) {
             return EGL_FALSE;
         }
-        return state->DestroySurface(dpy, surface) ? EGL_TRUE : EGL_FALSE;
+        if (!state->DestroySurface(dpy, surface)) {
+            return EGL_FALSE;
+        }
+        if (auto* backendObject = MG_Backend::pActiveBackendObject.get()) {
+            backendObject->ReleaseEGLSurface(surface);
+        }
+        return EGL_TRUE;
     }
 
     EGLBoolean Terminate(EGLDisplay dpy) {
@@ -333,7 +396,14 @@ namespace MobileGL::MG_Impl::EGLImpl {
         case EGL_CLIENT_APIS:
             return "OpenGL OpenGL_ES";
         case EGL_EXTENSIONS:
-            return "";
+            if (display == EGL_NO_DISPLAY) {
+                return "EGL_EXT_client_extensions "
+                       "EGL_EXT_platform_base "
+                       "EGL_KHR_platform_base "
+                       "EGL_MESA_platform_surfaceless";
+            }
+            return "EGL_KHR_create_context "
+                   "EGL_MESA_platform_surfaceless";
         default:
             state->SetError(EGL_BAD_PARAMETER);
             return nullptr;
@@ -345,7 +415,17 @@ namespace MobileGL::MG_Impl::EGLImpl {
         if (!state) {
             return EGL_FALSE;
         }
-        return state->SwapInterval(dpy, interval) ? EGL_TRUE : EGL_FALSE;
+        if (!state->SwapInterval(dpy, interval)) {
+            return EGL_FALSE;
+        }
+        // Forward the request to the backend's native presentation path; without this
+        // the app's vsync setting only ever reaches MobileGL's shadow state and the
+        // native surface stays at the driver default (interval 1 = always vsynced).
+        auto* backendObject = GetBackendObject(state);
+        if (backendObject) {
+            backendObject->SetEGLSwapInterval(static_cast<Int>(interval));
+        }
+        return EGL_TRUE;
     }
 
     EGLSurface CreatePbufferSurface(EGLDisplay dpy, EGLConfig config, const EGLint* attrib_list) {
@@ -364,7 +444,7 @@ namespace MobileGL::MG_Impl::EGLImpl {
         if (!backendObject) {
             return EGL_NO_SURFACE;
         }
-        if (!backendObject->CreateEGLPbufferSurface(width, height)) {
+        if (!backendObject->CreateEGLPbufferSurface(surface, width, height)) {
             state->DestroySurface(dpy, surface);
             state->SetError(EGL_BAD_ALLOC);
             return EGL_NO_SURFACE;
@@ -587,22 +667,53 @@ namespace MobileGL::MG_Impl::EGLImpl {
             return EGL_NO_SURFACE;
         }
 
-        auto* backendObject = GetBackendObject(state);
-        if (!backendObject) {
-            MGLOG_E("activeBackendObject not initialized!");
-            return EGL_NO_SURFACE;
-        }
-
         const MG_Backend::WindowHandle windowHandle = {
             .Backend = DetectWindowBackend(),
             .Handle = native_window,
+            .Width = static_cast<Uint32>(std::max<EGLint>(GetAttribValueAttrib(attrib_list, EGL_WIDTH, 0), 0)),
+            .Height = static_cast<Uint32>(std::max<EGLint>(GetAttribValueAttrib(attrib_list, EGL_HEIGHT, 0), 0)),
         };
-        if (!backendObject->CreateEGLWindowSurface(windowHandle)) {
+
+        EGLSurface surface = state->CreatePlatformWindowSurface(dpy, config, native_window, attrib_list);
+        if (surface == EGL_NO_SURFACE) {
+            return EGL_NO_SURFACE;
+        }
+
+        auto* backendObject = GetBackendObject(state);
+        if (!backendObject) {
+            MGLOG_E("activeBackendObject not initialized!");
+            state->DestroySurface(dpy, surface);
+            return EGL_NO_SURFACE;
+        }
+        if (!backendObject->CreateEGLWindowSurface(surface, windowHandle)) {
+            state->DestroySurface(dpy, surface);
             state->SetError(EGL_BAD_NATIVE_WINDOW);
             return EGL_NO_SURFACE;
         }
 
-        return state->CreatePlatformWindowSurface(dpy, config, native_window, attrib_list);
+        return surface;
+    }
+
+    EGLBoolean ResizePlatformWindowSurface(EGLDisplay dpy, EGLSurface surface, EGLint width, EGLint height) {
+        auto* state = GetState();
+        if (!state) {
+            return EGL_FALSE;
+        }
+        if (!state->ResizeSurface(dpy, surface, width, height)) {
+            return EGL_FALSE;
+        }
+        auto* backendObject = GetBackendObject(state);
+        if (!backendObject) {
+            MGLOG_E("activeBackendObject not initialized!");
+            return EGL_FALSE;
+        }
+        width = std::max<EGLint>(width, 1);
+        height = std::max<EGLint>(height, 1);
+        if (!backendObject->ResizeEGLWindowSurface(surface, static_cast<Uint32>(width), static_cast<Uint32>(height))) {
+            state->SetError(EGL_BAD_NATIVE_WINDOW);
+            return EGL_FALSE;
+        }
+        return EGL_TRUE;
     }
 
     EGLSurface CreatePlatformPixmapSurface(EGLDisplay dpy, EGLConfig config, void* native_pixmap,

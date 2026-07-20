@@ -9,12 +9,18 @@
 #include "Core.h"
 #include "MG_State/GLState/RenderbufferState/RenderbufferObject.h"
 #include "MG_State/EGLState/Core.h"
+#include <Config.h>
 
 namespace MobileGL::MG_State {
     void Init() {
         MGLOG_D("Initializing MobileGL State...");
         pGLContext = MakeUnique<GLState::GLContext>();
         pEGLContext = MakeUnique<EGLState::EGLContext>();
+    }
+
+    Bool IsRelaxedSemanticsActive() {
+        return MG_Config::Features.RelaxedSemantics ||
+               !(pEGLContext && pEGLContext->IsCurrentContextOpenGLCoreProfile());
     }
 
     namespace GLState {
@@ -80,11 +86,16 @@ namespace MobileGL::MG_State {
 
         void GLContext::MarkBufferObjectForDeletion(Uint index) {
             if (ValidateBufferObject(index)) {
+                // GL semantics: deleting a buffer detaches it only from the CURRENT
+                // context's bindings, including the currently bound VAO's attachment
+                // points; attachments in other VAOs must survive (the shared_ptr keeps
+                // the data object alive, matching the spec's deferred deletion). The
+                // previous every-VAO scan was wrong per spec and O(VAOs) per delete —
+                // with one VAO per chunk section, vanilla's steady buffer churn made it
+                // dominate the render thread and FPS decay over session time.
                 auto bufferObject = m_bufferState.GetBufferObject(index);
-                auto& vaos = m_vertexArrayState.GetAllVertexArrays();
-                for (auto& vao : vaos) {
-                    if (vao == nullptr) continue;
-
+                const auto& vao = m_vertexArrayState.GetBoundVertexArray();
+                if (vao != nullptr) {
                     if (vao->GetIndexBufferBindingSlot().GetBoundObject() == bufferObject) {
                         vao->GetIndexBufferBindingSlot().Bind(nullptr);
                     }
@@ -140,9 +151,32 @@ namespace MobileGL::MG_State {
             return m_vertexArrayState.GetBoundVertexArray();
         }
 
+        VertexAttribTypeInfo ClassifyVertexAttribType(GLenum glType) {
+            switch (glType) {
+            case GL_FLOAT: return {VertexAttribBaseType::Float, 1};
+            case GL_FLOAT_VEC2: return {VertexAttribBaseType::Float, 2};
+            case GL_FLOAT_VEC3: return {VertexAttribBaseType::Float, 3};
+            case GL_FLOAT_VEC4: return {VertexAttribBaseType::Float, 4};
+            case GL_INT: return {VertexAttribBaseType::Int, 1};
+            case GL_INT_VEC2: return {VertexAttribBaseType::Int, 2};
+            case GL_INT_VEC3: return {VertexAttribBaseType::Int, 3};
+            case GL_INT_VEC4: return {VertexAttribBaseType::Int, 4};
+            case GL_UNSIGNED_INT: return {VertexAttribBaseType::Uint, 1};
+            case GL_UNSIGNED_INT_VEC2: return {VertexAttribBaseType::Uint, 2};
+            case GL_UNSIGNED_INT_VEC3: return {VertexAttribBaseType::Uint, 3};
+            case GL_UNSIGNED_INT_VEC4: return {VertexAttribBaseType::Uint, 4};
+            default: return {};
+            }
+        }
+
+        // The three accessors below are reachable from backend draw paths with a location taken from
+        // shader reflection, so the bound must be enforced at runtime rather than by MOBILEGL_ASSERT
+        // (which expands to nothing outside debug builds).
         void GLContext::SetCurrentVertexAttributeFloat(Uint index, const Array<Float, 4>& value) {
-            MOBILEGL_ASSERT(index < m_currentVertexAttributes.size(),
-                            "SetCurrentVertexAttributeFloat: index %u is out of range", index);
+            if (index >= m_currentVertexAttributes.size()) {
+                MGLOG_E("SetCurrentVertexAttributeFloat: index %u is out of range", index);
+                return;
+            }
 
             auto& current = m_currentVertexAttributes[index];
             current.floatValue = value;
@@ -153,8 +187,10 @@ namespace MobileGL::MG_State {
         }
 
         void GLContext::SetCurrentVertexAttributeInt(Uint index, const Array<Int32, 4>& value) {
-            MOBILEGL_ASSERT(index < m_currentVertexAttributes.size(),
-                            "SetCurrentVertexAttributeInt: index %u is out of range", index);
+            if (index >= m_currentVertexAttributes.size()) {
+                MGLOG_E("SetCurrentVertexAttributeInt: index %u is out of range", index);
+                return;
+            }
 
             auto& current = m_currentVertexAttributes[index];
             current.intValue = value;
@@ -165,8 +201,10 @@ namespace MobileGL::MG_State {
         }
 
         void GLContext::SetCurrentVertexAttributeUint(Uint index, const Array<Uint32, 4>& value) {
-            MOBILEGL_ASSERT(index < m_currentVertexAttributes.size(),
-                            "SetCurrentVertexAttributeUint: index %u is out of range", index);
+            if (index >= m_currentVertexAttributes.size()) {
+                MGLOG_E("SetCurrentVertexAttributeUint: index %u is out of range", index);
+                return;
+            }
 
             auto& current = m_currentVertexAttributes[index];
             current.uintValue = value;
@@ -177,8 +215,11 @@ namespace MobileGL::MG_State {
         }
 
         const CurrentVertexAttributeValue& GLContext::GetCurrentVertexAttribute(Uint index) const {
-            MOBILEGL_ASSERT(index < m_currentVertexAttributes.size(),
-                            "GetCurrentVertexAttribute: index %u is out of range", index);
+            static const CurrentVertexAttributeValue defaultValue{};
+            if (index >= m_currentVertexAttributes.size()) {
+                MGLOG_E("GetCurrentVertexAttribute: index %u is out of range", index);
+                return defaultValue;
+            }
             return m_currentVertexAttributes[index];
         }
 
@@ -191,12 +232,16 @@ namespace MobileGL::MG_State {
             return m_textureState.GetTextureObject(index);
         }
 
+        const SharedPtr<ITextureObject>& GLContext::GetDefaultTextureObject(TextureTarget target) const {
+            return m_textureState.GetDefaultTextureObject(target);
+        }
+
         const SharedPtr<ITextureObject>& GLContext::CreateTextureObject(Uint index, TextureTarget target) {
             return m_textureState.CreateTextureObject(index, target);
         }
 
         void GLContext::MarkTextureObjectForDeletion(Uint index) {
-            m_textureState.MarkTextureObjectForDeletion(index);
+            m_textureState.MarkTextureObjectForDeletion(index, IsRelaxedSemanticsActive());
         }
 
         TextureUnit& GLContext::GetTextureUnitObject(Int unit) {
@@ -242,6 +287,10 @@ namespace MobileGL::MG_State {
 
         void GLContext::MarkShaderForDeletion(const Uint index) {
             return m_programState.MarkShaderObjectForDeletion(index);
+        }
+
+        void GLContext::ReleaseShaderNameIfOrphaned(const Uint index) {
+            return m_programState.ReleaseShaderNameIfOrphaned(index);
         }
 
         Bool GLContext::ValidateProgramName(const Uint index) const {
@@ -291,6 +340,58 @@ namespace MobileGL::MG_State {
 
         Float GLContext::GetLineWidth() const {
             return m_renderState.GetLineWidth();
+        }
+
+        void GLContext::SetHint(GLenum target, GLenum mode) {
+            m_renderState.SetHint(target, mode);
+        }
+
+        GLenum GLContext::GetHint(GLenum target) const {
+            return m_renderState.GetHint(target);
+        }
+
+        void GLContext::SetPointFadeThresholdSize(Float size) {
+            m_renderState.SetPointFadeThresholdSize(size);
+        }
+
+        Float GLContext::GetPointFadeThresholdSize() const {
+            return m_renderState.GetPointFadeThresholdSize();
+        }
+
+        void GLContext::SetPointSpriteCoordOrigin(GLenum origin) {
+            m_renderState.SetPointSpriteCoordOrigin(origin);
+        }
+
+        GLenum GLContext::GetPointSpriteCoordOrigin() const {
+            return m_renderState.GetPointSpriteCoordOrigin();
+        }
+
+        void GLContext::SetClampReadColor(GLenum clamp) {
+            m_renderState.SetClampReadColor(clamp);
+        }
+
+        GLenum GLContext::GetClampReadColor() const {
+            return m_renderState.GetClampReadColor();
+        }
+
+        void GLContext::SetPolygonMode(GLenum front, GLenum back) {
+            m_renderState.SetPolygonMode(front, back);
+        }
+
+        GLenum GLContext::GetPolygonModeFront() const {
+            return m_renderState.GetPolygonModeFront();
+        }
+
+        GLenum GLContext::GetPolygonModeBack() const {
+            return m_renderState.GetPolygonModeBack();
+        }
+
+        void GLContext::SetPrimitiveRestartIndex(Uint32 index) {
+            m_renderState.SetPrimitiveRestartIndex(index);
+        }
+
+        Uint32 GLContext::GetPrimitiveRestartIndex() const {
+            return m_renderState.GetPrimitiveRestartIndex();
         }
 
         void GLContext::SetPointSize(Float size) {
@@ -412,6 +513,14 @@ namespace MobileGL::MG_State {
 
         BoolVec4 GLContext::GetColorMask() const {
             return m_renderState.GetColorMask();
+        }
+
+        void GLContext::SetColorMaskIndexed(Uint index, BoolVec4 mask) {
+            m_renderState.SetColorMaskIndexed(index, mask);
+        }
+
+        BoolVec4 GLContext::GetColorMaskIndexed(Uint index) const {
+            return m_renderState.GetColorMaskIndexed(index);
         }
 
         void GLContext::SetClearColor(FloatVec4 color) {

@@ -3,21 +3,22 @@
 #include <dlfcn.h>
 #include "apitrace_exit.hpp"
 #include "png.h"
-#include "trace_parser.hpp"
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cctype>
 #include <cstring>
 #include <exception>
 #include <fstream>
-#include <limits>
+#include <iomanip>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -28,6 +29,10 @@
 #endif
 
 extern "C" int MOBILEGL_APITRACE_RETRACE_MAIN(int argc, char** argv);
+
+#if defined(__GNUC__) || defined(__clang__)
+extern "C" void mobilegl_trace_pump_events() __attribute__((weak));
+#endif
 
 namespace mobilegl_trace {
 namespace {
@@ -73,6 +78,17 @@ bool Exists(const std::string& path) {
     return !path.empty() && stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
+bool UseAngleForRequest(const Request& request) {
+    if (request.backend != "DirectGLES") {
+        return false;
+    }
+    if (request.useAngle) {
+        return true;
+    }
+    const char* value = getenv("MOBILEGL_USE_ANGLE");
+    return value != nullptr && strcmp(value, "1") == 0;
+}
+
 bool EnsureDirectory(const std::string& path) {
     if (path.empty()) {
         return false;
@@ -115,6 +131,29 @@ bool LoadMobileGL(const Request& request, std::string& error) {
     setenv("MOBILEGL_BACKEND_TYPE", request.backend.c_str(), 1);
     setenv("MOBILEGL_TRACE_LIBRARY", request.mobileGlLibrary.c_str(), 1);
     setenv("MOBILEGL_TRACE_SKIP_AUTODESTROY", "1", 1);
+    setenv("MOBILEGL_TRACE_SURFACE", request.usePbuffer ? "pbuffer" : "window", 1);
+    if (request.backend == "DirectVulkan") {
+        setenv("MOBILEGL_MAGMA_R11G11B10F_FALLBACK", "1", 1);
+    } else {
+        unsetenv("MOBILEGL_MAGMA_R11G11B10F_FALLBACK");
+    }
+    if (UseAngleForRequest(request)) {
+        setenv("MOBILEGL_USE_ANGLE", "1", 1);
+        setenv("MOBILEGL_TRACE_ANGLE_VARIANT", request.angleVariant.c_str(), 1);
+    } else {
+        unsetenv("MOBILEGL_USE_ANGLE");
+        unsetenv("MOBILEGL_TRACE_ANGLE_VARIANT");
+    }
+    if (request.avoidAngleLlvmpipeSamplerMipmapMinFilter) {
+        setenv("MOBILEGL_AVOID_SAMPLER_MIPMAP_MIN_FILTER", "1", 1);
+    } else {
+        unsetenv("MOBILEGL_AVOID_SAMPLER_MIPMAP_MIN_FILTER");
+    }
+    if (request.coherentAsFlush) {
+        setenv("MOBILEGL_COHERENT_AS_FLUSH", "1", 1);
+    } else {
+        unsetenv("MOBILEGL_COHERENT_AS_FLUSH");
+    }
 
     void* handle = dlopen(request.mobileGlLibrary.c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (handle == nullptr) {
@@ -123,6 +162,26 @@ bool LoadMobileGL(const Request& request, std::string& error) {
         return false;
     }
     return true;
+}
+
+void ConfigureHoldEnv(const Request& request) {
+    if (request.holdMs <= 0) {
+        unsetenv("MOBILEGL_TRACE_HOLD_MS");
+        unsetenv("MOBILEGL_TRACE_HOLD_CALL");
+        unsetenv("MOBILEGL_TRACE_HOLD_DONE");
+        return;
+    }
+
+    const std::string holdMs = std::to_string(request.holdMs);
+    const std::string holdCall = std::to_string(request.targetCall);
+    setenv("MOBILEGL_TRACE_HOLD_MS", holdMs.c_str(), 1);
+    setenv("MOBILEGL_TRACE_HOLD_CALL", holdCall.c_str(), 1);
+    unsetenv("MOBILEGL_TRACE_HOLD_DONE");
+}
+
+bool TraceHoldAlreadyRan() {
+    const char* holdDone = getenv("MOBILEGL_TRACE_HOLD_DONE");
+    return holdDone != nullptr && std::strcmp(holdDone, "1") == 0;
 }
 
 bool CopyFile(const std::string& from, const std::string& to) {
@@ -285,106 +344,15 @@ void ForceOpaqueAlpha(RgbaImage& image) {
     }
 }
 
-bool ReadPpmRgbAsRgba(const std::string& path, RgbaImage& image, std::string& error) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        error = "failed to open PPM: " + path;
-        return false;
-    }
-
-    auto readToken = [&file]() -> std::string {
-        std::string token;
-        char ch = 0;
-        while (file.get(ch)) {
-            if (ch == '#') {
-                file.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-                continue;
-            }
-            if (!std::isspace(static_cast<unsigned char>(ch))) {
-                token.push_back(ch);
-                break;
-            }
-        }
-        while (file.get(ch)) {
-            if (std::isspace(static_cast<unsigned char>(ch))) {
-                break;
-            }
-            token.push_back(ch);
-        }
-        return token;
-    };
-
-    const std::string magic = readToken();
-    const std::string widthToken = readToken();
-    const std::string heightToken = readToken();
-    const std::string maxToken = readToken();
-    if (magic != "P6" || widthToken.empty() || heightToken.empty() || maxToken != "255") {
-        error = "unsupported PPM header: " + path;
-        return false;
-    }
-
-    image.width = std::stoi(widthToken);
-    image.height = std::stoi(heightToken);
-    if (image.width <= 0 || image.height <= 0) {
-        error = "PPM has invalid dimensions: " + path;
-        return false;
-    }
-
-    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(image.width) * image.height * 3);
-    file.read(reinterpret_cast<char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
-    if (file.gcount() != static_cast<std::streamsize>(rgb.size())) {
-        error = "PPM payload is truncated: " + path;
-        return false;
-    }
-
-    image.pixels.resize(static_cast<std::size_t>(image.width) * image.height * 4);
-    for (std::size_t i = 0, j = 0; i < rgb.size(); i += 3, j += 4) {
-        image.pixels[j + 0] = rgb[i + 0];
-        image.pixels[j + 1] = rgb[i + 1];
-        image.pixels[j + 2] = rgb[i + 2];
-        image.pixels[j + 3] = 0xff;
-    }
-    return true;
-}
-
 std::string SnapshotPathForCall(const Request& request) {
     char call[16];
     snprintf(call, sizeof(call), "%010lld", request.targetCall);
     return request.outputDir + "/actual." + call + ".png";
 }
 
-bool TargetCallSwapsRenderTarget(const Request& request, bool& swapsRenderTarget, std::string& error) {
-    trace::Parser parser;
-    if (!parser.open(request.tracePath.c_str())) {
-        error = "failed to open trace for target call inspection";
-        return false;
-    }
-
-    trace::Call* call = nullptr;
-    while ((call = parser.parse_call()) != nullptr) {
-        const long long callNo = static_cast<long long>(call->no);
-        if (callNo == request.targetCall) {
-            swapsRenderTarget = (call->flags & trace::CALL_FLAG_SWAP_RENDERTARGET) != 0;
-            delete call;
-            return true;
-        }
-        if (callNo > request.targetCall) {
-            delete call;
-            break;
-        }
-        delete call;
-    }
-
-    std::ostringstream message;
-    message << "target_call " << request.targetCall << " was not found in trace";
-    error = message.str();
-    return false;
-}
-
-int RunRetraceMain(const Request& request, bool usePresentDump) {
+int RunRetraceMain(const Request& request) {
     std::string prefix = request.outputDir + "/actual.";
-    const long long snapshotCall = usePresentDump ? request.targetCall + 1 : request.targetCall;
-    std::string callSet = std::to_string(snapshotCall);
+    std::string callSet = std::to_string(request.targetCall);
 
     std::string arg0 = "mobilegl-glretrace";
     std::string argBenchmark = "-b";
@@ -411,11 +379,12 @@ int RunRetraceMain(const Request& request, bool usePresentDump) {
     return MOBILEGL_APITRACE_RETRACE_MAIN(10, argv);
 }
 
-bool RunRetrace(const Request& request, bool usePresentDump, Result& result) {
+bool RunRetrace(const Request& request, Result& result) {
     int status = 0;
+    ConfigureHoldEnv(request);
     try {
         ScopedFdRedirect redirect(request.outputDir + "/retrace.log");
-        status = RunRetraceMain(request, usePresentDump);
+        status = RunRetraceMain(request);
     } catch (const MobileGLRetraceExit& retraceExit) {
         status = retraceExit.status;
     } catch (const std::exception& exception) {
@@ -437,53 +406,28 @@ bool RunRetrace(const Request& request, bool usePresentDump, Result& result) {
     }
 
     std::string snapshotPath = SnapshotPathForCall(request);
-    const std::string presentPath = request.outputDir + "/present.ppm";
-    const bool hasSnapshot = Exists(snapshotPath);
-    const bool hasPresentDump = usePresentDump && Exists(presentPath);
-    if (!hasSnapshot && !hasPresentDump) {
+    if (!Exists(snapshotPath)) {
         result.statusCode = STATUS_RETRACE_FAILED;
         result.message = "retrace completed but did not create expected snapshot: " + snapshotPath;
         return false;
     }
-    if (hasSnapshot && !hasPresentDump) {
-        RgbaImage snapshot;
-        std::string imageError;
-        if (!ReadPngRgba(snapshotPath, snapshot, imageError)) {
-            result.statusCode = STATUS_IO_ERROR;
-            result.message = imageError.empty()
-                                     ? "failed to decode snapshot PNG: " + snapshotPath
-                                     : imageError;
-            return false;
-        }
-        ForceOpaqueAlpha(snapshot);
-        if (!WritePngRgba(result.actualPath, snapshot, imageError)) {
-            result.statusCode = STATUS_IO_ERROR;
-            result.message = imageError.empty()
-                                     ? "failed to write snapshot to actual PNG"
-                                     : imageError;
-            return false;
-        }
+
+    RgbaImage snapshot;
+    std::string imageError;
+    if (!ReadPngRgba(snapshotPath, snapshot, imageError)) {
+        result.statusCode = STATUS_IO_ERROR;
+        result.message = imageError.empty()
+                                 ? "failed to decode snapshot PNG: " + snapshotPath
+                                 : imageError;
+        return false;
     }
-    if (usePresentDump) {
-        if (hasPresentDump) {
-            RgbaImage present;
-            std::string imageError;
-            if (!ReadPpmRgbAsRgba(presentPath, present, imageError) ||
-                !WritePngRgba(request.outputDir + "/present.png", present, imageError)) {
-                result.statusCode = STATUS_IO_ERROR;
-                result.message = imageError.empty()
-                                         ? "failed to convert DirectVulkan present dump to PNG"
-                                         : imageError;
-                return false;
-            }
-            if (!WritePngRgba(result.actualPath, present, imageError)) {
-                result.statusCode = STATUS_IO_ERROR;
-                result.message = imageError.empty()
-                                         ? "failed to write DirectVulkan present dump to actual PNG"
-                                         : imageError;
-                return false;
-            }
-        }
+    ForceOpaqueAlpha(snapshot);
+    if (!WritePngRgba(result.actualPath, snapshot, imageError)) {
+        result.statusCode = STATUS_IO_ERROR;
+        result.message = imageError.empty()
+                                 ? "failed to write snapshot to actual PNG"
+                                 : imageError;
+        return false;
     }
     return true;
 }
@@ -499,7 +443,6 @@ bool WriteDifferenceImage(const Result& result,
                           int y0,
                           int compareWidth,
                           int compareHeight,
-                          int fuzz,
                           std::string& error) {
     if (result.diffPath.empty()) {
         return true;
@@ -527,7 +470,7 @@ bool WriteDifferenceImage(const Result& result,
                               ChannelValue(golden, imageX, imageY, 1));
             int db = std::abs(ChannelValue(actual, imageX, imageY, 2) -
                               ChannelValue(golden, imageX, imageY, 2));
-            bool different = dr > fuzz || dg > fuzz || db > fuzz;
+            bool different = dr != 0 || dg != 0 || db != 0;
             std::uint8_t* dst = diff.pixels.data() +
                                 (static_cast<std::size_t>(imageY) * diff.width + imageX) * 4;
             if (different) {
@@ -545,27 +488,105 @@ bool WriteDifferenceImage(const Result& result,
     return WritePngRgba(result.diffPath, diff, error);
 }
 
-bool CompareWithGolden(const Request& request, Result& result) {
-    if (request.goldenPath.empty()) {
-        result.passed = true;
-        result.statusCode = STATUS_OK;
-        result.message = "retrace completed; golden_path was not provided";
-        result.mismatchPixels = 0;
-        return true;
+void PumpTraceEvents() {
+#if defined(__GNUC__) || defined(__clang__)
+    if (mobilegl_trace_pump_events != nullptr) {
+        mobilegl_trace_pump_events();
     }
-    if (!Exists(request.goldenPath)) {
-        result.statusCode = STATUS_INVALID_ARGUMENT;
-        result.message = "golden_path does not exist or is not a regular file";
+#endif
+}
+
+void HoldAfterRetrace(const Request& request) {
+    if (request.holdMs <= 0 || TraceHoldAlreadyRan()) {
+        return;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(request.holdMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        PumpTraceEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+    PumpTraceEvents();
+    setenv("MOBILEGL_TRACE_HOLD_DONE", "1", 1);
+}
+
+struct GoldenComparison {
+    std::string path;
+    RgbaImage image;
+    double ssim = -1.0;
+    long long mismatchPixels = 0;
+    int x0 = 0;
+    int y0 = 0;
+    int compareWidth = 0;
+    int compareHeight = 0;
+};
+
+double ComputeChannelSsim(const RgbaImage& actual,
+                          const RgbaImage& golden,
+                          int x0,
+                          int y0,
+                          int compareWidth,
+                          int compareHeight,
+                          unsigned channel) {
+    const double count = static_cast<double>(compareWidth) * static_cast<double>(compareHeight);
+    double sumA = 0.0;
+    double sumG = 0.0;
+    double sumAA = 0.0;
+    double sumGG = 0.0;
+    double sumAG = 0.0;
+
+    for (int y = 0; y < compareHeight; ++y) {
+        for (int x = 0; x < compareWidth; ++x) {
+            const double a = ChannelValue(actual, x0 + x, y0 + y, channel);
+            const double g = ChannelValue(golden, x0 + x, y0 + y, channel);
+            sumA += a;
+            sumG += g;
+            sumAA += a * a;
+            sumGG += g * g;
+            sumAG += a * g;
+        }
+    }
+
+    const double meanA = sumA / count;
+    const double meanG = sumG / count;
+    const double varianceA = std::max(0.0, sumAA / count - meanA * meanA);
+    const double varianceG = std::max(0.0, sumGG / count - meanG * meanG);
+    const double covariance = sumAG / count - meanA * meanG;
+
+    constexpr double kC1 = 6.5025;  // (0.01 * 255)^2
+    constexpr double kC2 = 58.5225; // (0.03 * 255)^2
+    const double luminance = (2.0 * meanA * meanG + kC1) /
+                             (meanA * meanA + meanG * meanG + kC1);
+    const double contrastStructure = (2.0 * covariance + kC2) /
+                                     (varianceA + varianceG + kC2);
+    return luminance * contrastStructure;
+}
+
+double ComputeRgbSsim(const RgbaImage& actual,
+                      const RgbaImage& golden,
+                      int x0,
+                      int y0,
+                      int compareWidth,
+                      int compareHeight) {
+    double sum = 0.0;
+    for (unsigned channel = 0; channel < 3; ++channel) {
+        sum += ComputeChannelSsim(actual, golden, x0, y0, compareWidth, compareHeight, channel);
+    }
+    return sum / 3.0;
+}
+
+bool CompareAgainstOneGolden(const Request& request,
+                             const RgbaImage& actual,
+                             const std::string& goldenPath,
+                             GoldenComparison& comparison,
+                             std::string& error) {
+    if (!Exists(goldenPath)) {
+        error = "golden_path does not exist or is not a regular file: " + goldenPath;
         return false;
     }
 
-    RgbaImage actual;
     RgbaImage golden;
-    std::string pngError;
-    if (!ReadPngRgba(result.actualPath, actual, pngError) ||
-        !ReadPngRgba(request.goldenPath, golden, pngError)) {
-        result.statusCode = STATUS_COMPARE_FAILED;
-        result.message = pngError.empty() ? "failed to decode actual or golden PNG" : pngError;
+    if (!ReadPngRgba(goldenPath, golden, error)) {
         return false;
     }
 
@@ -573,11 +594,11 @@ bool CompareWithGolden(const Request& request, Result& result) {
     int y0 = request.cropY;
     if (request.cropWidth <= 0 && request.cropHeight <= 0 &&
         (actual.width != golden.width || actual.height != golden.height)) {
-        result.statusCode = STATUS_COMPARE_FAILED;
         std::ostringstream message;
         message << "actual image size " << actual.width << "x" << actual.height
-                << " does not match golden image size " << golden.width << "x" << golden.height;
-        result.message = message.str();
+                << " does not match golden image size " << golden.width << "x" << golden.height
+                << ": " << goldenPath;
+        error = message.str();
         return false;
     }
 
@@ -589,44 +610,108 @@ bool CompareWithGolden(const Request& request, Result& result) {
         y0 + compareHeight > actual.height ||
         x0 + compareWidth > golden.width ||
         y0 + compareHeight > golden.height) {
-        result.statusCode = STATUS_INVALID_ARGUMENT;
-        result.message = "compare crop is outside actual or golden image bounds";
+        error = "compare crop is outside actual or golden image bounds: " + goldenPath;
         return false;
     }
 
-    const int fuzz = std::max(0, std::min(100, request.fuzzPercent)) * 255 / 100;
-    long long mismatch = 0;
+    long long exactMismatch = 0;
     for (int y = 0; y < compareHeight; ++y) {
         for (int x = 0; x < compareWidth; ++x) {
             bool different = false;
             for (unsigned c = 0; c < 3; ++c) {
                 int a = ChannelValue(actual, x0 + x, y0 + y, c);
                 int g = ChannelValue(golden, x0 + x, y0 + y, c);
-                if (std::abs(a - g) > fuzz) {
+                if (a != g) {
                     different = true;
                     break;
                 }
             }
             if (different) {
-                ++mismatch;
+                ++exactMismatch;
             }
         }
     }
 
+    comparison.path = goldenPath;
+    comparison.image = std::move(golden);
+    comparison.ssim = ComputeRgbSsim(actual, comparison.image, x0, y0, compareWidth, compareHeight);
+    comparison.mismatchPixels = exactMismatch;
+    comparison.x0 = x0;
+    comparison.y0 = y0;
+    comparison.compareWidth = compareWidth;
+    comparison.compareHeight = compareHeight;
+    return true;
+}
+
+bool CompareWithGolden(const Request& request, Result& result) {
+    std::vector<std::string> goldenPaths;
+    if (!request.goldenPath.empty()) {
+        goldenPaths.push_back(request.goldenPath);
+    }
+    for (const auto& alternateGoldenPath : request.alternateGoldenPaths) {
+        if (!alternateGoldenPath.empty()) {
+            goldenPaths.push_back(alternateGoldenPath);
+        }
+    }
+
+    if (goldenPaths.empty()) {
+        result.passed = true;
+        result.statusCode = STATUS_OK;
+        result.message = "retrace completed; golden_path was not provided";
+        result.ssim = 1.0;
+        result.mismatchPixels = 0;
+        return true;
+    }
+
+    RgbaImage actual;
+    std::string pngError;
+    if (!ReadPngRgba(result.actualPath, actual, pngError)) {
+        result.statusCode = STATUS_COMPARE_FAILED;
+        result.message = pngError.empty() ? "failed to decode actual PNG" : pngError;
+        return false;
+    }
+
+    GoldenComparison bestComparison;
+    std::string comparisonError;
+    bool hasComparison = false;
+    for (const auto& goldenPath : goldenPaths) {
+        GoldenComparison comparison;
+        std::string error;
+        if (!CompareAgainstOneGolden(request, actual, goldenPath, comparison, error)) {
+            comparisonError = error;
+            continue;
+        }
+        if (!hasComparison || comparison.ssim > bestComparison.ssim) {
+            bestComparison = std::move(comparison);
+            hasComparison = true;
+        }
+    }
+
+    if (!hasComparison) {
+        result.statusCode = STATUS_COMPARE_FAILED;
+        result.message = comparisonError.empty() ? "failed to compare against any golden PNG" : comparisonError;
+        return false;
+    }
+
     std::string diffError;
-    if (!WriteDifferenceImage(result, actual, golden, x0, y0, compareWidth, compareHeight, fuzz, diffError)) {
+    if (!WriteDifferenceImage(result, actual, bestComparison.image, bestComparison.x0, bestComparison.y0,
+                              bestComparison.compareWidth, bestComparison.compareHeight, diffError)) {
         result.statusCode = STATUS_IO_ERROR;
         result.message = diffError.empty() ? "failed to write diff PNG" : diffError;
         return false;
     }
 
-    result.mismatchPixels = mismatch;
-    result.passed = mismatch <= request.tolerance;
+    result.ssim = bestComparison.ssim;
+    result.mismatchPixels = bestComparison.mismatchPixels;
+    result.matchedGoldenPath = bestComparison.path;
+    result.passed = bestComparison.ssim >= request.ssimThreshold;
     result.statusCode = result.passed ? STATUS_OK : STATUS_COMPARE_FAILED;
     std::ostringstream message;
-    message << "retrace completed; mismatchPixels=" << mismatch
-            << ", tolerance=" << request.tolerance
-            << ", fuzzPercent=" << request.fuzzPercent;
+    message << std::fixed << std::setprecision(6)
+            << "retrace completed; ssim=" << bestComparison.ssim
+            << ", ssimThreshold=" << request.ssimThreshold
+            << ", mismatchPixels=" << bestComparison.mismatchPixels
+            << ", matchedGoldenPath=" << bestComparison.path;
     result.message = message.str();
     return result.passed;
 }
@@ -648,9 +733,19 @@ bool WriteResultJson(const Request& request, const Result& result) {
     file << "  \"message\": \"" << JsonEscape(result.message) << "\",\n";
     file << "  \"tracePath\": \"" << JsonEscape(request.tracePath) << "\",\n";
     file << "  \"goldenPath\": \"" << JsonEscape(request.goldenPath) << "\",\n";
+    file << "  \"alternateGoldenPaths\": [";
+    for (std::size_t i = 0; i < request.alternateGoldenPaths.size(); ++i) {
+        if (i > 0) {
+            file << ", ";
+        }
+        file << "\"" << JsonEscape(request.alternateGoldenPaths[i]) << "\"";
+    }
+    file << "],\n";
+    file << "  \"matchedGoldenPath\": \"" << JsonEscape(result.matchedGoldenPath) << "\",\n";
     file << "  \"actualPath\": \"" << JsonEscape(result.actualPath) << "\",\n";
     file << "  \"diffPath\": \"" << JsonEscape(result.diffPath) << "\",\n";
     file << "  \"backend\": \"" << JsonEscape(request.backend) << "\",\n";
+    file << "  \"angleVariant\": \"" << JsonEscape(request.angleVariant) << "\",\n";
     file << "  \"targetFrame\": " << request.targetFrame << ",\n";
     file << "  \"targetCall\": " << request.targetCall << ",\n";
     file << "  \"width\": " << request.width << ",\n";
@@ -659,8 +754,14 @@ bool WriteResultJson(const Request& request, const Result& result) {
     file << "  \"cropY\": " << request.cropY << ",\n";
     file << "  \"cropWidth\": " << request.cropWidth << ",\n";
     file << "  \"cropHeight\": " << request.cropHeight << ",\n";
-    file << "  \"tolerance\": " << request.tolerance << ",\n";
-    file << "  \"fuzzPercent\": " << request.fuzzPercent << ",\n";
+    file << std::fixed << std::setprecision(9);
+    file << "  \"ssim\": " << result.ssim << ",\n";
+    file << "  \"ssimThreshold\": " << request.ssimThreshold << ",\n";
+    file << "  \"useAngle\": " << (UseAngleForRequest(request) ? "true" : "false") << ",\n";
+    file << "  \"usePbuffer\": " << (request.usePbuffer ? "true" : "false") << ",\n";
+    file << "  \"avoidAngleLlvmpipeSamplerMipmapMinFilter\": "
+         << (request.avoidAngleLlvmpipeSamplerMipmapMinFilter ? "true" : "false") << ",\n";
+    file << "  \"holdMs\": " << request.holdMs << ",\n";
     file << "  \"mismatchPixels\": " << result.mismatchPixels << "\n";
     file << "}\n";
     return true;
@@ -697,29 +798,6 @@ Result RunTraceReplay(const Request& request) {
         return result;
     }
 
-    bool usePresentDump = false;
-    if (request.backend == "DirectVulkan") {
-        std::string inspectError;
-        if (!TargetCallSwapsRenderTarget(request, usePresentDump, inspectError)) {
-            result.statusCode = STATUS_INVALID_ARGUMENT;
-            result.message = inspectError;
-            return result;
-        }
-    }
-
-    if (usePresentDump) {
-        std::string presentDumpPath = request.outputDir + "/present.ppm";
-        std::string presentDumpCall = std::to_string(request.targetCall);
-        setenv("MOBILEGL_PRESENT_DUMP_PATH", presentDumpPath.c_str(), 1);
-        setenv("MOBILEGL_PRESENT_DUMP_CALL", presentDumpCall.c_str(), 1);
-    } else {
-        unsetenv("MOBILEGL_PRESENT_STATS");
-        unsetenv("MOBILEGL_PRESENT_DUMP_PATH");
-        unsetenv("MOBILEGL_PRESENT_DUMP_CALL");
-        unsetenv("MOBILEGL_TEXTURE_UPLOAD_STATS");
-        unsetenv("MOBILEGL_DESCRIPTOR_STATS");
-    }
-
     setenv("MOBILEGL_LOG_FILE_PATH", mobileGlLogPath.c_str(), 1);
 
     std::string mobileGlError;
@@ -729,10 +807,12 @@ Result RunTraceReplay(const Request& request) {
         return result;
     }
 
-    if (!RunRetrace(request, usePresentDump, result)) {
+    if (!RunRetrace(request, result)) {
+        HoldAfterRetrace(request);
         return result;
     }
 
+    HoldAfterRetrace(request);
     CompareWithGolden(request, result);
     return result;
 }

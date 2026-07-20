@@ -62,13 +62,16 @@ set(LINK_LIBRARIES
 )
 
 include(GoogleTest)
-gtest_discover_tests(SanityTest)
+gtest_discover_tests(SanityTest DISCOVERY_TIMEOUT 30 PROPERTIES LABELS unit)
 
+add_subdirectory(BackendLoader)
 add_subdirectory(Buffer)
+add_subdirectory(EGLState)
 add_subdirectory(Framebuffer)
 add_subdirectory(Texture)
 add_subdirectory(VertexArray)
 add_subdirectory(Program)
+add_subdirectory(Query)
 if (ENABLE_INTEGRATION_TESTS)
     add_subdirectory(Backend/DirectVulkan)
 endif()
